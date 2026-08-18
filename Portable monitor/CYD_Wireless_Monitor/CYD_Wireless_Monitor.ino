@@ -39,6 +39,18 @@ static uint32_t latestFrameId = 0;
 static uint8_t currentRotation = 3; // 기본 180도 가로
 static bool showFpsOverlay = false;
 
+// ---- 재시작 감지용 타임아웃 ----
+// 패킷이 이 시간(ms) 이상 오지 않으면 세션이 끊겼다고 판단
+#define STREAM_TIMEOUT_MS 3000
+unsigned long lastPacketTime = 0;
+bool streamActive = false;
+
+// ---- 청크 수신 추적: bitmask (최대 32청크까지 지원) ----
+// 카운트 방식은 중복 수신 시 오동작 → 비트마스크로 교체
+#define MAX_CHUNKS_BITMASK 32
+static uint32_t chunkReceivedMask = 0;
+static uint32_t chunkExpectedMask = 0;
+
 volatile unsigned long frameCount = 0;
 unsigned long lastFpsTime = 0;
 float currentFps = 0.0f;
@@ -367,6 +379,17 @@ void runTouchWifiSetup() {
 // ==========================================
 // 5. AsyncUDP 수신 콜백
 // ==========================================
+void resetSessionState() {
+  // 세션 상태를 완전히 초기화합니다.
+  // 재시작 또는 타임아웃 시 호출하여 낡은 frame_id 비교 문제를 방지합니다.
+  latestFrameId = 0;
+  expectedChunks = 0;
+  receivedChunks = 0;
+  chunkReceivedMask = 0;
+  chunkExpectedMask = 0;
+  Serial.println("[UDP] 세션 상태 초기화 완료. latestFrameId 리셋.");
+}
+
 void onUdpPacketReceived(AsyncUDPPacket packet) {
   size_t len = packet.length();
   if (len < 8) return;
@@ -375,47 +398,103 @@ void onUdpPacketReceived(AsyncUDPPacket packet) {
 
   uint32_t frameId = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
   
-  // 제어 명령 패킷
+  // ---- 제어 명령 패킷 (0xFFFFFFFF) ----
+  // [FIX] 제어 패킷을 스트림 재시작 신호로도 활용: 세션 상태를 리셋합니다.
+  // Python streamer가 스트리밍 시작 시 제어 패킷을 먼저 보내므로,
+  // 이를 수신하는 순간 낡은 latestFrameId를 지워 재시작 후 드롭 문제를 방지합니다.
   if (frameId == 0xFFFFFFFF) {
     uint8_t reqRotation = data[4];
     if (reqRotation <= 7) {
       if (reqRotation != currentRotation) {
         currentRotation = reqRotation;
         lcd.setRotation(currentRotation);
+        Serial.printf("[CTRL] 화면 회전 변경: %d\n", currentRotation);
       }
     }
     showFpsOverlay = (data[5] != 0);
+    
+    // 새 스트리밍 세션 시작 신호: 세션 상태 리셋
+    Serial.println("[CTRL] 제어 패킷 수신 → 세션 상태 리셋 (재시작 대응)");
+    resetSessionState();
+    lastPacketTime = millis();
     return;
   }
 
+  // ---- 데이터 패킷 ----
   uint16_t totalChunks = ((uint16_t)data[4] << 8) | (uint16_t)data[5];
-  uint16_t chunkIdx = ((uint16_t)data[6] << 8) | (uint16_t)data[7];
-  size_t payloadLen = len - 8;
+  uint16_t chunkIdx    = ((uint16_t)data[6] << 8) | (uint16_t)data[7];
+  size_t   payloadLen  = len - 8;
 
   isReceiving = true;
+  lastPacketTime = millis();
+  streamActive = true;
 
-  if (frameId < latestFrameId && (latestFrameId - frameId < 100000)) {
-    return;
+  // ---- [FIX] frame_id 역전(재시작) 처리 ----
+  // 기존 로직: frameId < latestFrameId면 무조건 드롭 → 재시작 시 몇 분간 먹통!
+  // 수정 로직:
+  //   - frameId가 크게 역전(gap > 5000)되면 새 세션 시작으로 판단 → 세션 리셋
+  //   - 소폭 역전(gap <= 5000)은 네트워크 순서 역전(reorder)으로 판단 → 드롭
+  if (frameId < latestFrameId) {
+    uint32_t gap = latestFrameId - frameId;
+    if (gap > 5000) {
+      // 큰 역전 = 재시작으로 판단 (Python이 frame_id를 0부터 다시 시작)
+      Serial.printf("[UDP] frame_id 큰 역전 감지 (gap=%u). 새 세션으로 판단, 리셋.\n", gap);
+      resetSessionState();
+      // 리셋 후 아래 로직으로 계속 진행
+    } else {
+      // 소폭 역전 = 네트워크 패킷 순서 역전 → 무시
+      return;
+    }
   }
 
+  // 새 프레임 시작
   if (frameId != latestFrameId) {
     latestFrameId = frameId;
     expectedChunks = totalChunks;
     receivedChunks = 0;
+    // [FIX] 비트마스크 초기화 (최대 MAX_CHUNKS_BITMASK 청크까지 추적)
+    chunkReceivedMask = 0;
+    if (totalChunks <= MAX_CHUNKS_BITMASK) {
+      chunkExpectedMask = (totalChunks == 32) ? 0xFFFFFFFF : ((1u << totalChunks) - 1);
+    } else {
+      chunkExpectedMask = 0; // 청크 수 초과: bitmask 비활성화, count 방식으로 폴백
+    }
   }
 
+  // 청크 데이터 복사
   size_t offset = (size_t)chunkIdx * PACKET_PAYLOAD_SIZE;
   if (offset + payloadLen <= MAX_JPEG_SIZE) {
     memcpy(rxBuffer + offset, data + 8, payloadLen);
-    receivedChunks++;
 
-    if (receivedChunks == expectedChunks && expectedChunks > 0) {
+    // [FIX] 청크 수신 추적: bitmask 방식으로 중복 수신 오동작 방지
+    if (expectedChunks <= MAX_CHUNKS_BITMASK) {
+      // bitmask 방식: 이미 받은 청크는 비트가 세팅돼 있으므로 중복 카운트 없음
+      if (chunkIdx < MAX_CHUNKS_BITMASK && !(chunkReceivedMask & (1u << chunkIdx))) {
+        chunkReceivedMask |= (1u << chunkIdx);
+        receivedChunks++;
+      }
+    } else {
+      // 청크 수 초과(32 이상): 기존 카운트 방식 폴백
+      receivedChunks++;
+    }
+
+    // 모든 청크 수신 완료 판정
+    bool allReceived = false;
+    if (expectedChunks <= MAX_CHUNKS_BITMASK) {
+      allReceived = (chunkReceivedMask == chunkExpectedMask);
+    } else {
+      allReceived = (receivedChunks == expectedChunks);
+    }
+
+    if (allReceived && expectedChunks > 0) {
       if (!isRendering) {
         size_t totalBytes = ((expectedChunks - 1) * PACKET_PAYLOAD_SIZE) + payloadLen;
         if (totalBytes >= 4 && rxBuffer[0] == 0xFF && rxBuffer[1] == 0xD8) {
           memcpy(renderBuffer, rxBuffer, totalBytes);
           renderBufferSize = totalBytes;
           hasNewFrame = true;
+        } else {
+          Serial.printf("[UDP] JPEG 매직 바이트 불일치! 첫 2바이트: 0x%02X 0x%02X\n", rxBuffer[0], rxBuffer[1]);
         }
       }
     }
@@ -450,6 +529,18 @@ void loop() {
 
     frameCount++;
     isRendering = false;
+  }
+
+  // ---- [FIX] 스트림 타임아웃 감지: 패킷이 오랫동안 없으면 세션 상태 리셋 ----
+  // 제어 패킷 수신 시 리셋되지 않는 경우(Python 재시작이 매우 빠를 때)를 대비한 이중 안전망
+  if (streamActive && lastPacketTime > 0) {
+    unsigned long now = millis();
+    if (now - lastPacketTime > STREAM_TIMEOUT_MS) {
+      Serial.printf("[TIMEOUT] %lums 동안 패킷 없음. 세션 상태 리셋.\n", now - lastPacketTime);
+      resetSessionState();
+      streamActive = false;
+      isReceiving  = false;
+    }
   }
 
   if (isReceiving) {
