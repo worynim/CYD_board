@@ -1,11 +1,13 @@
 /**
  * @file CYD_Wireless_Monitor.ino
- * @brief CYD(ESP32-2432S028) 무선 모니터 (LGFX_AUTODETECT 기반 안정화 원복 버전)
- * 
- * 1. LGFX_AUTODETECT를 통해 사용자의 CYD 보드 패널(ILI9341/ST7789)을 자동 인식하여 색상/방향 무결성 보장
+ * @brief CYD(ESP32-2432S028) 무선 모니터 (커스텀 LGFX 클래스 + 80MHz SPI/DMA 안정화 버전)
+ *
+ * 1. 커스텀 LGFX 클래스로 패널(ILI9341/ST7789)을 명시 지정하고 80MHz SPI + 하드웨어 DMA 구동
+ *    (LGFX_AUTODETECT 미사용 — 패널은 아래 CYD_PANEL_ST7789 매크로로 선택)
  * 2. 주변 Wi-Fi AP 터치 목록 선택 및 비밀번호 가상 키보드 입력
  * 3. 원격 가로/세로 화면 회전 제어 및 FPS 오버레이 제어
- * 4. AsyncUDP 초저지연 프레임 수신
+ * 4. AsyncUDP 초저지연 프레임 수신 (1-패리티 FEC 복원 지원)
+ * 5. JPEGDEC(Larry Bank) 고속 디코더로 렌더 병목 제거
  */
 
 #include <WiFi.h>
@@ -18,10 +20,12 @@
 // ==========================================
 // 1. 객체 및 설정 정의
 // ==========================================
-// LGFX 커스텀 설정: 패널 SPI를 80MHz + DMA로 구동 (자동감지 기본 40MHz보다 2배).
-// 기본값은 ILI9341 (대부분의 CYD). ST7789 버전 보드면 아래 주석을 해제:
+// LGFX 커스텀 설정: 패널 SPI를 80MHz + DMA로 직접 구동 (아래 CYD_SPI_FREQ_WRITE 참조).
+// 패널 종류 선택 — 현재 이 보드는 ST7789 패널이므로 CYD_PANEL_ST7789가 활성화되어 있다.
+// ILI9341 패널 보드라면 아래 #define을 주석 처리하면 된다 (offset_rotation도 함께 전환됨):
+//   - ST7789 : offset_rotation = 0 (아래 패널 config)
+//   - ILI9341: offset_rotation = 2
 #define CYD_PANEL_ST7789
-// 패널 종류는 시리얼 출력 "[Autodetect] Sunton_2432S028 (??? )"에서 확인할 수 있습니다.
 
 // 화면 SPI 클럭. 노이즈/색상 이상/글리치 발생 시 아래 값으로 낮춰 테스트하세요:
 //   80000000 (80MHz) → 60000000 (60MHz) → 40000000 (40MHz, 자동감지 기본)
@@ -121,7 +125,9 @@ const uint16_t UDP_PORT = 8888;
 
 static uint8_t rxBuffer[MAX_JPEG_SIZE];
 static uint8_t renderBuffer[MAX_JPEG_SIZE];
-static size_t renderBufferSize = 0;
+// renderBufferSize는 Core0(콜백)에서 쓰고 Core1(loop 렌더)에서 읽는 크로스코어 값 → volatile.
+// (hasNewFrame=true 직후에 쓰이므로 실질적으로는 순서상 안전하지만, 컴파일러 재정렬 방지 차원에서 명시)
+static volatile size_t renderBufferSize = 0;
 volatile bool isRendering = false;
 volatile bool hasNewFrame = false;
 // [FIX#R2] 렌더 중 완성된 프레임을 버리지 않고 "대기"시켜, 렌더 종료 직후 곧바로 스테이징한다.
@@ -132,7 +138,7 @@ volatile bool pendingCommit = false;
 static uint16_t expectedChunks = 0;
 static uint16_t receivedChunks = 0;
 static uint32_t latestFrameId = 0;
-static uint8_t currentRotation = 3; // 기본 180도 가로
+static uint8_t currentRotation = 3; // 기본 가로 정방향 (320x240). 코드 1이 가로 180° 반전 (프로토콜 표 참조)
 static bool showFpsOverlay = false;
 
 // ---- 재시작 감지용 타임아웃 ----
@@ -480,9 +486,11 @@ String getTouchInput(const String& prompt, bool isPassword) {
   return input;
 }
 
+// Wi-Fi 설정 모드 진입. 부팅 시 터치(forceSetup) 또는 스트리밍 중 3초 long-touch 시 호출된다.
+// 흐름: AP 목록 스캔 → 터치 선택 → 가상 키보드 비밀번호 입력 → NVS 저장 → (호출부에서 ESP.restart)
 void runTouchWifiSetup() {
-  lcd.setRotation(3);
-  
+  lcd.setRotation(3);  // 설정 UI는 항상 가로 정방향(320x240, 코드 3) 기준으로 그린다
+
   String selectedSsid = selectWifiFromList();
   String new_pass = getTouchInput("Password for: " + selectedSsid, true);
 
@@ -641,6 +649,12 @@ void onUdpPacketReceived(AsyncUDPPacket packet) {
     return;
   }
 
+  // ---- 데이터 패킷: 프레임 재조립 상태 전이 ----
+  // 프레임 수명주기:
+  //   1. 새 frame_id 수신 → latestFrameId 갱신 + 청크 마스크/카운터 초기화 (새 프레임 시작)
+  //   2. 각 청크를 rxBuffer에 저장 (FEC 모드면 마지막 청크는 parityBuffer로 분리)
+  //   3. 판정: dataMissing==0 → 즉시 커밋 · 데이터 1개 유실+패리티 → XOR 복원 후 커밋 · 그 외 → 대기
+  // 커밋(commitFrame)은 렌더(Core1) 중이면 pendingCommit만 세우고, loop()가 렌더 종료 후 스테이징한다.
   // ---- 데이터 패킷 ----
   // [FIX#R2] pendingCommit 동안 rxBuffer에는 "스테이징 대기 중인 완성 프레임"이 있다.
   // 새 프레임이 rxBuffer를 덮어쓰면 대기 프레임이 파괴되므로, loop()가 스테이징할 때까지
@@ -922,6 +936,9 @@ void loop() {
     lastStatTime = statNow;
   }
 
+  // ---- 스트리밍 중 3초 long-touch → Wi-Fi 재설정 모드 ----
+  // lcd.getTouch()는 소프트웨어 SPI(XPT2046) 폴링이라 매 루프마다 Core1 시간을 소모한다.
+  // 렌더와 경합하므로 스트리밍 중 폴링 스로틀이 필요 — OPTIMIZATION_PLAN.md P1-2 적용 후보 지점.
   static unsigned long touchStart = 0;
   uint16_t tx, ty;
   if (lcd.getTouch(&tx, &ty)) {

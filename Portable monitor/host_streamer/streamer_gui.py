@@ -33,12 +33,15 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 
+# UDP 데이터 페이로드 크기(바이트). 펌웨어 CYD_Wireless_Monitor.ino의
+# PACKET_PAYLOAD_SIZE(1400)와 반드시 일치해야 하는 크로스파일 계약 상수.
+# 다르면 청크 경계가 어긋나 화면이 깨지므로, 한쪽을 바꿀 때는 반드시 함께 바꿀 것.
 PAYLOAD_CHUNK_SIZE = 1400
 
 # [FIX #12] 디바이스 렌더 상한. rt≈54ms(픽셀 푸시 17ms + 디코드 37ms) → 최대 ~18fps.
 # 이보다 빠르게 전송하면 commitFrame()의 isRendering 가드에 걸려 프레임이 폐기됨
-# (호스트 전송 FPS만 높고 CYD는 recv≈0·drop 폭증). 안전 마진을 두고 16fps로 클램프.
-DEVICE_RENDER_FPS_CAP = 16
+# (호스트 전송 FPS만 높고 CYD는 recv≈0·drop 폭증). 안전 마진을 두고 20fps로 클램프.
+DEVICE_RENDER_FPS_CAP = 20
 
 
 @dataclass
@@ -68,7 +71,10 @@ class CYDStreamerGUI:
         self._frame_queue: queue.Queue | None = None         # 생산자→소비자 JPEG 큐
         self._stage_times: Dict[str, float] = {}             # 스테이지별 누적 타이밍 (2s 로그용)
         self._stage_last_log = 0.0
-        self._ui_stage: Dict[str, float] = {}                # GUI 표시용 스테이지 누적 (500ms 갱신)
+        # GUI 표시용 스테이지 누적 (500ms 갱신). 캡처 스레드가 쓰고 메인(Tkinter) 스레드가
+        # GIL 하에서 읽고 초기화하므로 lock이 없다 — benign race. 최악의 경우 통계 한 샘플이
+        # 유실될 뿐 동작엔 영향 없음 (단순 표시 전용 데이터).
+        self._ui_stage: Dict[str, float] = {}
         self._ui_frames: int = 0
         self.sock: socket.socket | None = None
         self._last_sent_ctrl: tuple = (-1, -1)  # 마지막으로 보낸 (rot_code, show_fps) — [FIX #11] 중복 전송 방지
@@ -352,6 +358,9 @@ class CYDStreamerGUI:
         except Exception:
             pass
 
+    # 회전 코드 매핑 — 펌웨어/CLAUDE.md의 프로토콜 표와 반드시 동기 유지할 것:
+    #   0 = portrait(240x320) · 1 = landscape 180°(reversed) · 2 = portrait 180°(reversed) · 3 = landscape(320x240, 기본)
+    # UI 콤보 인덱스: 0 자동감지 · 1 가로 정방향 · 2 가로 180° · 3 세로 · 4 세로 180°
     def get_target_rotation_code(self, monitor_idx: int) -> int:
         idx = self.rot_combo.current()
         if idx == 0:
@@ -523,6 +532,8 @@ class CYDStreamerGUI:
                     data_chunks = (total_len + PAYLOAD_CHUNK_SIZE - 1) // PAYLOAD_CHUNK_SIZE
                     padded = jpeg_bytes + b"\x00" * (data_chunks * PAYLOAD_CHUNK_SIZE - total_len)
 
+                    # 패리티(XOR) 계산: 1400B 블록을 bigint로 취급해 C 수준 XOR → 프레임당 ~0.1ms로
+                    # 캡처/인코딩(~30-40ms) 대비 미미. 의도적으로 단순하게 유지한다 (과최적화 금지).
                     parity = 0
                     for i in range(data_chunks):
                         parity ^= int.from_bytes(padded[i * PAYLOAD_CHUNK_SIZE:(i + 1) * PAYLOAD_CHUNK_SIZE], "little")
@@ -549,6 +560,8 @@ class CYDStreamerGUI:
                                   DEVICE_RENDER_FPS_CAP)
                     frame_period = 1.0 / eff_fps
                     total_packets = data_chunks + 1  # 데이터 + 패리티
+                    # 프레임 주기에서 10ms를 뺀 구간에 (데이터+패리티)를 균등 분산 → 프레임 간 10ms 여유.
+                    # inter_chunk 하한 1.5ms를 보장해 패킷이 몰리는 것을 방지한다.
                     inter_chunk = max(1.5e-3, (frame_period - 0.010) / total_packets)
 
                     for chunk_idx in range(total_packets):  # 마지막 인덱스 = 패리티

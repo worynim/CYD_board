@@ -32,8 +32,9 @@ Portable monitor/
 │   └── CYD_Wireless_Monitor.ino   # CYD(ESP32) 아두이노 펌웨어
 ├── host_streamer/
 │   ├── streamer_gui.py            # Mac/Windows 호스트 GUI 스트리머 (Tkinter)
-│   ├── streamer.py                # CLI 버전 스트리머
 │   └── requirements.txt           # Python 필수 라이브러리 목록
+├── PLAN.md                        # 2초 딜레이/네트워크 유실 진단 및 FEC 계획
+├── OPTIMIZATION_PLAN.md           # 코드 최적화 로드맵
 └── README.md                      # 프로젝트 설명서 (본 파일)
 ```
 
@@ -46,6 +47,7 @@ Portable monitor/
 1. **필요 라이브러리 설치**:
    - Arduino IDE 메뉴: `스케치` → `라이브러리 포함하기` → `라이브러리 관리...`
    - **`LovyanGFX`** 검색 후 최신 버전 설치.
+   - **`JPEGDEC`** (Larry Bank) 검색 후 설치 — 화면 렌더링에 사용되는 고속 JPEG 디코더.
    - *(AsyncUDP 및 Preferences 라이브러리는 ESP32 보드 패키지에 기본 내장되어 있습니다)*
 
 2. **Arduino IDE 보드 설정**:
