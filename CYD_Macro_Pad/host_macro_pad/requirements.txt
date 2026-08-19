@@ -1,2 +1,4 @@
 # pynput은 GUI가 아니라 격리된 입력 헬퍼(_input_helper.py)에서만 사용된다.
 pynput>=1.7.6
+# Pillow는 버튼 이름 이미지 렌더링(G: 71x61 JPEG 인코딩)에 사용된다.
+Pillow>=10.0.0

@@ -8,17 +8,30 @@
  * 3. 호스트가 보내는 버튼 라벨 설정 수신 (UDP 8890) → 4x3 터치 버튼 그리드 렌더
  * 4. 버튼 터치 → 호스트로 UDP 이벤트 전송 ("MPAD") → 호스트가 단축키/문구/앱 실행
  *
- * 의존 라이브러리: LovyanGFX (JPEGDEC은 불필요)
+ * 의존 라이브러리: LovyanGFX, JPEGDEC (버튼 이름 이미지 렌더, G)
  * 보드 설정: ESP32 Dev Module · Flash 4MB · Partition "Huge APP (3MB No OTA/1MB SPIFFS)"
  *
  * 와이어 프로토콜 (host_macro_pad/macro_pad_gui.py와 정확히 일치해야 함):
- *   - 설정 패킷 (호스트→디바이스): >IBBBB magic=0x4D434647("MCFG"), page, count, num_pages, 0
- *                                 + count개 엔트리(>BBB + label bytes: button_id, label_len, color_idx)
- *                                 라벨 최대 24바이트, color_idx는 아래 BTN_PALETTE 인덱스(0..9)
+ *   - 설정 패킷 (호스트→디바이스, v3): >IBBBB magic=0x4D434647("MCFG"), page, count, num_pages, rsvd
+ *                                 + page_name_len u8 + page_name(≤PAGE_NAME_MAX, 0 = 변경 없음) [A]
+ *                                 + count개 엔트리(>BBBBB + label + action_value:
+ *                                   button_id, label_len, color_idx, action_type, action_len)
+ *                                   라벨 ≤24B, action_value ≤ACTION_VAL_MAX(128)B
+ *                                   action_type: 0=shortcut 1=text 2=app [H]
+ *                                 count=0 = ACK(설정 없음, 호스트 IP 학습용) [H]
+ *                                 한 페이지가 MTU 초과 시 count/bid로 여러 패킷으로 분할 [H]
+ *   - 설정 요청 (호스트→디바이스, H): >IBBBB magic=0x4D524551("MREQ"), 0,0,0,0
+ *                                 → 디바이스가 MCFG 포맷 config 덤프 + MIMG 이미지 덤프를 회신
+ *   - 이미지 패킷 (호스트→디바이스, G): >IBBBB magic=0x4D494D47("MIMG"), page, button_id, format, 0
+ *                                 format: 0 = JPEG 바이트(버튼 71x61, 단일 UDP 패킷 ≤1400B)
+ *                                         1 = 이미지 제거(clear, 페이로드 없음) → 텍스트/색 사각형 폴백
+ *                                 — 한글 라벨/업로드 이미지 버튼은 설정 푸시 후 전송, ASCII/빈 라벨은 clear.
+ *                                 [H] LittleFS(/btns/p{p}_{b}.jpg)에 저장, 현재 페이지만 RAM 캐시.
  *   - 이벤트 패킷 (디바이스→호스트): >IBBBB magic=0x4D504144("MPAD"), page, button_id, 0, 0
  *   - 디스커버리 비콘 (디바이스→서브넷 브로드캐스트): >IBBBB magic=0x4D504245("MPBE"), 0, 0, 0, 0
- *     Wi-Fi 연결 후 3초 주기로 전송 — 호스트 리스너가 소스 IP를 보고 자동으로 설정을 푸시
+ *     Wi-Fi 연결 후 3초 주기로 전송 — 호스트 리스너가 ACK(MCFG count=0)로 응답 [H]
  *   - 디바이스는 가장 최근 설정 패킷의 소스 IP/포트로 이벤트를 전송
+ *   - [H] 전체 설정은 LittleFS /config.bin에 저장 — 부팅/페이지 전환 시 플래시에서 복원(오프라인 동작).
  */
 
 #include <WiFi.h>
@@ -28,6 +41,8 @@
 #include <WiFiUdp.h>
 #include <vector>
 #include <LovyanGFX.hpp>
+#include <JPEGDEC.h>   // [G] 버튼 이름 이미지(JPEG) 디코더. Arduino 라이브러리 매니저 "JPEGDEC" 필요.
+#include <LittleFS.h>  // [H] 전체 설정/이미지 내장 저장 (Huge APP 파티션의 1MB SPIFFS 파티션을 마운트)
 
 // ==========================================
 // 1. 객체 및 설정 정의
@@ -133,6 +148,7 @@ static LGFX lcd;
 #define MAGIC_BEACON     0x4D504245      // "MPBE" 디스커버리 비콘 (디바이스→브로드캐스트)
 #define MAGIC_OK         0x4D504F4B      // "MPOK" 액션 성공 피드백 (호스트→디바이스, B)
 #define MAGIC_ERR        0x4D504552      // "MPER" 액션 실패 피드백 (호스트→디바이스, B)
+#define MAGIC_IMAGE      0x4D494D47      // "MIMG" 버튼 이름 이미지 (호스트→디바이스, G)
 #define FEEDBACK_MS      300             // 버튼 플래시 지속 시간 (B)
 #define BEACON_INTERVAL_MS  3000         // 비콘 재전송 주기 (호스트가 IP 자동 검색)
 #define MAX_PAGES        8               // 최대 페이지 수 (호스트와 일치)
@@ -143,6 +159,20 @@ static LGFX lcd;
 #define LABEL_MAX        24              // 라벨 최대 바이트 (호스트와 동일)
 #define PAGE_NAME_MAX    20              // 페이지 이름 최대 바이트 (호스트와 동일, A)
 #define BTN_COLOR_COUNT  10              // 버튼 팔레트 색 수 (호스트 COLOR_NAMES와 일치)
+#define IMG_MAX_BYTES    2048            // [G] 단일 이미지(JPEG) 바이트 상한 (방어 — 호스트는 ≤1400 맞춤)
+#define IMG_REDRAW_DELAY 50              // [G] 이미지 배치 도착 후 재렌더 debounce(ms) — 버스트 1회 합침
+#define IMG_BUDGET_BYTES (96 * 1024)     // [G] 이미지 RAM 총 예산 (내부 DRAM, 최대 96장×1KB).
+                                         //     [H] 거부 로직 제거 — 이미지는 LittleFS(/btns)에 저장되고
+                                         //     현재 페이지만 RAM에 캐시(≤12×1400B)하므로 전역 예산 불필요.
+#define MAGIC_REQUEST     0x4D524551      // "MREQ" 설정 덤프 요청 (호스트→디바이스, H)
+#define ACTION_VAL_MAX    128             // 액션 값(action_value) 최대 바이트 (호스트와 일치, H)
+#define CFG_MAGIC         0x4D504346      // "MPCF" config.bin 매직 (H)
+#define CFG_VERSION       3               // config.bin 버전 (H)
+#define CONFIG_BIN_PATH   "/config.bin"   // 전체 설정 저장 파일 (H)
+#define BTNS_DIR          "/btns"         // 버튼 이미지 저장 디렉터리 (H)
+#define CONFIG_SAVE_DEBOUNCE_MS 500       // [H] config.bin 저장 debounce — 다중 패킷 푸시를 1회 쓰기로 (웨어 방지)
+#define LABELS_REDRAW_DELAY 50            // [H] labelsDirty 재렌더 debounce — 다중 패킷 푸시 플리커 방지
+#define MCFG_CHUNK_MAX      1200          // [H] MCFG 푸시/덤프 청크 상한 (UDP 단일 패킷 안전)
 
 // ==========================================
 // 3. UI 지오메트리 (320x240 가로 정방향, 회전 코드 3)
@@ -216,6 +246,16 @@ uint8_t currentPage = 0;
 char pageNames[MAX_PAGES][PAGE_NAME_MAX + 1] = {};   // 페이지 이름 (설정 패킷으로 채움, A)
 Preferences prefsPad;   // 마지막 페이지/페이지 수 복원용 NVS (네임스페이스 "cyd_mpad", E)
 
+// [H] 버튼 액션 저장 (호스트가 v3 MCFG로 전송). 실행은 항상 호스트 — 여기선 저장만.
+uint8_t btnActionType[MAX_PAGES][BUTTONS_PER_PAGE] = {};   // 0=shortcut 1=text 2=app
+char    btnActionVal[MAX_PAGES][BUTTONS_PER_PAGE][ACTION_VAL_MAX + 1] = {};   // 96×129 = 12,384B
+
+// [H] LittleFS 상태 (config.bin / /btns 이미지)
+bool fsMounted = false;                        // LittleFS 마운트 성공 여부
+volatile bool configSaveDirty = false;         // 콜백이 세우고 loop()가 디바운스 후 1회 저장
+volatile unsigned long configDirtyTime = 0;    // 마지막 설정 변경 시각 (저장 디바운스 기준)
+volatile unsigned long labelsDirtyTime = 0;    // 마지막 라벨 변경 시각 (재렌더 디바운스 기준, H)
+
 // 호스트 주소 (가장 최근 설정 패킷의 소스로 학습)
 IPAddress hostIP;
 uint16_t hostPort = 0;
@@ -238,6 +278,43 @@ static bool feedbackOk = false;
 static unsigned long feedbackUntil = 0;
 static bool feedbackPending = false;   // AsyncUDP 콜백이 세우고 loop()가 소비 (레이스 방지)
 
+// [G] 버튼 이름 이미지(JPEG) 저장소 — 호스트 MIMG 패킷이 채운다. RAM 동적 할당.
+// (PLAN H에서 LittleFS 저장으로 이전 예정 — 여기선 RAM 캐시. 부팅 후 첫 푸시까지는 텍스트 폴백)
+static JPEGDEC jpeg;                                  // JPEG 디코더 (JPEGDEC, Larry Bank)
+uint8_t* imgJpeg[MAX_PAGES][BUTTONS_PER_PAGE] = {};   // JPEG 바이트 버퍼 (nullptr = 없음)
+uint16_t imgSize[MAX_PAGES][BUTTONS_PER_PAGE] = {};   // 버퍼 바이트 수
+uint32_t imgHeapUsed = 0;                             // 이미지 저장에 쓰인 힙 총량(바이트)
+volatile bool imagesDirty = false;                    // 이미지 도착 → loop()가 debounce 후 재렌더
+volatile unsigned long lastImageTime = 0;             // 마지막 이미지 도착 시각 (debounce 기준)
+static uint32_t statImgRecv = 0;                      // [STAT] 수신 이미지 패킷 수
+static uint32_t statImgNew = 0;                       // [STAT] 실제 저장(변경)된 이미지 수
+static uint32_t statImgDrop = 0;                      // [STAT] 예산 초과로 거부된 이미지 수
+
+// [G] 이미지 패킷을 loop()로 넘기는 pending 큐. AsyncUDP 콜백(loop()와 다른 코어)은
+//     원본 JPEG를 임시 버퍼에 복사해 여기 넣기만 하고, imgJpeg/imgSize/imgHeapUsed 변경과
+//     free는 전부 loop()의 applyPendingImages()가 단일 task로 수행한다. 코어 간 공유 상태를
+//     없애 이중 해제/use-after-free(heap_caps_free 어설션 → 무한 리셋)를 원천 차단한다.
+#define IMG_PENDING_QUEUE 128                         // 배치(96개 최대) 초과 여유
+typedef struct {
+  uint8_t  page, bid;        // 대상 버튼
+  uint8_t  fmt;              // 0 = JPEG 저장 · 1 = clear
+  uint8_t* buf;              // fmt=0: JPEG 바이트 (malloc) — 소유권은 loop()로 이전
+  uint16_t len;              // fmt=0: JPEG 길이
+} PendingImage;
+static PendingImage imgPending[IMG_PENDING_QUEUE] = {};
+static volatile uint16_t imgPendingHead = 0, imgPendingTail = 0;
+static portMUX_TYPE imgPendingMux = portMUX_INITIALIZER_UNLOCKED;
+
+// [H] MREQ 수신 → loop()로 이전 (AsyncUDP 콜백에서 LittleFS I/O/UDP 전송 금지 — 교차 코어 안전).
+//     콜백은 mux 아래 필드만 세우고, loop()가 소비해 실제 덤프를 전송한다.
+typedef struct {
+  IPAddress ip;          // 덤프를 보낼 호스트 주소
+  uint16_t  port;
+  bool      pending;     // loop()가 소비하면 false
+} PendingDump;
+static PendingDump dumpReq;
+static portMUX_TYPE dumpReqMux = portMUX_INITIALIZER_UNLOCKED;
+
 // ==========================================
 // 5. 함수 선언
 // ==========================================
@@ -253,12 +330,27 @@ void drawErrorScreen(const char* msg);
 void drawReadyScreen();
 void drawGrid(uint8_t page);
 void drawButton(uint8_t page, uint8_t idx, bool pressed);
+void drawButtonImage(uint8_t page, uint8_t idx, int x, int y, bool pressed);
+void drawButtonText(uint8_t page, uint8_t idx, int x, int y, bool pressed);
 void drawButtonFlash(uint8_t page, uint8_t idx, uint16_t fill);
 void drawStatusBar();
 void updateBrightness();
 void onFeedbackPacket(AsyncUDPPacket packet);
+void onImagePacket(AsyncUDPPacket packet);
+void applyPendingImages();
+int jpegBtnCallback(JPEGDRAW* pDraw);
+uint16_t countImages();
 void handleTouch();
 bool hitButton(uint16_t tx, uint16_t ty, int* col, int* row);
+// [H] LittleFS 헬퍼
+int writeButtonImageFlash(uint8_t page, uint8_t bid, const uint8_t* buf, uint16_t len);   // 1=저장 0=동일생략 -1=실패
+bool deleteButtonImageFlash(uint8_t page, uint8_t bid);
+void loadPageImages(uint8_t page);
+void freePageImages(uint8_t page);
+bool loadConfigFromFlash(void);
+void saveConfigToFlash(void);
+void sendConfigDump(IPAddress ip, uint16_t port);
+void sendImageDump(IPAddress ip, uint16_t port);
 
 // ==========================================
 // 6. Setup 함수
@@ -278,16 +370,47 @@ void setup() {
   stored_ssid = prefs.getString("ssid", "");
   stored_pass = prefs.getString("pass", "");
 
-  // [E] 마지막 페이지 복원: 이전 세션의 페이지 수/인덱스를 NVS에서 읽어 부팅 시 복원
-  // (페이지 전환 후 5초 디바운스로 저장 — loop() 참조, NVS 웨어 방지)
+  // [E][H] 마지막 페이지/전체 설정 복원:
+  //  - 전체 설정(라벨/색/액션/페이지 이름/num_pages)은 LittleFS /config.bin 우선 (H)
+  //  - config.bin 부재/손상 시 NVS(cyd_mpad)의 페이지 수로 폴백 (E)
+  //  - currentPage(마지막 페이지)는 항상 NVS lastPage에서 읽어 config.bin numPages에 클램프
   prefsPad.begin("cyd_mpad", false);
-  uint8_t savedPages = prefsPad.getUChar("numPages", DEFAULT_PAGES);
-  if (savedPages < 1) savedPages = 1;
-  if (savedPages > MAX_PAGES) savedPages = MAX_PAGES;
-  numPages = savedPages;
   uint8_t savedPage = prefsPad.getUChar("lastPage", 0);
+
+  // [H] LittleFS 마운트 — udp.listen() 이전에 완료해 AsyncUDP 콜백과 FS/힙 레이스 방지.
+  //     이 1MB 파티션은 이번 기능(H)이 처음 쓰는 영역이라, 미사용 잔재(이전 데이터/랜덤 비트)가
+  //     있으면 "Corrupted dir pair"(-84 = LFS_ERR_CORRUPT)로 마운트에 실패한다. 일부 코어는
+  //     자동 포맷을 하지 않으므로, 실패 시 포맷 후 1회 재시도해 자가치유한다. 그래도 실패하면
+  //     순수 RAM 모드로 동작한다 (기존처럼 설정은 푸시로 유지, 저장/불러오기만 비활성).
+  fsMounted = LittleFS.begin();
+  if (!fsMounted) {
+    Serial.println("[FS] LittleFS 마운트 실패 — 포맷 후 재시도");
+    bool formatted = LittleFS.format();
+    fsMounted = formatted && LittleFS.begin();
+    if (!fsMounted) {
+      Serial.println(formatted ? "[FS] 포맷 후에도 마운트 실패 — 저장 비활성 (RAM 모드)"
+                               : "[FS] 포맷 실패 — 저장 비활성 (RAM 모드)");
+    } else {
+      Serial.println("[FS] 포맷 후 마운트 OK");
+    }
+  } else {
+    Serial.println("[FS] LittleFS 마운트 OK");
+  }
+  if (fsMounted && !LittleFS.exists(BTNS_DIR)) LittleFS.mkdir(BTNS_DIR);
+
+  bool loaded = false;
+  if (fsMounted) loaded = loadConfigFromFlash();
+  if (!loaded) {
+    uint8_t savedPages = prefsPad.getUChar("numPages", DEFAULT_PAGES);
+    if (savedPages < 1) savedPages = 1;
+    if (savedPages > MAX_PAGES) savedPages = MAX_PAGES;
+    numPages = savedPages;
+  }
   if (savedPage >= numPages) savedPage = 0;
   currentPage = savedPage;
+
+  // [H] 현재 페이지 이미지 플래시 → RAM 로드 (부팅 즉시 이전 화면 복원, 이미지 포함 오프라인)
+  if (fsMounted) loadPageImages(currentPage);
 
   uint16_t tx, ty;
   bool forceSetup = lcd.getTouch(&tx, &ty);
@@ -601,6 +724,26 @@ void onConfigPacket(AsyncUDPPacket packet) {
     return;
   }
 
+  // [G] 버튼 이름 이미지 (MIMG): JPEG 저장 (호스트가 설정 푸시 후 전송)
+  if (magic == MAGIC_IMAGE) {
+    onImagePacket(packet);
+    return;
+  }
+
+  // [H] 설정 덤프 요청 (MREQ): 소스 IP/포트로 MCFG config 덤프 + MIMG 이미지 덤프 회신.
+  //     실제 전송은 loop()가 수행 (AsyncUDP 콜백에서 LittleFS I/O/UDP 전송 금지).
+  if (magic == MAGIC_REQUEST) {
+    hostIP = packet.remoteIP();
+    hostPort = packet.remotePort();
+    hostKnown = true;
+    portENTER_CRITICAL(&dumpReqMux);
+    dumpReq.ip = packet.remoteIP();
+    dumpReq.port = packet.remotePort();
+    dumpReq.pending = true;
+    portEXIT_CRITICAL(&dumpReqMux);
+    return;
+  }
+
   if (magic != MAGIC_CONFIG) return;
 
   // 호스트 주소 학습: 가장 최근 설정 패킷의 소스로 이벤트 전송 대상을 갱신
@@ -614,13 +757,20 @@ void onConfigPacket(AsyncUDPPacket packet) {
   if (count > BUTTONS_PER_PAGE) count = BUTTONS_PER_PAGE;
 
   // 페이지 수 갱신 (헤더 3번째 필드 = num_pages) — 상태바 "PAGE x/y" 반영
-  uint8_t np = d[6];
-  if (np < 1) np = 1;
-  if (np > MAX_PAGES) np = MAX_PAGES;
-  if (np != numPages) {
-    numPages = np;
-    if (currentPage >= numPages) currentPage = numPages - 1;
-    labelsDirty = true;
+  // [H] count==0(ACK)일 때는 상태 변화 없이 IP만 학습하도록 게이트 — 호스트 비콘 ACK가
+  //     numPages를 잘못 클램프하지 않게 한다 (ACK의 num_pages는 항상 호스트의 실제 페이지 수).
+  if (count > 0) {
+    uint8_t np = d[6];
+    if (np < 1) np = 1;
+    if (np > MAX_PAGES) np = MAX_PAGES;
+    if (np != numPages) {
+      numPages = np;
+      if (currentPage >= numPages) currentPage = numPages - 1;
+      labelsDirty = true;
+      labelsDirtyTime = millis();
+      configSaveDirty = true;   // [H] numPages 변경도 config.bin에 반영
+      configDirtyTime = millis();
+    }
   }
 
   bool changed = false;
@@ -642,17 +792,22 @@ void onConfigPacket(AsyncUDPPacket packet) {
     off += nameLen;
   }
 
-  // 엔트리는 가변 길이(>BBB + label bytes) → 고정 오프셋이 아니라 순차 탐색해야 한다.
+  // 엔트리는 가변 길이(>BBBBB + label bytes + action_value bytes, v3) → 고정 오프셋이 아니라 순차 탐색해야 한다.
   for (uint8_t i = 0; i < count; i++) {
-    if (off + 3 > len) break;
-    uint8_t bid = d[off];
-    uint8_t llen = d[off + 1];
-    uint8_t col = d[off + 2];
-    off += 3;
+    if (off + 5 > len) break;
+    uint8_t bid   = d[off];
+    uint8_t llen  = d[off + 1];
+    uint8_t col   = d[off + 2];
+    uint8_t atype = d[off + 3];
+    uint8_t alen  = d[off + 4];
+    off += 5;
     if (bid >= BUTTONS_PER_PAGE) continue;
     if (col >= BTN_COLOR_COUNT) col = 0;
+    if (atype > 2) atype = 0;                          // [H] 0=shortcut 1=text 2=app
     if (off + llen > len) llen = len - off;
     if (llen > LABEL_MAX) llen = LABEL_MAX;
+    if (off + llen + alen > len) alen = len - off - llen;
+    if (alen > ACTION_VAL_MAX) alen = ACTION_VAL_MAX;  // [H] action_value ≤ 128B
 
     if (btnColors[page][bid] != col) {
       btnColors[page][bid] = col;
@@ -668,11 +823,28 @@ void onConfigPacket(AsyncUDPPacket packet) {
       changed = true;
     }
     off += llen;
+
+    // [H] 액션 저장 — 실행은 항상 호스트(pynput/pbcopy 격리)가 하므로 여기선 저장만.
+    char tav[ACTION_VAL_MAX + 1];
+    memcpy(tav, d + off, alen);
+    tav[alen] = '\0';
+    off += alen;
+    if (btnActionType[page][bid] != atype) {
+      btnActionType[page][bid] = atype;
+      changed = true;
+    }
+    if (strcmp(tav, btnActionVal[page][bid]) != 0) {
+      strncpy(btnActionVal[page][bid], tav, ACTION_VAL_MAX + 1);
+      changed = true;
+    }
   }
 
   statConfigs++;
   if (changed) {
-    labelsDirty = true;   // loop()가 그리드 재렌더
+    labelsDirty = true;   // loop()가 디바운스 후 그리드 재렌더
+    labelsDirtyTime = millis();
+    configSaveDirty = true;   // [H] loop()가 디바운스 후 config.bin 1회 저장 (웨어 방지)
+    configDirtyTime = millis();
     String hip = hostIP.toString();
     Serial.printf("[CFG] page=%u count=%u pages=%u host=%s:%u\n",
                   page, count, numPages, hip.c_str(), hostPort);
@@ -697,6 +869,439 @@ void onFeedbackPacket(AsyncUDPPacket packet) {
   feedbackUntil = millis() + FEEDBACK_MS;
   feedbackPending = true;   // loop()에서 실제 렌더 — AsyncUDP 콜백에서 직접 그리면 레이스
   Serial.printf("[FB] page=%u btn=%u %s\n", page, btn, ok ? "OK" : "ERR");
+}
+
+// ==========================================
+// 9.5 버튼 이름 이미지 수신 (MIMG) — G
+// ==========================================
+// onImagePacket은 AsyncUDP 콜백에서 실행된다 (loop()와 다른 코어일 수 있음). 그래서
+// imgJpeg/imgSize/imgHeapUsed/free를 절대 직접 건드리지 않고, 원본 JPEG를 임시 버퍼에
+// 복사한 (page,bid,fmt,len)만 imgPending 큐에 넣는다. 실제 저장/해제/회계는 전부 loop()의
+// applyPendingImages()가 단일 task로 수행 — 코어 간 경합으로 인한 이중 해제/use-after-free
+// (heap_caps_free 어설션 → 무한 리셋)를 원천 차단한다.
+void onImagePacket(AsyncUDPPacket packet) {
+  size_t len = packet.length();
+  if (len < 8) return;
+  const uint8_t* d = packet.data();
+
+  uint8_t page = d[4], bid = d[5], fmt = d[6];
+  if (page >= MAX_PAGES || bid >= BUTTONS_PER_PAGE) return;
+
+  PendingImage pi = { page, bid, fmt, nullptr, 0 };
+
+  // [G] format 1 = 이미지 제거(clear): 해당 버튼은 펌웨어 텍스트/색 사각형으로 폴백.
+  //     ASCII/빈 라벨 버튼에 대해 호스트가 매 푸시마다 보낸다. (한글→ASCII 전환 시
+  //     스테일 이미지 제거) — 큐에 기록만 하고 free는 loop()가 수행한다.
+  if (fmt == 1) {
+    // 위 pi 기본값 그대로 (buf=nullptr, len=0)
+  } else if (fmt == 0) {                       // format 0 = JPEG
+    size_t jlen = len - 8;
+    if (jlen == 0 || jlen > IMG_MAX_BYTES) return;
+    uint8_t* buf = (uint8_t*)malloc(jlen);
+    if (!buf) {
+      Serial.println("[IMG] malloc 실패");
+      return;
+    }
+    memcpy(buf, d + 8, jlen);
+    pi.buf = buf;
+    pi.len = (uint16_t)jlen;
+  } else {
+    return;                                    // 예약 형식
+  }
+
+  portENTER_CRITICAL(&imgPendingMux);
+  uint16_t next = (uint16_t)((imgPendingHead + 1) % IMG_PENDING_QUEUE);
+  if (next == imgPendingTail) {                // 가득 참 → 이번 요청은 폐기
+    portEXIT_CRITICAL(&imgPendingMux);
+    if (pi.buf) free(pi.buf);                  // loop()로 소유권을 넘기지 못했으므로 여기서 해제
+    static bool warned = false;
+    if (!warned) { Serial.println("[IMG] pending-queue overflow (요청 폐기)"); warned = true; }
+    return;
+  }
+  imgPending[imgPendingHead] = pi;
+  imgPendingHead = next;
+  portEXIT_CRITICAL(&imgPendingMux);
+
+  // 재렌더 여부(imagesDirty)는 applyPendingImages()가 실제 변경이 있을 때만 세운다.
+  // 여기서 무조건 세우면 3초 비콘 재푸시(중복 이미지)마다 그리드가 전체 리렌더되어 깜빡인다.
+  lastImageTime = millis();
+}
+
+// loop() 최상단에서 호출 — pending 큐를 비우며 모든 이미지 버퍼 변경/해제를 단일 task에서
+// 수행한다. 여기서 free한 버퍼는 그려지기 전에 이미 imgJpeg에서 분리됐으므로 decode 중
+// free 레이스가 없다. (기존 deferImgFree/drainImgFreeQueue의 교차 코어 경합을 제거)
+void applyPendingImages() {
+  while (true) {
+    PendingImage pi;
+    portENTER_CRITICAL(&imgPendingMux);
+    if (imgPendingHead == imgPendingTail) {
+      portEXIT_CRITICAL(&imgPendingMux);
+      break;
+    }
+    pi = imgPending[imgPendingTail];
+    imgPendingTail = (uint16_t)((imgPendingTail + 1) % IMG_PENDING_QUEUE);
+    portEXIT_CRITICAL(&imgPendingMux);
+
+    // 페이지 수 감소로 잘린 페이지 대상이면 폐기 (trim이 이미 해제한 범위)
+    if (pi.page >= numPages) {
+      if (pi.buf) free(pi.buf);
+      continue;
+    }
+
+    if (pi.fmt == 1) {                         // clear: 플래시 파일 삭제 + 현재 페이지면 RAM 해제
+      bool flashRemoved = deleteButtonImageFlash(pi.page, pi.bid);   // [H]
+      uint8_t* cur = imgJpeg[pi.page][pi.bid];
+      if (cur) {
+        uint16_t sz = imgSize[pi.page][pi.bid];
+        imgJpeg[pi.page][pi.bid] = nullptr;
+        imgSize[pi.page][pi.bid] = 0;
+        imgHeapUsed -= sz;
+        free(cur);
+        imagesDirty = true;                    // 실제 제거가 있었을 때만 재렌더 (중복 clear는 no-op)
+        Serial.printf("[IMG] clear p=%u b=%u flash=%d\n", pi.page, pi.bid, (int)flashRemoved);
+      }
+    } else if (pi.fmt == 0 && pi.buf) {        // JPEG 저장
+      uint8_t* cur = imgJpeg[pi.page][pi.bid];
+      uint16_t curSize = imgSize[pi.page][pi.bid];
+      statImgRecv++;
+
+      // [H] 플래시 저장 (기존 파일과 memcmp → 동일하면 생략, 웨어 방지).
+      //     비현재 페이지도 여기서 /btns/p{p}_{b}.jpg에 영구 저장된다.
+      //     flashRes: 1=저장(신규/변경) 0=동일생략 -1=실패
+      int flashRes = writeButtonImageFlash(pi.page, pi.bid, pi.buf, pi.len);
+
+      // [H] RAM은 현재 페이지만 캐시 — 비현재 페이지는 플래시에만 저장하고
+      //     페이지 전환 시 loadPageImages()로 로드한다 (오프라인 페이지 네비게이션).
+      bool ramChanged = false;
+      if (pi.page == currentPage) {
+        // 동일 이미지면 스킵 — malloc/free 회전과 재렌더를 막는다 (변경 시에만 갱신 관례)
+        if (cur && curSize == pi.len && memcmp(cur, pi.buf, pi.len) == 0) {
+          free(pi.buf);                        // 중복 → 새 임시 버퍼만 폐기
+        } else {
+          imgSize[pi.page][pi.bid] = pi.len;   // 크기 → 포인터 순 (같은 세대 조합)
+          imgJpeg[pi.page][pi.bid] = pi.buf;
+          imgHeapUsed += (uint32_t)pi.len;
+          imgHeapUsed -= curSize;
+          statImgNew++;
+          if (cur) free(cur);                  // 이전 버퍼 — 같은 task에서 해제
+          ramChanged = true;
+        }
+      } else {
+        // 비현재 페이지: 이전 캐시가 남아 있으면 해제 (플래시가 소스 — 다시 로드됨)
+        if (cur) {
+          imgJpeg[pi.page][pi.bid] = nullptr;
+          imgSize[pi.page][pi.bid] = 0;
+          imgHeapUsed -= curSize;
+          free(cur);
+        }
+        free(pi.buf);                          // 임시 버퍼 소유권 해제
+      }
+      if (ramChanged) {
+        imagesDirty = true;                    // 실제 저장/교체가 있었을 때만 재렌더
+      }
+      const char* flashLabel = (flashRes == 1) ? "저장" : (flashRes == 0 ? "동일생략" : "실패");
+      Serial.printf("[IMG] p=%u b=%u %uB flash=%s(%d) ram=%d imgHeap=%uB\n",
+                    pi.page, pi.bid, (unsigned)pi.len, flashLabel, flashRes, (int)ramChanged, (unsigned)imgHeapUsed);
+    } else {
+      if (pi.buf) free(pi.buf);                // 형식 불일치 등 — 방어적 해제
+    }
+  }
+}
+
+// [H] 버튼 이미지를 LittleFS /btns/p{page}_{bid}.jpg에 저장.
+//     반환: 1=기록함(신규/변경), 0=동일 내용이라 생략(웨어 보호), -1=실패(FS 미마운트/쓰기 오류).
+//     실패 시 구체적 원인을 [FS] 로그로 남긴다 (진단: 마운트 실패 vs 파일 오픈 실패 vs 부분 쓰기).
+int writeButtonImageFlash(uint8_t page, uint8_t bid, const uint8_t* buf, uint16_t len) {
+  if (!fsMounted) {
+    Serial.printf("[FS] 이미지 저장 실패 — LittleFS 미마운트: /btns/p%u_%u.jpg (파티션 확인: Huge APP)\n",
+                  page, bid);
+    return -1;
+  }
+  char path[32];
+  snprintf(path, sizeof(path), "/btns/p%u_%u.jpg", page, bid);
+  if (LittleFS.exists(path)) {
+    File f = LittleFS.open(path, "r");
+    if (f) {
+      bool same = (f.size() == len);
+      if (same) {
+        uint8_t chunk[256];
+        uint16_t off = 0;
+        while (same && off < len) {
+          size_t rd = f.read(chunk, min((size_t)sizeof(chunk), (size_t)(len - off)));
+          if (rd == 0) { same = false; break; }
+          if (memcmp(chunk, buf + off, rd) != 0) same = false;
+          off += (uint16_t)rd;
+        }
+      }
+      f.close();
+      if (same) return 0;       // 내용 동일 → 쓰지 않음 (웨어 보호)
+    }
+  }
+  File w = LittleFS.open(path, "w");
+  if (!w) {
+    Serial.printf("[FS] 이미지 저장 실패 — %s 열기(쓰기) 오류\n", path);
+    return -1;
+  }
+  size_t written = w.write(buf, len);
+  w.close();
+  if (written != len) {
+    Serial.printf("[FS] 이미지 저장 실패 — 부분 쓰기 %u/%u (%s)\n", (unsigned)written, (unsigned)len, path);
+    return -1;
+  }
+  return 1;
+}
+
+// [H] 버튼 이미지 파일 삭제. 파일이 있었고 삭제했으면 true, 없었으면 false.
+bool deleteButtonImageFlash(uint8_t page, uint8_t bid) {
+  if (!fsMounted) return false;
+  char path[32];
+  snprintf(path, sizeof(path), "/btns/p%u_%u.jpg", page, bid);
+  if (!LittleFS.exists(path)) return false;
+  LittleFS.remove(path);
+  return true;
+}
+
+// [H] 페이지의 이미지를 플래시 → RAM으로 로드 (부팅/페이지 전환 시). 이미 로드된 슬롯은 유지.
+//     loop()/setup() task에서만 호출 (교차 코어에서 힙 조작 금지).
+void loadPageImages(uint8_t page) {
+  if (!fsMounted) return;
+  for (uint8_t b = 0; b < BUTTONS_PER_PAGE; b++) {
+    if (imgJpeg[page][b]) continue;   // 이미 캐시됨
+    char path[32];
+    snprintf(path, sizeof(path), "/btns/p%u_%u.jpg", page, b);
+    File f = LittleFS.open(path, "r");
+    if (!f) continue;
+    size_t sz = f.size();
+    if (sz == 0 || sz > IMG_MAX_BYTES) { f.close(); continue; }
+    uint8_t* buf = (uint8_t*)malloc(sz);
+    if (!buf) { f.close(); continue; }
+    if (f.read(buf, sz) != sz) { free(buf); f.close(); continue; }
+    f.close();
+    imgJpeg[page][b] = buf;
+    imgSize[page][b] = (uint16_t)sz;
+    imgHeapUsed += (uint32_t)sz;
+  }
+}
+
+// [H] 페이지의 이미지 RAM 슬롯 해제 (페이지 이탈 시). 플래시 파일은 유지 — 다시 로드 가능.
+void freePageImages(uint8_t page) {
+  for (uint8_t b = 0; b < BUTTONS_PER_PAGE; b++) {
+    uint8_t* cur = imgJpeg[page][b];
+    if (cur) {
+      uint16_t sz = imgSize[page][b];
+      imgJpeg[page][b] = nullptr;
+      imgSize[page][b] = 0;
+      imgHeapUsed -= sz;
+      free(cur);
+    }
+  }
+}
+
+// 현재 저장된 이미지 수 (nullptr 아닌 슬롯) — [STAT] 표시용
+uint16_t countImages() {
+  uint16_t n = 0;
+  for (uint8_t p = 0; p < MAX_PAGES; p++)
+    for (uint8_t b = 0; b < BUTTONS_PER_PAGE; b++)
+      if (imgJpeg[p][b]) n++;
+  return n;
+}
+
+// [H] 전체 설정(RAM) → LittleFS /config.bin (A.4 포맷). 내용이 실제로 바뀌었을 때만
+//     loop()가 호출(디바운스) — 웨어 방지. 최악 ~15KB를 힙 임시 버퍼에 조립 후 1회 쓰기.
+void saveConfigToFlash() {
+  if (!fsMounted) return;
+  uint8_t np = numPages;
+  if (np < 1) np = 1;
+  if (np > MAX_PAGES) np = MAX_PAGES;
+
+  size_t cap = 6;
+  for (uint8_t p = 0; p < np; p++) {
+    cap += 1 + (size_t)strlen(pageNames[p]);
+    for (uint8_t b = 0; b < BUTTONS_PER_PAGE; b++)
+      cap += 1 + (size_t)strlen(labels[p][b]) + 3 + (size_t)strlen(btnActionVal[p][b]);
+  }
+  uint8_t* buf = (uint8_t*)malloc(cap);
+  if (!buf) { Serial.println("[FS] config.bin 저장 실패 (메모리)"); return; }
+
+  size_t off = 0;
+  buf[off++] = (uint8_t)(CFG_MAGIC >> 24); buf[off++] = (uint8_t)(CFG_MAGIC >> 16);
+  buf[off++] = (uint8_t)(CFG_MAGIC >> 8);  buf[off++] = (uint8_t)CFG_MAGIC;
+  buf[off++] = CFG_VERSION;
+  buf[off++] = np;
+  for (uint8_t p = 0; p < np; p++) {
+    size_t nlen = strlen(pageNames[p]);
+    buf[off++] = (uint8_t)nlen;
+    memcpy(buf + off, pageNames[p], nlen); off += nlen;
+    for (uint8_t b = 0; b < BUTTONS_PER_PAGE; b++) {
+      size_t llen = strlen(labels[p][b]);
+      size_t alen = strlen(btnActionVal[p][b]);
+      buf[off++] = (uint8_t)llen;
+      memcpy(buf + off, labels[p][b], llen); off += llen;
+      buf[off++] = btnColors[p][b];
+      buf[off++] = btnActionType[p][b];
+      buf[off++] = (uint8_t)alen;
+      memcpy(buf + off, btnActionVal[p][b], alen); off += alen;
+    }
+  }
+
+  File f = LittleFS.open(CONFIG_BIN_PATH, "w");
+  if (f) {
+    f.write(buf, off);
+    f.close();
+    Serial.printf("[FS] config.bin 저장: %u페이지 (%uB)\n", np, (unsigned)off);
+  } else {
+    Serial.println("[FS] config.bin 쓰기 실패");
+  }
+  free(buf);
+}
+
+// [H] LittleFS /config.bin → RAM 복원. 성공 시 numPages 설정, true 반환.
+//     손상/부재 시 false → 호출자가 NVS 기본값으로 폴백 (디바이스는 그래도 동작).
+bool loadConfigFromFlash() {
+  if (!fsMounted) return false;
+  if (!LittleFS.exists(CONFIG_BIN_PATH)) return false;
+  File f = LittleFS.open(CONFIG_BIN_PATH, "r");
+  if (!f) return false;
+  size_t sz = f.size();
+  if (sz < 6) { f.close(); return false; }
+  uint8_t* buf = (uint8_t*)malloc(sz);
+  if (!buf) { f.close(); return false; }
+  if (f.read(buf, sz) != sz) { free(buf); f.close(); return false; }
+  f.close();
+
+  size_t off = 0;
+  uint32_t magic = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
+                   ((uint32_t)buf[2] << 8) | (uint32_t)buf[3];
+  uint8_t ver = buf[4];
+  uint8_t np = buf[5];
+  off = 6;
+  if (magic != CFG_MAGIC || ver != CFG_VERSION) { free(buf); return false; }
+  if (np < 1) np = 1;
+  if (np > MAX_PAGES) np = MAX_PAGES;
+
+  bool ok = true;
+  for (uint8_t p = 0; p < np && ok; p++) {
+    if (off + 1 > sz) { ok = false; break; }
+    uint8_t nlen = buf[off++];
+    if (nlen > PAGE_NAME_MAX) nlen = PAGE_NAME_MAX;
+    if (off + nlen > sz) { ok = false; break; }
+    if (nlen) { memcpy(pageNames[p], buf + off, nlen); pageNames[p][nlen] = '\0'; }
+    else      { pageNames[p][0] = '\0'; }
+    off += nlen;
+    for (uint8_t b = 0; b < BUTTONS_PER_PAGE && ok; b++) {
+      if (off + 1 > sz) { ok = false; break; }
+      uint8_t llen = buf[off++];
+      if (llen > LABEL_MAX) llen = LABEL_MAX;
+      if (off + llen > sz) { ok = false; break; }
+      if (llen) { memcpy(labels[p][b], buf + off, llen); labels[p][b][llen] = '\0'; }
+      else      { labels[p][b][0] = '\0'; }
+      off += llen;
+      if (off + 3 > sz) { ok = false; break; }
+      btnColors[p][b] = buf[off++];
+      if (btnColors[p][b] >= BTN_COLOR_COUNT) btnColors[p][b] = 0;
+      btnActionType[p][b] = buf[off++];
+      if (btnActionType[p][b] > 2) btnActionType[p][b] = 0;
+      uint8_t alen = buf[off++];
+      if (alen > ACTION_VAL_MAX) alen = ACTION_VAL_MAX;
+      if (off + alen > sz) { ok = false; break; }
+      if (alen) { memcpy(btnActionVal[p][b], buf + off, alen); btnActionVal[p][b][alen] = '\0'; }
+      else      { btnActionVal[p][b][0] = '\0'; }
+      off += alen;
+    }
+  }
+  free(buf);
+  if (!ok) { Serial.println("[FS] config.bin 손상 — 기본값 사용"); return false; }
+
+  numPages = np;
+  if (currentPage >= numPages) currentPage = numPages - 1;   // 호출자가 NVS lastPage로 보정
+  Serial.printf("[FS] config.bin 로드: %u페이지\n", np);
+  return true;
+}
+
+// [H] MREQ 응답: 전체 설정을 v3 MCFG 포맷으로 페이지별 청크 전송 (페이지 0..numPages-1).
+//     실행은 loop()에서 (콜백에서 UDP/LittleFS 금지). page_name은 페이지 첫 청크에만,
+//     이후 청크는 name_len=0(변경 없음). num_pages는 모든 청크에 반복.
+void sendConfigDump(IPAddress ip, uint16_t port) {
+  if (port == 0) return;
+  uint8_t pkt[1400];   // 단일 UDP 데이터그램
+  for (uint8_t p = 0; p < numPages; p++) {
+    size_t nameLen = strlen(pageNames[p]);
+    if (nameLen > PAGE_NAME_MAX) nameLen = PAGE_NAME_MAX;
+    size_t off = 0;
+    pkt[off++] = 0x4D; pkt[off++] = 0x43; pkt[off++] = 0x46; pkt[off++] = 0x47;  // "MCFG"
+    pkt[off++] = p;                    // page
+    uint8_t countPos = off; off++;     // count — 전송 전에 채움
+    pkt[off++] = numPages;             // num_pages
+    pkt[off++] = 0;                    // rsvd
+    pkt[off++] = (uint8_t)nameLen;     // page_name_len
+    memcpy(pkt + off, pageNames[p], nameLen); off += nameLen;
+    uint8_t count = 0;
+    for (uint8_t b = 0; b < BUTTONS_PER_PAGE; b++) {
+      size_t llen = strlen(labels[p][b]);
+      size_t alen = strlen(btnActionVal[p][b]);
+      size_t itemBytes = 5 + llen + alen;
+      // 새 항목이 청크 상한을 넘으면 지금까지 것을 전송하고 새 청크 시작
+      if (count > 0 && off + itemBytes > MCFG_CHUNK_MAX) {
+        pkt[countPos] = count;
+        udpSend.beginPacket(ip, port);
+        udpSend.write(pkt, off);
+        udpSend.endPacket();
+        off = 0;                                   // 새 청크: 헤더 + name_len=0 (이름 생략)
+        pkt[off++] = 0x4D; pkt[off++] = 0x43; pkt[off++] = 0x46; pkt[off++] = 0x47;
+        pkt[off++] = p;
+        countPos = off; off++;
+        pkt[off++] = numPages;
+        pkt[off++] = 0;
+        pkt[off++] = 0;                            // page_name_len = 0
+        count = 0;
+      }
+      if (off + itemBytes > sizeof(pkt)) break;    // 방어 — 단일 항목이 버퍼 초과 시 생략
+      pkt[off++] = b;
+      pkt[off++] = (uint8_t)llen;
+      pkt[off++] = btnColors[p][b];
+      pkt[off++] = btnActionType[p][b];
+      pkt[off++] = (uint8_t)alen;
+      memcpy(pkt + off, labels[p][b], llen); off += llen;
+      memcpy(pkt + off, btnActionVal[p][b], alen); off += alen;
+      count++;
+    }
+    pkt[countPos] = count;
+    udpSend.beginPacket(ip, port);
+    udpSend.write(pkt, off);
+    udpSend.endPacket();
+  }
+}
+
+// [H] MREQ 응답: /btns/p{page}_{bid}.jpg 이미지 덤프 (존재하는 이미지 버튼만 MIMG fmt=0).
+//     파일 ≤IMG_MAX_BYTES라 단일 데이터그램 — WiFiUDP는 beginPacket~endPacket을 하나로 버퍼링.
+//     패킷 사이에 delay()를 두어 WiFi/AP TX 큐가 비우도록 한다 — ESP32는 연속 대형 UDP 버스트에서
+//     패킷 드랍이 발생할 수 있고, config(소형)는 통과해도 이미지(최대 1400B)가 유실되는 사례가 있다.
+void sendImageDump(IPAddress ip, uint16_t port) {
+  if (!fsMounted || port == 0) return;
+  for (uint8_t p = 0; p < numPages; p++) {
+    for (uint8_t b = 0; b < BUTTONS_PER_PAGE; b++) {
+      char path[32];
+      snprintf(path, sizeof(path), "/btns/p%u_%u.jpg", p, b);
+      if (!LittleFS.exists(path)) continue;
+      File f = LittleFS.open(path, "r");
+      if (!f) continue;
+      size_t sz = f.size();
+      if (sz == 0 || sz > IMG_MAX_BYTES) { f.close(); continue; }
+      uint8_t hdr[8] = {0x4D, 0x49, 0x4D, 0x47, p, b, 0, 0};   // "MIMG" page bid fmt=0 rsvd=0
+      udpSend.beginPacket(ip, port);
+      udpSend.write(hdr, 8);
+      uint8_t chunk[256];
+      while (sz > 0) {
+        size_t rd = f.read(chunk, min((size_t)sizeof(chunk), sz));
+        if (rd == 0) break;
+        udpSend.write(chunk, rd);
+        sz -= rd;
+      }
+      udpSend.endPacket();
+      f.close();
+      delay(15);   // [H] 버스트 유실 방지 — 최대 96개×15ms = 1.44s (호스트 5s 데드라인 안)
+    }
+  }
 }
 
 // ==========================================
@@ -766,6 +1371,16 @@ void drawButton(uint8_t page, uint8_t idx, bool pressed) {
   int row = idx / GRID_COLS;
   int x = btn_x(col), y = btn_y(row);
 
+  // [G] 이미지가 있으면 JPEG 렌더, 없으면 기존 텍스트 렌더 (폴백)
+  if (imgJpeg[page][idx] && imgSize[page][idx] > 0) {
+    drawButtonImage(page, idx, x, y, pressed);
+    return;
+  }
+  drawButtonText(page, idx, x, y, pressed);
+}
+
+// [G] 텍스트 렌더 (기존 방식) — 이미지가 없거나 디코드 실패 시 폴백
+void drawButtonText(uint8_t page, uint8_t idx, int x, int y, bool pressed) {
   // 팔레트 기반 색상 (btnColors[page][idx]는 onConfigPacket이 채움)
   uint8_t ci = btnColors[page][idx];
   if (ci >= BTN_COLOR_COUNT) ci = 0;
@@ -787,11 +1402,80 @@ void drawButton(uint8_t page, uint8_t idx, bool pressed) {
   lcd.drawString(labels[page][idx], x + BTN_W / 2, y + BTN_H / 2);
 }
 
+// [G] 버튼 눌림 상태를 JPEG 디코드 콜백이 참조. 디코드는 loop()에서 동기식이므로
+//     전역 플래그로 충분하다 (AsyncUDP 콜백은 이미지 버퍼를 건드리지 않음).
+static bool btnDrawPressed = false;
+
+int jpegBtnCallback(JPEGDRAW* pDraw) {
+  // 눌림: 픽셀을 ×0.75 어둡게 오버레이.
+  // 주의: setPixelType(RGB565_BIG_ENDIAN)이므로 pPixels는 고바이트 우선이다.
+  // little-endian ESP32에서 uint16_t*로 읽으면 바이트가 뒤집혀 채널이 깨진다
+  // → 바이트 단위로 조립/분해해 같은 순서(BE)로 다시 기록한다.
+  if (btnDrawPressed) {
+    uint8_t* b = (uint8_t*)pDraw->pPixels;
+    int n = pDraw->iWidth * pDraw->iHeight;
+    for (int i = 0; i < n; i++) {
+      uint16_t v = (uint16_t)((b[i * 2] << 8) | b[i * 2 + 1]);  // BE → 논리 RGB565
+      uint16_t r = (v >> 11) & 0x1F, g = (v >> 5) & 0x3F, bl = v & 0x1F;
+      uint16_t d = (uint16_t)(((r * 3 / 4) << 11) | ((g * 3 / 4) << 5) | (bl * 3 / 4));
+      b[i * 2] = (uint8_t)(d >> 8);                             // BE로 다시 기록
+      b[i * 2 + 1] = (uint8_t)(d & 0xFF);
+    }
+  }
+  lcd.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
+  return 1;
+}
+
+// [G] 버튼 JPEG를 디코드해 버튼 위치에 그린다. 디코드 실패 시 텍스트 폴백.
+//     decode(x, y, 0)로 버튼 원점을 지정 → 콜백의 pDraw->x/y는 절대 화면 좌표.
+void drawButtonImage(uint8_t page, uint8_t idx, int x, int y, bool pressed) {
+  uint8_t* jpg = imgJpeg[page][idx];
+  uint16_t sz = imgSize[page][idx];
+  if (!jpg || sz == 0) {
+    drawButtonText(page, idx, x, y, pressed);
+    return;
+  }
+
+  btnDrawPressed = pressed;
+  int rc = jpeg.openRAM(jpg, (int)sz, jpegBtnCallback);
+  if (rc <= 0) {   // openRAM 실패(잘린 JPEG 등) → 텍스트 폴백
+    Serial.printf("[IMG] 디코드 실패 p=%u b=%u rc=%d\n", page, idx, rc);
+    drawButtonText(page, idx, x, y, pressed);
+    return;
+  }
+  jpeg.setPixelType(RGB565_BIG_ENDIAN);
+  // [FIX] 버튼 71×61은 8/16의 배수가 아니다. JPEGDEC는 MCU(4:2:0 = 16×16) 단위로
+  // 패딩을 채워 콜백의 iWidth를 80(5 MCU×16 = 실제 71 + 패딩 9)으로 넘긴다.
+  // 이대로 pushImage하면 우측 9px의 패딩 쓰레기가 갭·다음 버튼을 덮는다 → 버튼
+  // 셀로 클립해 잘라낸다. (pushImage가 src_bitwidth=iWidth로 행 간격을 맞춰 읽으므로
+  // iWidthUsed로 축소하면 행이 틀어지지만, 클립은 안전하다.)
+  lcd.setClipRect(x, y, BTN_W, BTN_H);
+  jpeg.decode(x, y, 0);
+  lcd.clearClipRect();
+  jpeg.close();
+
+  if (pressed) {
+    // 눌림: 밝은 테두리 2px 오버레이 (텍스트 버튼 pressed 시각과 일치)
+    lcd.drawRoundRect(x + 1, y + 1, BTN_W - 2, BTN_H - 2, 6, TFT_WHITE);
+    lcd.drawRoundRect(x + 2, y + 2, BTN_W - 4, BTN_H - 4, 6, TFT_WHITE);
+  }
+}
+
 // [B] 버튼을 임시 색(피드백용)으로 렌더 — 원상 복귀는 drawButton(page, idx, false)
 void drawButtonFlash(uint8_t page, uint8_t idx, uint16_t fill) {
   int col = idx % GRID_COLS;
   int row = idx / GRID_COLS;
   int x = btn_x(col), y = btn_y(row);
+
+  // [G] 이미지 버튼: 이미지는 유지하고 피드백 색 테두리를 3px 오버레이 (성공/실패 신호)
+  if (imgJpeg[page][idx] && imgSize[page][idx] > 0) {
+    drawButtonImage(page, idx, x, y, false);
+    lcd.drawRoundRect(x + 1, y + 1, BTN_W - 2, BTN_H - 2, 6, fill);
+    lcd.drawRoundRect(x + 2, y + 2, BTN_W - 4, BTN_H - 4, 6, fill);
+    lcd.drawRoundRect(x + 3, y + 3, BTN_W - 6, BTN_H - 6, 6, fill);
+    return;
+  }
+
   lcd.fillRoundRect(x, y, BTN_W, BTN_H, 6, fill);
   lcd.drawRoundRect(x, y, BTN_W, BTN_H, 6, TFT_WHITE);
   lcd.setTextColor(TFT_WHITE);
@@ -968,12 +1652,18 @@ void handleTouch() {
         sendEvent(currentPage, idx);
       }
     } else {
-      // 상태바: 페이지 이동
+      // 상태바: 페이지 이동 — [H] 이미지 캐시를 페이지 단위로 스왑 (플래시에서 즉시 로드, 오프라인)
       if (pressX >= PREV_X && pressX < PREV_X + PREV_W && currentPage > 0) {
+        uint8_t oldPage = currentPage;
         currentPage--;
+        freePageImages(oldPage);
+        loadPageImages(currentPage);
         drawGrid(currentPage);
       } else if (pressX >= NEXT_X && pressX < NEXT_X + NEXT_W && currentPage < numPages - 1) {
+        uint8_t oldPage = currentPage;
         currentPage++;
+        freePageImages(oldPage);
+        loadPageImages(currentPage);
         drawGrid(currentPage);
       } else {
         drawStatusBar();
@@ -990,9 +1680,55 @@ static uint8_t lastShownPage = 0xFF;
 static uint8_t lastSavedPages = 0xFF;
 static unsigned long pageChangeTime = 0;
 static bool pageChangePending = false;
+// [G] 페이지 수 감소로 범위 밖이 된 이미지 해제용 추적 (마지막으로 정리한 페이지 수)
+static uint8_t lastTrimmedPages = 0xFF;
 
 void loop() {
   unsigned long now = millis();
+
+  // [G] 이미지 패킷 적용 (onImagePacket이 pending 큐에 넣은 것) — 단일 task에서
+  //     저장/해제/회계 수행. 렌더보다 먼저 처리해 decode 중 free 레이스를 없앤다.
+  applyPendingImages();
+
+  // [H] config.bin 저장 debounce — 다중 패킷 푸시(8페이지×청크)를 1회 쓰기로 합침 (웨어 방지)
+  if (configSaveDirty && now - configDirtyTime >= CONFIG_SAVE_DEBOUNCE_MS) {
+    configSaveDirty = false;
+    saveConfigToFlash();
+  }
+
+  // [H] MREQ 덤프 처리 (AsyncUDP 콜백이 mux 아래 큐에 넣음 — 여기서 실제 전송)
+  bool doDump = false;
+  IPAddress dumpIP;
+  uint16_t dumpPort = 0;
+  portENTER_CRITICAL(&dumpReqMux);
+  if (dumpReq.pending) {
+    doDump = true;
+    dumpIP = dumpReq.ip;
+    dumpPort = dumpReq.port;
+    dumpReq.pending = false;
+  }
+  portEXIT_CRITICAL(&dumpReqMux);
+  if (doDump) {
+    String s = dumpIP.toString();
+    Serial.printf("[MREQ] dump -> %s:%u\n", s.c_str(), dumpPort);
+    sendConfigDump(dumpIP, dumpPort);
+    sendImageDump(dumpIP, dumpPort);
+  }
+
+  // [G] 페이지 수 감소로 범위 밖이 된 페이지의 이미지 해제 + [H] 플래시 파일 정리
+  if (numPages < lastTrimmedPages) {
+    for (uint8_t p = numPages; p < lastTrimmedPages; p++) {
+      freePageImages(p);                        // [H] RAM 해제 (잘린 페이지는 현재 페이지가 아님 — 방어적)
+      if (fsMounted) {
+        for (uint8_t b = 0; b < BUTTONS_PER_PAGE; b++) {
+          char path[32];
+          snprintf(path, sizeof(path), "/btns/p%u_%u.jpg", p, b);
+          if (LittleFS.exists(path)) LittleFS.remove(path);   // 잘린 페이지 이미지 삭제
+        }
+      }
+    }
+  }
+  lastTrimmedPages = numPages;
 
   // 페이지 수 감소로 현재 페이지가 범위 밖이면 보정 (안전망 — onConfigPacket도 클램프)
   if (currentPage >= numPages) currentPage = numPages - 1;
@@ -1012,9 +1748,15 @@ void loop() {
     pageChangePending = false;
   }
 
-  // 호스트 설정 도착 시 그리드 재렌더 (플리커 방지: 변경 시에만)
-  if (labelsDirty) {
+  // 호스트 설정 도착 시 그리드 재렌더 (플리커 방지: 변경 시에만 + [H] 다중 패킷 푸시 debounce)
+  if (labelsDirty && now - labelsDirtyTime >= LABELS_REDRAW_DELAY) {
     labelsDirty = false;
+    drawGrid(currentPage);
+  }
+
+  // [G] 이미지 배치 도착 → debounce 후 1회 재렌더 (버스트를 1회로 합침, 플리커 방지)
+  if (imagesDirty && now - lastImageTime >= IMG_REDRAW_DELAY) {
+    imagesDirty = false;
     drawGrid(currentPage);
   }
 
@@ -1048,12 +1790,15 @@ void loop() {
   static unsigned long lastStatTime = 0;
   if (now - lastStatTime >= 1000) {
     String hip = hostKnown ? hostIP.toString() : String("-");
-    Serial.printf("[STAT] page=%u pages=%u host=%s:%u evt=%u cfg=%u bcn=%u heap=%lukB wifi=%d\n",
+    Serial.printf("[STAT] page=%u pages=%u host=%s:%u evt=%u cfg=%u img=%u+%u/%u(drop=%u) kb=%u bcn=%u heap=%lukB wifi=%d\n",
                   currentPage, numPages, hip.c_str(), hostPort,
-                  statEvents, statConfigs, statBeacons,
+                  statEvents, statConfigs, statImgRecv, statImgNew, countImages(), statImgDrop, (unsigned)(imgHeapUsed / 1024), statBeacons,
                   (unsigned long)(ESP.getFreeHeap() / 1024), WiFi.status());
     statEvents = 0;
     statConfigs = 0;
+    statImgRecv = 0;
+    statImgNew = 0;
+    statImgDrop = 0;
     statBeacons = 0;
     lastStatTime = now;
   }
