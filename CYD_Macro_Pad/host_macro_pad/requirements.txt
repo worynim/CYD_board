@@ -1,0 +1,2 @@
+# pynput은 GUI가 아니라 격리된 입력 헬퍼(_input_helper.py)에서만 사용된다.
+pynput>=1.7.6
