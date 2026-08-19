@@ -112,6 +112,15 @@ public:
 
 static LGFX lcd;
 static JPEGDEC jpeg;   // 고속 JPEG 디코더 인스턴스 (Larry Bank JPEGDEC 라이브러리)
+
+// ---- 오프스크린 렌더 버퍼 (티어링 방지) ----
+// JPEGDEC는 MCU 블록 단위로 LCD에 직접 푸시 → 한 프레임이 블록으로 조립돼 보이고,
+// 패널 스캔과 경합하면 가로 이분선(티어링)이 생긴다.
+// 디코드 결과를 RGB565 스프라이트(RAM)에 먼저 채우고 pushSprite()로 한 번에 blit하면
+// 각 프레임이 원자적으로 교체된다. 힙 할당 실패 시 직접 디코드 모드로 자동 폴백.
+// (스프라이트 ~150KB + 기존 JPEG 버퍼 ~50KB. 메모리 여유가 없으면 폴백이 안전망 역할)
+static LGFX_Sprite renderSprite(&lcd);
+static bool spriteReady = false;               // 스프라이트 버퍼 할당 성공 여부
 AsyncUDP udp;
 Preferences prefs;
 
@@ -187,6 +196,7 @@ void drawBootScreen(const char* statusMsg);
 void drawReadyScreen(String ipAddr);
 void drawErrorScreen(const char* errMsg);
 void onUdpPacketReceived(AsyncUDPPacket packet);
+void ensureRenderSprite();
 
 // ==========================================
 // 2. Setup 함수
@@ -199,6 +209,7 @@ void setup() {
   lcd.init();
   lcd.setRotation(currentRotation);
   lcd.setBrightness(200);
+  ensureRenderSprite();  // 오프스크린 렌더 버퍼 생성 (티어링 방지). 실패 시 직접 디코드 모드로 폴백
 
   // [TEST] SPI 클럭 검증: fillScreen(320x240 전체 픽셀 푸시) 시간으로 클럭 효과 확인.
   //   80MHz → 약 15ms, 40MHz → 약 30ms. (클럭 상향이 실제 적용되는지 판별)
@@ -815,21 +826,71 @@ void onUdpPacketReceived(AsyncUDPPacket packet) {
 }
 
 // ==========================================
-// 5.5 JPEG 고속 디코드 (JPEGDEC) — 디코드 병목 제거
+// 5.5 JPEG 고속 디코드 (JPEGDEC) — 디코드 병목 제거 + 오프스크린 티어링 방지
 // ==========================================
-// [계측] 렌더 내 "픽셀 푸시" 시간(µs) 누적. [STAT]의 rt에서 이 값을 빼면
+// [계측] 렌더 내 "픽셀 푸시"(SPI blit) 시간(µs) 누적. [STAT]의 rt에서 이 값을 빼면
 // 실제 JPEG 디코드 시간이 나옴 → 다음 병목(디코드 vs 푸시) 판별용.
+// 스프라이트 모드: pushSprite()의 SPI 시간. 직접 모드(폴백): 콜백 pushImage()의 SPI 시간.
 static unsigned long pushTimeSum = 0;
 
 // jpegDbg: 처음 몇 프레임만 진단 출력 (통과 후엔 조용)
 static int jpegDbg = 0;
 
-// JPEGDEC 디코드 콜백: 디코드된 RGB565 블록을 LCD에 푸시.
+static void* spriteBuf = nullptr;   // 오프스크린 버퍼 원시 포인터 (직접 heap_caps_free로 정리)
+static bool spriteAllocTried = false;  // 최초 1회만 할당 시도 → 실패 시 재시도/스팸 방지
+
+// 현재 화면 크기(회전 반영)에 맞는 오프스크린 스프라이트를 생성/재생성.
+// 회전이 바뀌면 lcd.width()/height()가 달라져 다음 렌더에서 자동 재생성된다.
+// 할당 실패 시 spriteReady=false로 고정 → renderJpegFast가 직접 디코드 모드로 동작.
+// 실패 후에는 재시도하지 않는다: 150KB 할당을 매 프레임 시도하면 heap 스캔 + 시리얼 출력이
+// Core1 렌더를 지연시켜 오히려 성능이 떨어진다 (직렬 핫 경로 무제한 출력 금지 규칙과 동일).
+void ensureRenderSprite() {
+  if (spriteAllocTried && !spriteReady) return;  // 1회 실패 → 직접 모드 고정 (재시도 없음)
+  int w = lcd.width();
+  int h = lcd.height();
+  if (spriteReady && renderSprite.width() == w && renderSprite.height() == h) return;
+  if (spriteBuf != nullptr) {  // 이전 버퍼 해제 (어느 할당 경로든 heap_caps_free로 정리)
+    heap_caps_free(spriteBuf);
+    spriteBuf = nullptr;
+    spriteReady = false;
+  }
+  spriteAllocTried = true;
+  size_t need = (size_t)w * h * 2;  // RGB565 바이트 수
+  // PSRAM 우선: 내부 DRAM ~150KB를 잡으면 WiFi 스택(~50-70KB)이 메모리 부족으로 죽을 수 있다.
+  // PSRAM 모델(ESP32-2432S028R 등)은 Arduino IDE → Tools → PSRAM → Enabled로 활성화해야 함.
+  spriteBuf = heap_caps_malloc(need, MALLOC_CAP_SPIRAM);
+  if (spriteBuf != nullptr) {
+    Serial.printf("[SPRITE] PSRAM 버퍼 %uKB 확보\n", (unsigned)(need / 1024));
+  } else {
+    spriteBuf = heap_caps_malloc(need, MALLOC_CAP_8BIT);  // 내부 DRAM 폴백 (이 보드에선 실패 예상)
+    if (spriteBuf != nullptr) {
+      Serial.printf("[SPRITE] 내부 DRAM 버퍼 %uKB 확보\n", (unsigned)(need / 1024));
+    }
+  }
+  if (spriteBuf == nullptr) {
+    Serial.printf("[SPRITE] 버퍼 할당 실패 (free heap=%uKB) → 직접 디코드 모드 고정 (재시도 없음)\n",
+                  (unsigned)(ESP.getFreeHeap() / 1024));
+    return;
+  }
+  renderSprite.setColorDepth(16);
+  renderSprite.setBuffer(spriteBuf, w, h);
+  spriteReady = true;
+  Serial.printf("[SPRITE] 오프스크린 버퍼 활성 (%dx%d)\n", w, h);
+}
+
+// JPEGDEC 디코드 콜백: 디코드된 RGB565 블록을 스프라이트(RAM) 또는 LCD로 복사.
 // JPEGDEC 디코드는 동기식이라 이 콜백은 loop() 스레드에서 실행됨 → 렌더 경합 없음.
 int jpegDrawCallback(JPEGDRAW* pDraw) {
-  unsigned long t0 = micros();
-  lcd.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
-  pushTimeSum += (micros() - t0);
+  if (spriteReady) {
+    // 스프라이트 모드: RAM 복사만 (SPI 미사용) → 블록이 화면에 조립돼 보이지 않음.
+    // RGB565_BIG_ENDIAN이 직접 푸시와 동일하게 그대로 복사되어 색 순서가 유지된다.
+    renderSprite.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
+  } else {
+    // 직접 모드 폴백: MCU 블록을 즉시 LCD로 푸시 (원래 방식).
+    unsigned long t0 = micros();
+    lcd.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
+    pushTimeSum += (micros() - t0);
+  }
   return 1;
 }
 
@@ -849,6 +910,13 @@ void renderJpegFast() {
   jpeg.setPixelType(RGB565_BIG_ENDIAN);
   jpeg.decode(0, 0, 0);
   jpeg.close();
+  if (spriteReady) {
+    // 원자적 blit: 완성된 프레임 전체를 한 번에 LCD로 푸시 (블록 조립·패널 스캔 경합 제거).
+    // pushSprite는 내부적으로 startWrite/endWrite로 처리하며 한 번의 SPI 버스트로 전송.
+    unsigned long t0 = micros();
+    renderSprite.pushSprite(0, 0);
+    pushTimeSum += (micros() - t0);
+  }
 }
 
 // ==========================================
@@ -866,6 +934,8 @@ void loop() {
   if (hasNewFrame) {
     isRendering = true;
     hasNewFrame = false;
+
+    ensureRenderSprite();  // 회전이 바뀌었으면 오프스크린 스프라이트 재생성 (통상 no-op)
 
     int w = lcd.width();
     int h = lcd.height();
