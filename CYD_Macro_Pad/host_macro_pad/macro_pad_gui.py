@@ -51,14 +51,21 @@ UDP_PORT = 8890              # 매크로 패드 전용 포트 (스트리밍 8888
 MAGIC_CONFIG = 0x4D434647    # "MCFG" 호스트→디바이스 설정 패킷
 MAGIC_EVENT = 0x4D504144     # "MPAD" 디바이스→호스트 이벤트 패킷
 MAGIC_BEACON = 0x4D504245    # "MPBE" 디바이스→브로드캐스트 디스커버리 비콘
-PAGES = 2
+MAX_PAGES = 8                # 최대 페이지 수 (펌웨어와 일치)
+DEFAULT_PAGES = 2            # 최초 페이지 수
 GRID_COLS = 4
 GRID_ROWS = 3
 BUTTONS_PER_PAGE = GRID_COLS * GRID_ROWS   # 12
 LABEL_MAX = 24               # 라벨 최대 바이트 (UTF-8)
 
+# 버튼 색상 팔레트 (인덱스 → 펌웨어 BTN_PALETTE와 정확히 일치해야 함)
+COLOR_NAMES = ["slate", "red", "orange", "yellow", "green",
+               "teal", "blue", "purple", "pink", "white"]
+COLOR_HEX = ["#64748B", "#EF4444", "#F97316", "#EAB308", "#22C55E",
+             "#14B8A6", "#3B82F6", "#A855F7", "#EC4899", "#F8FAFC"]
+
 # 양쪽 모두 8바이트 헤더: magic u32 + 필드 4 × u8
-CONFIG_HEADER = struct.Struct(">IBBBB")    # magic, page, count, rsvd, rsvd
+CONFIG_HEADER = struct.Struct(">IBBBB")    # magic, page, count, num_pages, rsvd
 EVENT_HEADER = struct.Struct(">IBBBB")     # magic, page, button, flags, rsvd
 
 ACTION_TYPES = ["shortcut", "text", "app"]
@@ -116,17 +123,23 @@ def _trunc_utf8(text: str, max_bytes: int) -> bytes:
     return b[:end]
 
 
-def build_config_packet(page_idx: int, buttons) -> bytes:
-    """한 페이지 설정 패킷을 만든다. buttons는 {'label', ...} 딕셔너리 리스트.
+def build_config_packet(page_idx: int, buttons, num_pages: int) -> bytes:
+    """한 페이지 설정 패킷을 만든다. buttons는 {'label', 'color', ...} 딕셔너리 리스트.
 
-    >IBBBB 헤더(magic, page, count, 0, 0) + count개 엔트리(>BB + label bytes)
+    >IBBBB 헤더(magic, page, count, num_pages, 0) + count개 엔트리(>BBB + label bytes).
+    엔트리: button_id u8, label_len u8, color_idx u8 (0..COLOR_NAMES-1).
     """
+    if not (0 <= page_idx < MAX_PAGES):
+        page_idx = max(0, min(page_idx, MAX_PAGES - 1))
     entries = bytearray()
     for bid, btn in enumerate(buttons):
         label = _trunc_utf8(btn.get("label") or "", LABEL_MAX)
-        entries += struct.pack(">BB", bid, len(label))
+        color = int(btn.get("color", 0) or 0)
+        if not (0 <= color < len(COLOR_NAMES)):
+            color = 0
+        entries += struct.pack(">BBB", bid, len(label), color)
         entries += label
-    return CONFIG_HEADER.pack(MAGIC_CONFIG, page_idx, len(buttons), 0, 0) + bytes(entries)
+    return CONFIG_HEADER.pack(MAGIC_CONFIG, page_idx, len(buttons), num_pages, 0) + bytes(entries)
 
 
 def parse_event_packet(data: bytes):
@@ -171,14 +184,15 @@ class MacroPadGUI:
         self._event_queue: "queue.Queue[tuple]" = queue.Queue()  # 리스너→UI 로그
         self._listener_running = False
         self._listener_thread: threading.Thread | None = None
-        self._ip_manual_edit_time = 0.0   # 사용자가 IP 직접 입력 시각 (자동검색 덮어쓰기 10s 보호)
 
         self._button_widgets: list = []            # [page][button] → 위젯 dict
+        self._page_tabs: list = []                 # [page] → Notebook 탭 Frame
 
         self.setup_ui_style()
         self.create_widgets()
         self._populate_from_config()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._start_listener()                     # 리스너 자동 시작 (고정 포트 8890)
         self._poll_event_queue()
 
     # ------------------------------------------------------------------
@@ -187,21 +201,54 @@ class MacroPadGUI:
     def _load_config(self) -> dict:
         if self.config_path.exists():
             try:
-                return json.loads(self.config_path.read_text(encoding="utf-8"))
+                raw = json.loads(self.config_path.read_text(encoding="utf-8"))
+                return self._normalize_config(raw)
             except Exception as e:
                 logging.warning("[CFG] 설정 파싱 실패, 기본값 사용: %s", e)
         return self._default_config()
 
     @staticmethod
     def _default_config() -> dict:
-        empty = [{"label": "", "action_type": "shortcut", "action_value": ""}
+        empty = [{"label": "", "action_type": "shortcut", "action_value": "", "color": 0}
                  for _ in range(BUTTONS_PER_PAGE)]
         return {
-            "version": 1,
+            "version": 2,
             "port": UDP_PORT,
             "device_ip": "",
             "pages": [{"name": "Page %d" % (i + 1), "buttons": list(empty)}
-                      for i in range(PAGES)],
+                      for i in range(DEFAULT_PAGES)],
+        }
+
+    def _normalize_config(self, config: dict) -> dict:
+        """구버전(1) 설정을 v2로 보정. 누락된 필드를 기본값으로 채운다."""
+        pages = config.get("pages")
+        if not isinstance(pages, list) or not pages:
+            pages = self._default_config()["pages"]
+        norm = []
+        for i, pg in enumerate(pages):
+            if not isinstance(pg, dict):
+                pg = {}
+            btns = pg.get("buttons")
+            if not isinstance(btns, list):
+                btns = []
+            buttons = []
+            for bid in range(BUTTONS_PER_PAGE):
+                b = btns[bid] if bid < len(btns) and isinstance(btns[bid], dict) else {}
+                color = int(b.get("color", 0) or 0)
+                if not (0 <= color < len(COLOR_NAMES)):
+                    color = 0
+                buttons.append({
+                    "label": (b.get("label") or "")[:LABEL_MAX],
+                    "action_type": b.get("action_type", "shortcut") or "shortcut",
+                    "action_value": b.get("action_value") or "",
+                    "color": color,
+                })
+            norm.append({"name": (pg.get("name") or "Page %d" % (i + 1)), "buttons": buttons})
+        return {
+            "version": 2,
+            "port": int(config.get("port", UDP_PORT) or UDP_PORT),
+            "device_ip": str(config.get("device_ip", "") or ""),
+            "pages": norm,
         }
 
     def _save_config(self, config: dict) -> None:
@@ -241,49 +288,38 @@ class MacroPadGUI:
         tk.Label(header_frame, text="ESP32-2432S028 터치 버튼 → UDP 이벤트 → 매크로 실행",
                  bg=self.bg_color, fg=self.sub_text, font=("Pretendard", 9)).pack(anchor="w")
 
-        # 디바이스 카드
-        dev_card = tk.Frame(self.root, bg=self.card_bg, bd=1, relief=tk.SOLID, padx=12, pady=10)
-        dev_card.pack(fill=tk.X, padx=16, pady=(0, 10))
-        dev_row = tk.Frame(dev_card, bg=self.card_bg)
-        dev_row.pack(fill=tk.X)
-        ttk.Label(dev_row, text="CYD IP:").pack(side=tk.LEFT)
-        self.ip_entry = ttk.Entry(dev_row, width=15)
-        self.ip_entry.pack(side=tk.LEFT, padx=6)
-        self.ip_entry.bind("<KeyRelease>", lambda e: self._on_ip_edited())
-        ttk.Label(dev_row, text="포트:").pack(side=tk.LEFT)
-        self.port_entry = ttk.Entry(dev_row, width=6)
-        self.port_entry.pack(side=tk.LEFT, padx=6)
-        self.listen_btn = tk.Button(dev_row, text="● 리스너 시작", command=self._toggle_listener,
-                                    bg="#22c55e", fg="white", relief=tk.FLAT, padx=14, pady=6,
-                                    cursor="pointinghand", font=("Pretendard", 10, "bold"))
-        self.listen_btn.pack(side=tk.RIGHT)
-        self.ip_hint = tk.Label(dev_card, text="(IP 비우면 자동검색)", bg=self.card_bg,
-                                fg=self.sub_text, font=("Pretendard", 8), anchor="w")
-        self.ip_hint.pack(fill=tk.X, pady=(4, 0))
-        self.listen_status = tk.Label(dev_card, text="● 리스너 중지됨", bg=self.card_bg,
+        # 리스너 상태 카드 (IP/포트/시작 버튼 없음 — 리스너는 자동 시작)
+        status_card = tk.Frame(self.root, bg=self.card_bg, bd=1, relief=tk.SOLID, padx=12, pady=8)
+        status_card.pack(fill=tk.X, padx=16, pady=(0, 8))
+        self.listen_status = tk.Label(status_card, text="● 리스너 시작 중...", bg=self.card_bg,
                                       fg=self.sub_text, font=("Pretendard", 9), anchor="w")
-        self.listen_status.pack(fill=tk.X, pady=(8, 0))
+        self.listen_status.pack(fill=tk.X)
 
-        # 페이지 노트북 (2페이지 × 4×3 버튼)
+        # 페이지 관리 행 (이름 편집 + 추가/삭제)
+        page_row = tk.Frame(self.root, bg=self.card_bg, bd=1, relief=tk.SOLID, padx=12, pady=8)
+        page_row.pack(fill=tk.X, padx=16, pady=(0, 8))
+        ttk.Label(page_row, text="페이지 이름:").pack(side=tk.LEFT)
+        self.page_name_entry = ttk.Entry(page_row, width=18)
+        self.page_name_entry.pack(side=tk.LEFT, padx=6)
+        self.page_name_entry.bind("<KeyRelease>", lambda e: self._page_name_edited())
+        self.del_page_btn = tk.Button(page_row, text="− 페이지", command=self._del_page,
+                                      bg="#ef4444", fg="white", relief=tk.FLAT, padx=10, pady=4,
+                                      cursor="pointinghand", font=("Pretendard", 9, "bold"))
+        self.del_page_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        self.add_page_btn = tk.Button(page_row, text="+ 페이지", command=self._add_page,
+                                      bg="#10b981", fg="white", relief=tk.FLAT, padx=10, pady=4,
+                                      cursor="pointinghand", font=("Pretendard", 9, "bold"))
+        self.add_page_btn.pack(side=tk.RIGHT)
+
+        # 페이지 노트북 (최대 MAX_PAGES × 4×3 버튼)
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 10))
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+        self.notebook.bind("<<NotebookTabChanged>>", self._page_changed)
         self._button_widgets = []
-        for page in range(PAGES):
-            tab = tk.Frame(self.notebook, bg=self.card_bg, padx=8, pady=8)
-            self.notebook.add(tab, text="Page %d" % (page + 1))
-            grid = tk.Frame(tab, bg=self.card_bg)
-            grid.pack(fill=tk.BOTH, expand=True)
-            page_widgets = []
-            for bid in range(BUTTONS_PER_PAGE):
-                r, c = divmod(bid, GRID_COLS)
-                card = self._make_button_card(grid, bid)
-                card["frame"].grid(row=r, column=c, padx=5, pady=5, sticky="nsew")
-                page_widgets.append(card)
-            for c in range(GRID_COLS):
-                grid.columnconfigure(c, weight=1, uniform="col")
-            for r in range(GRID_ROWS):
-                grid.rowconfigure(r, weight=1, uniform="row")
-            self._button_widgets.append(page_widgets)
+        self._page_tabs = []
+        pages = self.config.get("pages") or []
+        for page in range(len(pages)):
+            self._make_page_tab(page, pages[page].get("name") or "Page %d" % (page + 1))
 
         # 하단 카드: 적용 / 하트비트 / 이벤트 로그
         bot_card = tk.Frame(self.root, bg=self.card_bg, bd=1, relief=tk.SOLID, padx=12, pady=10)
@@ -294,9 +330,6 @@ class MacroPadGUI:
                                    bg="#0ea5e9", fg="white", relief=tk.FLAT, padx=14, pady=6,
                                    cursor="pointinghand", font=("Pretendard", 10, "bold"))
         self.apply_btn.pack(side=tk.LEFT)
-        self.hb_var = tk.BooleanVar(value=bool(self.config.get("heartbeat_enabled", True)))
-        self.hb_var.trace_add("write", lambda *a: self._hb_changed())
-        ttk.Checkbutton(bot_row, text="주기 재전송 (20s)", variable=self.hb_var).pack(side=tk.LEFT, padx=14)
         log_frame = tk.Frame(bot_card, bg=self.card_bg)
         log_frame.pack(fill=tk.BOTH, pady=(8, 0))
         self.log_text = tk.Text(log_frame, height=6, bg="#020617", fg=self.text_color,
@@ -307,7 +340,7 @@ class MacroPadGUI:
         self._log("준비됨. CYD에 설정을 적용하려면 '설정 적용'을 누르세요.")
 
     def _make_button_card(self, parent: tk.Widget, bid: int) -> dict:
-        """버튼 한 개의 편집 카드 (라벨/동작/값 + 힌트)."""
+        """버튼 한 개의 편집 카드 (라벨/동작/값/색 + 힌트)."""
         f = tk.Frame(parent, bg="#1e293b", bd=1, relief=tk.SOLID, padx=6, pady=5)
         tk.Label(f, text="#%d" % bid, bg="#1e293b", fg=self.sub_text,
                  font=("Pretendard", 8)).pack(anchor="w")
@@ -317,12 +350,47 @@ class MacroPadGUI:
         act.pack(fill=tk.X, pady=(0, 2))
         val = ttk.Entry(f, width=12)
         val.pack(fill=tk.X, pady=(0, 2))
+        # 색상 선택 (구분용): 스와치 + 팔레트 Combobox
+        color_row = tk.Frame(f, bg="#1e293b")
+        color_row.pack(fill=tk.X, pady=(0, 2))
+        swatch = tk.Label(color_row, text="  ", bg=COLOR_HEX[0], width=2)
+        swatch.pack(side=tk.LEFT)
+        col = ttk.Combobox(color_row, values=COLOR_NAMES, width=9, state="readonly")
+        col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        col.bind("<<ComboboxSelected>>",
+                 lambda e, s=swatch, c=col: self._color_selected(s, c))
         hint = tk.Label(f, text="", bg="#1e293b", fg=self.sub_text,
                         font=("Pretendard", 7), anchor="w")
         hint.pack(fill=tk.X)
         act.bind("<<ComboboxSelected>>",
                  lambda e, h=hint, a=act: self._update_hint(h, a))
-        return {"frame": f, "label": lbl, "action": act, "value": val, "hint": hint}
+        return {"frame": f, "label": lbl, "action": act, "value": val,
+                "color": col, "swatch": swatch, "hint": hint}
+
+    @staticmethod
+    def _color_selected(swatch: tk.Label, col: ttk.Combobox) -> None:
+        name = col.get()
+        if name in COLOR_NAMES:
+            swatch.config(bg=COLOR_HEX[COLOR_NAMES.index(name)])
+
+    def _make_page_tab(self, idx: int, name: str) -> None:
+        """페이지 탭 하나를 만들어 _button_widgets/_page_tabs에 추가한다."""
+        tab = tk.Frame(self.notebook, bg=self.card_bg, padx=8, pady=8)
+        self.notebook.add(tab, text=name or "Page %d" % (idx + 1))
+        grid = tk.Frame(tab, bg=self.card_bg)
+        grid.pack(fill=tk.BOTH, expand=True)
+        page_widgets = []
+        for bid in range(BUTTONS_PER_PAGE):
+            r, c = divmod(bid, GRID_COLS)
+            card = self._make_button_card(grid, bid)
+            card["frame"].grid(row=r, column=c, padx=5, pady=5, sticky="nsew")
+            page_widgets.append(card)
+        for c in range(GRID_COLS):
+            grid.columnconfigure(c, weight=1, uniform="col")
+        for r in range(GRID_ROWS):
+            grid.rowconfigure(r, weight=1, uniform="row")
+        self._button_widgets.append(page_widgets)
+        self._page_tabs.append(tab)
 
     @staticmethod
     def _update_hint(hint: tk.Label, act: ttk.Combobox) -> None:
@@ -334,17 +402,9 @@ class MacroPadGUI:
     # ------------------------------------------------------------------
     # 설정 ↔ 위젯
     # ------------------------------------------------------------------
-    def _on_ip_edited(self) -> None:
-        """IP 필드를 직접 입력하면 시각 기록 — 자동 검색이 10초간 덮어쓰지 않도록."""
-        self._ip_manual_edit_time = time.time()
-
     def _populate_from_config(self) -> None:
-        self.ip_entry.delete(0, tk.END)
-        self.ip_entry.insert(0, str(self.config.get("device_ip") or ""))
-        self.port_entry.delete(0, tk.END)
-        self.port_entry.insert(0, str(self.config.get("port") or UDP_PORT))
         pages = self.config.get("pages") or []
-        for page in range(PAGES):
+        for page in range(len(self._button_widgets)):
             for bid in range(BUTTONS_PER_PAGE):
                 w = self._button_widgets[page][bid]
                 btn = {}
@@ -357,67 +417,130 @@ class MacroPadGUI:
                 w["action"].set(btn.get("action_type", "shortcut"))
                 w["value"].delete(0, tk.END)
                 w["value"].insert(0, btn.get("action_value") or "")
+                color = int(btn.get("color", 0) or 0)
+                if not (0 <= color < len(COLOR_NAMES)):
+                    color = 0
+                w["color"].set(COLOR_NAMES[color])
+                w["swatch"].config(bg=COLOR_HEX[color])
                 self._update_hint(w["hint"], w["action"])
+        if self._page_tabs:
+            self._load_page_name(self._current_page_idx())
 
-    def _collect_config(self, ip: str, port: int) -> dict:
+    # ------------------------------------------------------------------
+    # 페이지 관리 (이름 편집 / 추가 / 삭제)
+    # ------------------------------------------------------------------
+    def _current_page_idx(self) -> int:
+        try:
+            return self.notebook.index(self.notebook.select())
+        except tk.TclError:
+            return 0
+
+    def _page_name_edited(self) -> None:
+        idx = self._current_page_idx()
+        name = self.page_name_entry.get().strip()[:20]
+        with self._config_lock:
+            pages = self.config["pages"]
+            if 0 <= idx < len(pages):
+                pages[idx]["name"] = name
+        if 0 <= idx < len(self._page_tabs):
+            self.notebook.tab(self._page_tabs[idx], text=name or "Page %d" % (idx + 1))
+
+    def _page_changed(self, event=None) -> None:
+        self._load_page_name(self._current_page_idx())
+
+    def _load_page_name(self, idx: int) -> None:
+        with self._config_lock:
+            pages = self.config["pages"]
+            name = pages[idx].get("name", "") if 0 <= idx < len(pages) else ""
+        self.page_name_entry.delete(0, tk.END)
+        self.page_name_entry.insert(0, name)
+
+    def _add_page(self) -> None:
+        with self._config_lock:
+            if len(self.config["pages"]) >= MAX_PAGES:
+                self._log("⚠️ 페이지는 최대 %d개까지 추가할 수 있습니다" % MAX_PAGES, error=True)
+                return
+        idx = len(self._page_tabs)
+        self._make_page_tab(idx, "Page %d" % (idx + 1))
+        with self._config_lock:
+            self.config["pages"].append({
+                "name": "Page %d" % (idx + 1),
+                "buttons": [{"label": "", "action_type": "shortcut", "action_value": "", "color": 0}
+                            for _ in range(BUTTONS_PER_PAGE)],
+            })
+        self.notebook.select(self._page_tabs[idx])
+        self._load_page_name(idx)
+        self._log("+ 페이지 %d 추가" % (idx + 1))
+
+    def _del_page(self) -> None:
+        with self._config_lock:
+            if len(self.config["pages"]) <= 1:
+                messagebox.showwarning("페이지 삭제", "최소 1개 페이지는 필요합니다.")
+                return
+        idx = self._current_page_idx()
+        if not (0 <= idx < len(self._button_widgets)):
+            return
+        has_content = any(
+            w["label"].get().strip() or w["value"].get().strip() for w in self._button_widgets[idx])
+        if has_content and not messagebox.askyesno(
+                "페이지 삭제", "페이지 %d의 설정이 삭제됩니다. 계속할까요?" % (idx + 1)):
+            return
+        self.notebook.forget(idx)
+        tab = self._page_tabs.pop(idx)
+        tab.destroy()
+        self._button_widgets.pop(idx)
+        with self._config_lock:
+            self.config["pages"].pop(idx)
+        self._reindex_tab_labels()
+        self._page_changed()
+        self._log("− 페이지 %d 삭제" % (idx + 1))
+
+    def _reindex_tab_labels(self) -> None:
+        with self._config_lock:
+            pages = self.config["pages"]
+        for i, tab in enumerate(self._page_tabs):
+            name = pages[i].get("name") if i < len(pages) else "Page %d" % (i + 1)
+            self.notebook.tab(tab, text=name or "Page %d" % (i + 1))
+
+    def _collect_config(self) -> dict:
+        with self._config_lock:
+            cur_pages = self.config["pages"]
         pages = []
-        for page in range(PAGES):
+        for page in range(len(self._button_widgets)):
             buttons = []
             for bid in range(BUTTONS_PER_PAGE):
                 w = self._button_widgets[page][bid]
+                cname = w["color"].get()
+                color = COLOR_NAMES.index(cname) if cname in COLOR_NAMES else 0
                 buttons.append({
                     "label": w["label"].get().strip()[:LABEL_MAX],
                     "action_type": w["action"].get() or "shortcut",
                     "action_value": w["value"].get(),
+                    "color": color,
                 })
-            pages.append({"name": "Page %d" % (page + 1), "buttons": buttons})
-        return {"version": 1, "port": port, "device_ip": ip,
-                "heartbeat_enabled": bool(self.hb_var.get()), "pages": pages}
-
-    def _validate_addr(self, require_ip: bool = True):
-        """IP/포트 검증. 오류 시 메시지박스 표시 후 (None, None).
-
-        require_ip=False면 IP가 비어 있어도 허용 (자동 검색 모드).
-        """
-        ip = self.ip_entry.get().strip()
-        if not ip:
-            if require_ip:
-                messagebox.showerror("주소 오류", "CYD IP를 입력하세요.")
-                return (None, None)
-            ip = ""
-        try:
-            port = int(self.port_entry.get().strip())
-        except ValueError:
-            messagebox.showerror("포트 오류", "포트는 숫자여야 합니다.")
-            return (None, None)
-        return (ip, port)
-
-    def _hb_changed(self) -> None:
-        with self._config_lock:
-            self.config["heartbeat_enabled"] = bool(self.hb_var.get())
+            name = cur_pages[page].get("name") if page < len(cur_pages) else "Page %d" % (page + 1)
+            pages.append({"name": name, "buttons": buttons})
+        return {"version": 2, "port": UDP_PORT,
+                "device_ip": self.config.get("device_ip", "") or "",
+                "pages": pages}
 
     # ------------------------------------------------------------------
     # 설정 적용 (Apply)
     # ------------------------------------------------------------------
     def _apply(self) -> None:
-        ip, port = self._validate_addr(require_ip=False)
-        if ip is None:
-            return
-        config = self._collect_config(ip, port)
+        config = self._collect_config()
         self._save_config(config)
         with self._config_lock:
             self.config = config
-        if not _is_valid_ip(ip):
-            # IP 미지정 → 리스너 시작 후 자동 검색으로 전송 (여기선 저장만)
-            self._log("💾 설정 저장 — CYD IP 미지정, 리스너 시작하면 자동 검색으로 전송됩니다")
-            return
-        # 리스너가 실행 중이면 리스너 소켓으로 재전송 (소스 포트 = 수신 포트 보장)
+        ip = self.config.get("device_ip", "") or ""
         if self._listener_running:
             self._resend_queue.put("resend")
-            self._log("💾 설정 저장 + 재전송 요청 (%s:%d)" % (ip, port))
+            self._log("💾 설정 저장 + 재전송 요청 (%d페이지)" % len(config["pages"]))
+        elif _is_valid_ip(ip):
+            self._send_config_from_temp_socket(ip, UDP_PORT)
+            self._log("💾 설정 저장 + 전송 (%s)" % ip)
         else:
-            self._send_config_from_temp_socket(ip, port)
-            self._log("💾 설정 저장 + 전송 (%s:%d)" % (ip, port))
+            self._log("💾 설정 저장 — 디바이스 발견 시 자동 전송됩니다")
 
     def _send_config_from_temp_socket(self, ip: str, port: int) -> None:
         """리스너 미실행 시 임시 소켓으로 설정 전송.
@@ -442,27 +565,22 @@ class MacroPadGUI:
     def _send_all_pages(self, sock: socket.socket, ip: str, port: int) -> None:
         with self._config_lock:
             pages = self.config.get("pages") or []
-        for page in range(PAGES):
+        num_pages = len(pages)
+        for page in range(num_pages):
             btns = pages[page].get("buttons", []) if page < len(pages) else []
             if len(btns) < BUTTONS_PER_PAGE:
-                btns = btns + [{"label": ""}] * (BUTTONS_PER_PAGE - len(btns))
-            sock.sendto(build_config_packet(page, btns), (ip, port))
+                btns = btns + [{"label": "", "color": 0}] * (BUTTONS_PER_PAGE - len(btns))
+            sock.sendto(build_config_packet(page, btns, num_pages), (ip, port))
 
     # ------------------------------------------------------------------
     # 리스너 스레드 (UDP 수신 + 액션 실행)
     # ------------------------------------------------------------------
-    def _toggle_listener(self) -> None:
-        if self._listener_running:
-            self._stop_listener()
-        else:
-            self._start_listener()
-
     def _start_listener(self) -> None:
-        ip, port = self._validate_addr(require_ip=False)
-        if ip is None:
+        """리스너 자동 시작: 고정 포트 UDP_PORT(8890)로 바인드해 실시간 수신."""
+        if self._listener_running:
             return
+        port = UDP_PORT
         with self._config_lock:
-            self.config["device_ip"] = ip
             self.config["port"] = port
         if not _pynput_installed():
             self._log("⚠️ pynput 미설치 — 단축키/문구 액션이 동작하지 않습니다 (pip install -r requirements.txt)",
@@ -471,23 +589,14 @@ class MacroPadGUI:
         self._listener_thread = threading.Thread(target=self._listener_worker, args=(port,),
                                                  daemon=True)
         self._listener_thread.start()
-        self.listen_btn.config(text="■ 수신 중지", bg="#ef4444")
-        if _is_valid_ip(ip):
-            self.listen_status.config(
-                text="● 리스너 동작 중 (%s:%d)  ·  접근성 권한: 시스템설정 → 손쉬운 사용" % (ip, port),
-                fg="#22c55e")
-            self._log("▶ 리스너 시작: %s:%d" % (ip, port))
-        else:
-            self.listen_status.config(
-                text="● 리스너 동작 중 · CYD IP 자동 검색 대기 중...", fg="#22c55e")
-            self._log("▶ 리스너 시작: CYD IP 자동 검색 대기 중 (디바이스 발견 시 자동 설정)")
+        self.listen_status.config(text="● 리스너 동작 중 · CYD 자동 검색 대기...", fg="#22c55e")
+        self._log("▶ 리스너 자동 시작: UDP %d (디바이스 자동 검색)" % port)
 
     def _stop_listener(self) -> None:
         self._listener_running = False
         if self._listener_thread is not None:
             self._listener_thread.join(timeout=3.0)
             self._listener_thread = None
-        self.listen_btn.config(text="● 리스너 시작", bg="#22c55e")
         self.listen_status.config(text="● 리스너 중지됨", fg=self.sub_text)
         self._log("■ 리스너 중지")
 
@@ -498,21 +607,29 @@ class MacroPadGUI:
         """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("0.0.0.0", port))
-        sock.settimeout(2.0)   # 주기적 기상: 하트비트/재전송/종료 폴링
+        try:
+            sock.bind(("0.0.0.0", port))
+        except OSError as e:
+            self._listener_running = False
+            self._event_queue.put(("log", "⚠️ UDP %d 바인드 실패: %s" % (port, e), True))
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return
+        sock.settimeout(2.0)   # 주기적 기상: 재전송/종료 폴링
 
         with self._config_lock:
             ip = self.config.get("device_ip", "") or ""
         if _is_valid_ip(ip):
             self._send_all_pages(sock, ip, port)     # 시작 시 1회 설정 푸시 (IP 아는 경우에만)
-        last_heartbeat = time.time()
 
         try:
             while self._listener_running:
                 try:
                     data, addr = sock.recvfrom(4096)
                     if parse_beacon_packet(data):
-                        self._handle_beacon(sock, addr, port)   # IP 자동 검색
+                        self._handle_beacon(sock, addr, port)   # IP 자동 검색 + 설정 재푸시
                     else:
                         self._handle_event_packet(data, addr)
                 except socket.timeout:
@@ -520,22 +637,13 @@ class MacroPadGUI:
                 except OSError:
                     break
 
-                with self._config_lock:
-                    hb_enabled = bool(self.config.get("heartbeat_enabled", True))
-                now = time.time()
-                if hb_enabled and now - last_heartbeat >= 20.0:
-                    with self._config_lock:
-                        ip = self.config.get("device_ip", "") or ""
-                    if _is_valid_ip(ip):
-                        self._send_all_pages(sock, ip, port)
-                        last_heartbeat = now
+                # Apply 재전송 요청 (메인 스레드에서 큐로 전달)
                 try:
-                    self._resend_queue.get_nowait()   # Apply 재전송 요청
+                    self._resend_queue.get_nowait()
                     with self._config_lock:
                         ip = self.config.get("device_ip", "") or ""
                     if _is_valid_ip(ip):
                         self._send_all_pages(sock, ip, port)
-                        last_heartbeat = now
                 except queue.Empty:
                     pass
         finally:
@@ -566,30 +674,31 @@ class MacroPadGUI:
                                    True))
 
     def _handle_beacon(self, sock: socket.socket, addr, port: int) -> None:
-        """디스커버리 비콘("MPBE") 수신: 소스 IP로 디바이스 주소를 학습하고 설정을 푸시한다."""
+        """디스커버리 비콘("MPBE") 수신: 소스 IP를 학습하고 설정을 재푸시한다.
+
+        IP가 같아도 매 비콘(3초)마다 재푸시 — 디바이스가 재부팅되어 RAM의 라벨/색을
+        잃었거나 호스트 IP가 바뀌었어도 자동 복구된다. (기존 "주기 재전송" 체크박스 역할을
+        이 매 비콘 푸시로 대체. 로그/상태바 갱신은 새 IP일 때만.)
+        """
         device_ip = addr[0]
+        is_new = False
         with self._config_lock:
             cur = self.config.get("device_ip", "") or ""
-            if device_ip == cur:
-                return   # 이미 아는 주소 — 재전송 불필요
-            self.config["device_ip"] = device_ip
-            self.config["port"] = port
-        self._event_queue.put(("ip", device_ip,
-                               "디바이스 발견 (자동 검색): %s — 설정 전송" % device_ip))
+            if device_ip != cur:
+                is_new = True
+                self.config["device_ip"] = device_ip
+                self.config["port"] = port
+        if is_new:
+            self._event_queue.put(("ip", device_ip,
+                                   "디바이스 발견 (자동 검색): %s — 설정 전송" % device_ip))
         self._send_all_pages(sock, device_ip, port)
 
     def _apply_detected_ip(self, ip: str, msg: str) -> None:
-        """자동 검색된 IP를 UI에 반영 (메인 스레드).
-
-        사용자가 직접 입력한 지 10초 안에는 덮어쓰지 않는다(_ip_manual_edit_time).
-        """
+        """자동 검색된 디바이스를 상태바에 반영 (메인 스레드)."""
         self._log(msg)
-        if time.time() - self._ip_manual_edit_time > 10:
-            self.ip_entry.delete(0, tk.END)
-            self.ip_entry.insert(0, ip)
         port = int(self.config.get("port", UDP_PORT) or UDP_PORT)
         self.listen_status.config(
-            text="● 리스너 동작 중 (%s:%d) · 디바이스 자동 발견" % (ip, port), fg="#22c55e")
+            text="● 리스너 동작 중 · 디바이스 발견: %s:%d" % (ip, port), fg="#22c55e")
 
     @staticmethod
     def _action_desc(btn: dict) -> str:
@@ -672,6 +781,9 @@ class MacroPadGUI:
                 if item[0] == "ip":
                     _, ip, msg = item
                     self._apply_detected_ip(ip, msg)
+                elif item[0] == "log":
+                    _, msg, is_error = item
+                    self._log(msg, error=is_error)
                 else:
                     page, button, msg, is_error = item
                     self._log(msg, error=is_error)
@@ -702,15 +814,22 @@ if __name__ == "__main__":
     if "--test-packets" in sys.argv:
         # 오프라인 패킷 구성/파싱 자가검증 (GUI 없이 실행 가능)
         assert struct.calcsize(">IBBBB") == 8, "헤더는 8바이트여야 함"
-        btns = [{"label": "Copy", "action_type": "shortcut", "action_value": "cmd+c"},
-                {"label": "안녕", "action_type": "text", "action_value": "x"},
-                {"label": "", "action_type": "app", "action_value": ""}] + \
-               [{"label": "", "action_type": "shortcut", "action_value": ""}] * 9
-        pkt = build_config_packet(0, btns)
-        assert pkt[:8] == struct.pack(">IBBBB", MAGIC_CONFIG, 0, 12, 0, 0)
-        assert len(pkt) == 8 + 12 * 2 + 4 + 6   # 4="Copy", 6="안녕" UTF-8
-        magic, page, count, r, r2 = CONFIG_HEADER.unpack(pkt[:8])
-        assert magic == MAGIC_CONFIG and page == 0 and count == 12
+        btns = [{"label": "Copy", "action_type": "shortcut", "action_value": "cmd+c", "color": 0},
+                {"label": "안녕", "action_type": "text", "action_value": "x", "color": 7},
+                {"label": "", "action_type": "app", "action_value": "", "color": 2}] + \
+               [{"label": "", "action_type": "shortcut", "action_value": "", "color": 0}] * 9
+        pkt = build_config_packet(0, btns, 3)
+        assert pkt[:8] == struct.pack(">IBBBB", MAGIC_CONFIG, 0, 12, 3, 0)  # num_pages=3
+        assert len(pkt) == 8 + 12 * 3 + 4 + 6   # 엔트리 12×3B(bid/llen/color) + 4="Copy" + 6="안녕"
+        magic, page, count, num_pages, r2 = CONFIG_HEADER.unpack(pkt[:8])
+        assert magic == MAGIC_CONFIG and page == 0 and count == 12 and num_pages == 3
+        # 엔트리 >BBB (button_id, label_len, color_idx) 검증 — 라벨은 엔트리 사이에 교차 배치
+        # layout: [8B헤더][bid0 llen0 col0]["Copy" 4B][bid1 llen1 col1]["안녕" 6B]...
+        assert pkt[8:11] == bytes([0, 4, 0])    # bid0 "Copy" color 0
+        assert pkt[15:18] == bytes([1, 6, 7])   # bid1 "안녕"(UTF-8 6B) color 7
+        assert pkt[24:27] == bytes([2, 0, 2])   # bid2 빈 라벨 color 2
+        assert pkt[11:15] == b"Copy"                            # 라벨0 "Copy"
+        assert pkt[18:24] == "안녕".encode("utf-8")             # 라벨1 "안녕"(6B)
         # 라벨 24바이트 초과 절단 검증 (멀티바이트 비분할)
         long_label = _trunc_utf8("가" * 30, LABEL_MAX)
         assert len(long_label) <= LABEL_MAX and long_label.decode("utf-8").endswith("가")
@@ -720,7 +839,7 @@ if __name__ == "__main__":
         assert parse_event_packet(evt[:7]) is None          # 짧은 패킷
         bad = struct.pack(">IBBBB", 0xDEADBEEF, 0, 0, 0, 0)  # 잘못된 magic
         assert parse_event_packet(bad) is None
-        print("OK: 패킷 구성/파싱 검증 통과 (헤더 8B, magic MCFG/MPAD, 라벨 절단, 이벤트 파싱)")
+        print("OK: 패킷 구성/파싱 검증 통과 (헤더 8B, magic MCFG/MPAD, 엔트리 >BBB+color, num_pages, 라벨 절단, 이벤트 파싱)")
         sys.exit(0)
     if "--test-action" in sys.argv:
         # 오프라인 액션 검증: 격리 헬퍼로 키보드 입력이 실제 동작하는지 확인 (디바이스 불필요)

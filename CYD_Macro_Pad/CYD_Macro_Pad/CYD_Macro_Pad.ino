@@ -12,8 +12,9 @@
  * 보드 설정: ESP32 Dev Module · Flash 4MB · Partition "Huge APP (3MB No OTA/1MB SPIFFS)"
  *
  * 와이어 프로토콜 (host_macro_pad/macro_pad_gui.py와 정확히 일치해야 함):
- *   - 설정 패킷 (호스트→디바이스): >IBBBB magic=0x4D434647("MCFG"), page, count, 0, 0
- *                                 + count개 엔트리(>BB + label bytes, 라벨 최대 24바이트)
+ *   - 설정 패킷 (호스트→디바이스): >IBBBB magic=0x4D434647("MCFG"), page, count, num_pages, 0
+ *                                 + count개 엔트리(>BBB + label bytes: button_id, label_len, color_idx)
+ *                                 라벨 최대 24바이트, color_idx는 아래 BTN_PALETTE 인덱스(0..9)
  *   - 이벤트 패킷 (디바이스→호스트): >IBBBB magic=0x4D504144("MPAD"), page, button_id, 0, 0
  *   - 디스커버리 비콘 (디바이스→서브넷 브로드캐스트): >IBBBB magic=0x4D504245("MPBE"), 0, 0, 0, 0
  *     Wi-Fi 연결 후 3초 주기로 전송 — 호스트 리스너가 소스 IP를 보고 자동으로 설정을 푸시
@@ -131,11 +132,13 @@ static LGFX lcd;
 #define MAGIC_EVENT      0x4D504144      // "MPAD" 이벤트 패킷 (디바이스→호스트)
 #define MAGIC_BEACON     0x4D504245      // "MPBE" 디스커버리 비콘 (디바이스→브로드캐스트)
 #define BEACON_INTERVAL_MS  3000         // 비콘 재전송 주기 (호스트가 IP 자동 검색)
-#define PAGES            2
+#define MAX_PAGES        8               // 최대 페이지 수 (호스트와 일치)
+#define DEFAULT_PAGES    2               // 부팅 시 페이지 수 (numPages 초기값)
 #define GRID_COLS        4
 #define GRID_ROWS        3
 #define BUTTONS_PER_PAGE (GRID_COLS * GRID_ROWS)  // 12
 #define LABEL_MAX        24              // 라벨 최대 바이트 (호스트와 동일)
+#define BTN_COLOR_COUNT  10              // 버튼 팔레트 색 수 (호스트 COLOR_NAMES와 일치)
 
 // ==========================================
 // 3. UI 지오메트리 (320x240 가로 정방향, 회전 코드 3)
@@ -163,6 +166,27 @@ static LGFX lcd;
 #define MAX_TAP_MS      800              // 이보다 길게 누른 탭은 무시
 
 // ==========================================
+// 3.5 버튼 색상 팔레트 (호스트 COLOR_NAMES/COLOR_HEX와 순서·값 정확히 일치)
+// ==========================================
+// 버튼 구분용 10색. textWhite=false면 검정 글자(밝은 배경), true면 흰 글자.
+struct BtnColor {
+  uint8_t r, g, b;
+  bool    textWhite;
+};
+static const BtnColor BTN_PALETTE[BTN_COLOR_COUNT] = {
+  {100, 116, 139, true },   //  0 slate  #64748B
+  {239,  68,  68, true },   //  1 red    #EF4444
+  {249, 115,  22, true },   //  2 orange #F97316
+  {234, 179,   8, true },   //  3 yellow #EAB308
+  { 34, 197,  94, true },   //  4 green  #22C55E
+  { 20, 184, 166, true },   //  5 teal   #14B8A6
+  { 59, 130, 246, true },   //  6 blue   #3B82F6
+  {168,  85, 247, true },   //  7 purple #A855F7
+  {236,  72, 153, true },   //  8 pink   #EC4899
+  {248, 250, 252, false},   //  9 white  #F8FAFC → 검정 글자
+};
+
+// ==========================================
 // 4. 전역 상태
 // ==========================================
 AsyncUDP udp;                  // 설정 수신 (listen 전용)
@@ -172,8 +196,10 @@ Preferences prefs;
 String stored_ssid = "";
 String stored_pass = "";
 
-// 버튼 라벨 저장소 (호스트가 설정 패킷으로 채움)
-char labels[PAGES][BUTTONS_PER_PAGE][LABEL_MAX + 1] = {};
+// 버튼 라벨/색 저장소 (호스트가 설정 패킷으로 채움)
+char labels[MAX_PAGES][BUTTONS_PER_PAGE][LABEL_MAX + 1] = {};
+uint8_t btnColors[MAX_PAGES][BUTTONS_PER_PAGE] = {};   // 0..BTN_COLOR_COUNT-1 (기본 0=slate)
+uint8_t numPages = DEFAULT_PAGES;   // 현재 페이지 수 (설정 패킷 헤더로 갱신)
 volatile bool labelsDirty = false;   // AsyncUDP 콜백에서 세우고 loop()에서 소비
 uint8_t currentPage = 0;
 
@@ -536,20 +562,37 @@ void onConfigPacket(AsyncUDPPacket packet) {
 
   uint8_t page = d[4];
   uint8_t count = d[5];
-  if (page >= PAGES) page = PAGES - 1;
+  if (page >= MAX_PAGES) page = MAX_PAGES - 1;
   if (count > BUTTONS_PER_PAGE) count = BUTTONS_PER_PAGE;
 
+  // 페이지 수 갱신 (헤더 3번째 필드 = num_pages) — 상태바 "PAGE x/y" 반영
+  uint8_t np = d[6];
+  if (np < 1) np = 1;
+  if (np > MAX_PAGES) np = MAX_PAGES;
+  if (np != numPages) {
+    numPages = np;
+    if (currentPage >= numPages) currentPage = numPages - 1;
+    labelsDirty = true;
+  }
+
   bool changed = false;
-  // 엔트리는 가변 길이(>BB + label bytes) → 고정 오프셋이 아니라 순차 탐색해야 한다.
+  // 엔트리는 가변 길이(>BBB + label bytes) → 고정 오프셋이 아니라 순차 탐색해야 한다.
   size_t off = 8;
   for (uint8_t i = 0; i < count; i++) {
-    if (off + 2 > len) break;
+    if (off + 3 > len) break;
     uint8_t bid = d[off];
     uint8_t llen = d[off + 1];
-    off += 2;
+    uint8_t col = d[off + 2];
+    off += 3;
     if (bid >= BUTTONS_PER_PAGE) continue;
+    if (col >= BTN_COLOR_COUNT) col = 0;
     if (off + llen > len) llen = len - off;
     if (llen > LABEL_MAX) llen = LABEL_MAX;
+
+    if (btnColors[page][bid] != col) {
+      btnColors[page][bid] = col;
+      changed = true;
+    }
 
     char tmp[LABEL_MAX + 1];
     memcpy(tmp, d + off, llen);
@@ -566,7 +609,8 @@ void onConfigPacket(AsyncUDPPacket packet) {
   if (changed) {
     labelsDirty = true;   // loop()가 그리드 재렌더
     String hip = hostIP.toString();
-    Serial.printf("[CFG] page=%u count=%u host=%s:%u\n", page, count, hip.c_str(), hostPort);
+    Serial.printf("[CFG] page=%u count=%u pages=%u host=%s:%u\n",
+                  page, count, numPages, hip.c_str(), hostPort);
   }
 }
 
@@ -637,12 +681,22 @@ void drawButton(uint8_t page, uint8_t idx, bool pressed) {
   int row = idx / GRID_COLS;
   int x = btn_x(col), y = btn_y(row);
 
-  uint16_t fill = pressed ? lcd.color565(37, 99, 235) : lcd.color565(51, 65, 85);
+  // 팔레트 기반 색상 (btnColors[page][idx]는 onConfigPacket이 채움)
+  uint8_t ci = btnColors[page][idx];
+  if (ci >= BTN_COLOR_COUNT) ci = 0;
+  const BtnColor& c = BTN_PALETTE[ci];
+  uint16_t fill;
+  if (pressed) {
+    // 눌림: 각 채널 +50 (255 클램프) → 밝게 하이라이트
+    fill = lcd.color565(min(255, c.r + 50), min(255, c.g + 50), min(255, c.b + 50));
+  } else {
+    fill = lcd.color565(c.r, c.g, c.b);
+  }
   uint16_t border = pressed ? TFT_WHITE : lcd.color565(100, 116, 139);
   lcd.fillRoundRect(x, y, BTN_W, BTN_H, 6, fill);
   lcd.drawRoundRect(x, y, BTN_W, BTN_H, 6, border);
 
-  lcd.setTextColor(TFT_WHITE);
+  lcd.setTextColor(c.textWhite ? TFT_WHITE : TFT_BLACK);
   lcd.setTextSize(1);
   lcd.setTextDatum(MC_DATUM);
   lcd.drawString(labels[page][idx], x + BTN_W / 2, y + BTN_H / 2);
@@ -661,13 +715,13 @@ void drawStatusBar() {
   lcd.drawString("<", PREV_X + PREV_W / 2, PREV_Y + PREV_H / 2);
 
   lcd.fillRoundRect(NEXT_X, NEXT_Y, NEXT_W, NEXT_H, 4,
-                    currentPage < PAGES - 1 ? lcd.color565(37, 99, 235) : lcd.color565(71, 85, 105));
+                    currentPage < numPages - 1 ? lcd.color565(37, 99, 235) : lcd.color565(71, 85, 105));
   lcd.drawString(">", NEXT_X + NEXT_W / 2, NEXT_Y + NEXT_H / 2);
 
   // 중앙: 페이지 인디케이터 + IP
   String ipStr = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "NO WIFI";
   char buf[40];
-  snprintf(buf, sizeof(buf), "PAGE %d/%d  %s", currentPage + 1, PAGES, ipStr.c_str());
+  snprintf(buf, sizeof(buf), "PAGE %d/%d  %s", currentPage + 1, numPages, ipStr.c_str());
   lcd.setTextColor(lcd.color565(148, 163, 184));
   lcd.drawString(buf, 160, STATUS_TOP + 14);
 }
@@ -774,7 +828,7 @@ void handleTouch() {
       if (pressX >= PREV_X && pressX < PREV_X + PREV_W && currentPage > 0) {
         currentPage--;
         drawGrid(currentPage);
-      } else if (pressX >= NEXT_X && pressX < NEXT_X + NEXT_W && currentPage < PAGES - 1) {
+      } else if (pressX >= NEXT_X && pressX < NEXT_X + NEXT_W && currentPage < numPages - 1) {
         currentPage++;
         drawGrid(currentPage);
       } else {
@@ -788,6 +842,9 @@ void handleTouch() {
 // 13. 메인 루프
 // ==========================================
 void loop() {
+  // 페이지 수 감소로 현재 페이지가 범위 밖이면 보정 (안전망 — onConfigPacket도 클램프)
+  if (currentPage >= numPages) currentPage = numPages - 1;
+
   // 호스트 설정 도착 시 그리드 재렌더 (플리커 방지: 변경 시에만)
   if (labelsDirty) {
     labelsDirty = false;
@@ -809,8 +866,8 @@ void loop() {
   static unsigned long lastStatTime = 0;
   if (now - lastStatTime >= 1000) {
     String hip = hostKnown ? hostIP.toString() : String("-");
-    Serial.printf("[STAT] page=%u host=%s:%u evt=%u cfg=%u bcn=%u heap=%lukB wifi=%d\n",
-                  currentPage, hip.c_str(), hostPort,
+    Serial.printf("[STAT] page=%u pages=%u host=%s:%u evt=%u cfg=%u bcn=%u heap=%lukB wifi=%d\n",
+                  currentPage, numPages, hip.c_str(), hostPort,
                   statEvents, statConfigs, statBeacons,
                   (unsigned long)(ESP.getFreeHeap() / 1024), WiFi.status());
     statEvents = 0;
