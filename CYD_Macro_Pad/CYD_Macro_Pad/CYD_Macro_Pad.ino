@@ -131,6 +131,9 @@ static LGFX lcd;
 #define MAGIC_CONFIG     0x4D434647      // "MCFG" 설정 패킷 (호스트→디바이스)
 #define MAGIC_EVENT      0x4D504144      // "MPAD" 이벤트 패킷 (디바이스→호스트)
 #define MAGIC_BEACON     0x4D504245      // "MPBE" 디스커버리 비콘 (디바이스→브로드캐스트)
+#define MAGIC_OK         0x4D504F4B      // "MPOK" 액션 성공 피드백 (호스트→디바이스, B)
+#define MAGIC_ERR        0x4D504552      // "MPER" 액션 실패 피드백 (호스트→디바이스, B)
+#define FEEDBACK_MS      300             // 버튼 플래시 지속 시간 (B)
 #define BEACON_INTERVAL_MS  3000         // 비콘 재전송 주기 (호스트가 IP 자동 검색)
 #define MAX_PAGES        8               // 최대 페이지 수 (호스트와 일치)
 #define DEFAULT_PAGES    2               // 부팅 시 페이지 수 (numPages 초기값)
@@ -138,6 +141,7 @@ static LGFX lcd;
 #define GRID_ROWS        3
 #define BUTTONS_PER_PAGE (GRID_COLS * GRID_ROWS)  // 12
 #define LABEL_MAX        24              // 라벨 최대 바이트 (호스트와 동일)
+#define PAGE_NAME_MAX    20              // 페이지 이름 최대 바이트 (호스트와 동일, A)
 #define BTN_COLOR_COUNT  10              // 버튼 팔레트 색 수 (호스트 COLOR_NAMES와 일치)
 
 // ==========================================
@@ -164,6 +168,13 @@ static LGFX lcd;
 
 #define LONG_PRESS_MS   2500             // 상태바 길게 → Wi-Fi 재설정
 #define MAX_TAP_MS      800              // 이보다 길게 누른 탭은 무시
+
+// [C] 백라이트 절전 + 주변 밝기 자동 조절
+#define LDR_PIN         34               // GPIO34 CDS 조도 센서 (아날로그 ADC1)
+#define IDLE_DIM_MS     60000            // 무터치 60s 후 백라이트 디밍 (off 아님)
+#define BRIGHT_FULL     200              // 기본 밝기 (최대)
+#define BRIGHT_DIM      40               // 디밍 밝기
+#define BRIGHT_MIN      60               // 조도 기반 밝기 하한 (어두운 곳)
 
 // ==========================================
 // 3.5 버튼 색상 팔레트 (호스트 COLOR_NAMES/COLOR_HEX와 순서·값 정확히 일치)
@@ -202,6 +213,8 @@ uint8_t btnColors[MAX_PAGES][BUTTONS_PER_PAGE] = {};   // 0..BTN_COLOR_COUNT-1 (
 uint8_t numPages = DEFAULT_PAGES;   // 현재 페이지 수 (설정 패킷 헤더로 갱신)
 volatile bool labelsDirty = false;   // AsyncUDP 콜백에서 세우고 loop()에서 소비
 uint8_t currentPage = 0;
+char pageNames[MAX_PAGES][PAGE_NAME_MAX + 1] = {};   // 페이지 이름 (설정 패킷으로 채움, A)
+Preferences prefsPad;   // 마지막 페이지/페이지 수 복원용 NVS (네임스페이스 "cyd_mpad", E)
 
 // 호스트 주소 (가장 최근 설정 패킷의 소스로 학습)
 IPAddress hostIP;
@@ -212,6 +225,18 @@ bool hostKnown = false;
 static uint32_t statEvents = 0;    // 전송한 이벤트 수
 static uint32_t statConfigs = 0;   // 수신한 설정 패킷 수
 static uint32_t statBeacons = 0;   // 보낸 디스커버리 비콘 수
+
+// [C] 백라이트 절전 + 조도 자동 밝기 상태
+static unsigned long lastTouchTime = 0;   // 마지막 터치 시각 (무터치 디밍 판정)
+static uint8_t lastBrightness = 0;        // 현재 백라이트 밝기 (변경 시에만 setBrightness)
+static unsigned long lastLdrTime = 0;     // 조도 ADC 읽기 throttle (1초)
+
+// [B] 실행 결과 피드백 (MPOK/MPER 수신 → 버튼 플래시)
+static int8_t feedbackPage = -1;   // -1 = 플래시 없음
+static int8_t feedbackBtn = -1;
+static bool feedbackOk = false;
+static unsigned long feedbackUntil = 0;
+static bool feedbackPending = false;   // AsyncUDP 콜백이 세우고 loop()가 소비 (레이스 방지)
 
 // ==========================================
 // 5. 함수 선언
@@ -228,7 +253,10 @@ void drawErrorScreen(const char* msg);
 void drawReadyScreen();
 void drawGrid(uint8_t page);
 void drawButton(uint8_t page, uint8_t idx, bool pressed);
+void drawButtonFlash(uint8_t page, uint8_t idx, uint16_t fill);
 void drawStatusBar();
+void updateBrightness();
+void onFeedbackPacket(AsyncUDPPacket packet);
 void handleTouch();
 bool hitButton(uint16_t tx, uint16_t ty, int* col, int* row);
 
@@ -242,11 +270,24 @@ void setup() {
 
   lcd.init();
   lcd.setRotation(3);   // 가로 정방향 (320x240)
-  lcd.setBrightness(200);
+  lcd.setBrightness(BRIGHT_FULL);   // [C] 기본 밝기
+  lastTouchTime = millis();
+  lastBrightness = BRIGHT_FULL;
 
   prefs.begin("cyd_wifi", false);
   stored_ssid = prefs.getString("ssid", "");
   stored_pass = prefs.getString("pass", "");
+
+  // [E] 마지막 페이지 복원: 이전 세션의 페이지 수/인덱스를 NVS에서 읽어 부팅 시 복원
+  // (페이지 전환 후 5초 디바운스로 저장 — loop() 참조, NVS 웨어 방지)
+  prefsPad.begin("cyd_mpad", false);
+  uint8_t savedPages = prefsPad.getUChar("numPages", DEFAULT_PAGES);
+  if (savedPages < 1) savedPages = 1;
+  if (savedPages > MAX_PAGES) savedPages = MAX_PAGES;
+  numPages = savedPages;
+  uint8_t savedPage = prefsPad.getUChar("lastPage", 0);
+  if (savedPage >= numPages) savedPage = 0;
+  currentPage = savedPage;
 
   uint16_t tx, ty;
   bool forceSetup = lcd.getTouch(&tx, &ty);
@@ -553,6 +594,13 @@ void onConfigPacket(AsyncUDPPacket packet) {
 
   const uint8_t* d = packet.data();
   uint32_t magic = ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) | ((uint32_t)d[2] << 8) | (uint32_t)d[3];
+
+  // [B] 액션 실행 결과 피드백 (MPOK/MPER): 성공/실패를 버튼 플래시로 표시
+  if (magic == MAGIC_OK || magic == MAGIC_ERR) {
+    onFeedbackPacket(packet);
+    return;
+  }
+
   if (magic != MAGIC_CONFIG) return;
 
   // 호스트 주소 학습: 가장 최근 설정 패킷의 소스로 이벤트 전송 대상을 갱신
@@ -576,8 +624,25 @@ void onConfigPacket(AsyncUDPPacket packet) {
   }
 
   bool changed = false;
-  // 엔트리는 가변 길이(>BBB + label bytes) → 고정 오프셋이 아니라 순차 탐색해야 한다.
+  // [A] page_name: 헤더(8B) 뒤에 page_name_len u8 + name bytes. len==0 = "변경 없음"(H 명세 동일).
   size_t off = 8;
+  if (off + 1 > len) return;
+  uint8_t nameLen = d[off];
+  off += 1;
+  if (nameLen > 0) {
+    if (nameLen > PAGE_NAME_MAX) nameLen = PAGE_NAME_MAX;
+    if (off + nameLen > len) nameLen = len - off;
+    char tmpName[PAGE_NAME_MAX + 1];
+    memcpy(tmpName, d + off, nameLen);
+    tmpName[nameLen] = '\0';
+    if (strcmp(tmpName, pageNames[page]) != 0) {
+      strncpy(pageNames[page], tmpName, PAGE_NAME_MAX + 1);
+      changed = true;
+    }
+    off += nameLen;
+  }
+
+  // 엔트리는 가변 길이(>BBB + label bytes) → 고정 오프셋이 아니라 순차 탐색해야 한다.
   for (uint8_t i = 0; i < count; i++) {
     if (off + 3 > len) break;
     uint8_t bid = d[off];
@@ -612,6 +677,26 @@ void onConfigPacket(AsyncUDPPacket packet) {
     Serial.printf("[CFG] page=%u count=%u pages=%u host=%s:%u\n",
                   page, count, numPages, hip.c_str(), hostPort);
   }
+}
+
+// [B] 액션 실행 결과 피드백 수신 (호스트 → 디바이스): 해당 버튼을 초록(성공)/빨강(실패)으로 플래시
+void onFeedbackPacket(AsyncUDPPacket packet) {
+  const uint8_t* d = packet.data();
+  uint32_t magic = ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) | ((uint32_t)d[2] << 8) | (uint32_t)d[3];
+  bool ok = (magic == MAGIC_OK);
+  uint8_t page = d[4];
+  uint8_t btn = d[5];
+  if (page >= MAX_PAGES || btn >= BUTTONS_PER_PAGE) return;
+
+  // 현재 페이지의 버튼만 플래시 (다른 페이지면 화면에 안 보이므로 스킵)
+  if (page != currentPage) return;
+
+  feedbackPage = page;
+  feedbackBtn = btn;
+  feedbackOk = ok;
+  feedbackUntil = millis() + FEEDBACK_MS;
+  feedbackPending = true;   // loop()에서 실제 렌더 — AsyncUDP 콜백에서 직접 그리면 레이스
+  Serial.printf("[FB] page=%u btn=%u %s\n", page, btn, ok ? "OK" : "ERR");
 }
 
 // ==========================================
@@ -702,6 +787,48 @@ void drawButton(uint8_t page, uint8_t idx, bool pressed) {
   lcd.drawString(labels[page][idx], x + BTN_W / 2, y + BTN_H / 2);
 }
 
+// [B] 버튼을 임시 색(피드백용)으로 렌더 — 원상 복귀는 drawButton(page, idx, false)
+void drawButtonFlash(uint8_t page, uint8_t idx, uint16_t fill) {
+  int col = idx % GRID_COLS;
+  int row = idx / GRID_COLS;
+  int x = btn_x(col), y = btn_y(row);
+  lcd.fillRoundRect(x, y, BTN_W, BTN_H, 6, fill);
+  lcd.drawRoundRect(x, y, BTN_W, BTN_H, 6, TFT_WHITE);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.setTextSize(1);
+  lcd.setTextDatum(MC_DATUM);
+  lcd.drawString(labels[page][idx], x + BTN_W / 2, y + BTN_H / 2);
+}
+
+// [C] 백라이트 밝기 갱신: 무터치 시 디밍, 그 외엔 주변 조도(CDS)에 맞춰 자동 조절.
+// LDR 극성은 보드마다 다를 수 있다 — CYD 기본 회로는 밝을수록 ADC 값이 낮아져
+// (3.3V→CDS→핀→GND), 아래 map()은 "밝은 곳에서 화면도 밝게"다. 반대라면
+// map(in, inMin, inMax)의 인자 순서(200/3600)를 뒤집는다.
+void updateBrightness() {
+  unsigned long now = millis();
+
+  // 무터치 IDLE_DIM_MS 경과 → 디밍 (off 아님). 터치는 handleTouch가 lastTouchTime을 갱신.
+  if (now - lastTouchTime >= IDLE_DIM_MS) {
+    if (lastBrightness != BRIGHT_DIM) {
+      lcd.setBrightness(BRIGHT_DIM);
+      lastBrightness = BRIGHT_DIM;
+    }
+    return;
+  }
+
+  // 조도 기반 자동 밝기 (ADC 읽기는 1초 throttle — 매 loop마다 읽지 않음)
+  if (now - lastLdrTime < 1000) return;
+  lastLdrTime = now;
+
+  int ldr = analogRead(LDR_PIN);                       // 0~4095, 밝을수록 낮음(CYD)
+  int b = map(ldr, 200, 3800, BRIGHT_FULL, BRIGHT_MIN);
+  b = constrain(b, BRIGHT_MIN, BRIGHT_FULL);
+  if ((uint8_t)b != lastBrightness) {
+    lcd.setBrightness((uint8_t)b);
+    lastBrightness = (uint8_t)b;
+  }
+}
+
 void drawStatusBar() {
   // 상태바 배경 (그리드 배경색과 동일하게 채워 이음새 제거)
   lcd.fillRect(0, STATUS_TOP, 320, 240 - STATUS_TOP, lcd.color565(15, 23, 42));
@@ -718,10 +845,18 @@ void drawStatusBar() {
                     currentPage < numPages - 1 ? lcd.color565(37, 99, 235) : lcd.color565(71, 85, 105));
   lcd.drawString(">", NEXT_X + NEXT_W / 2, NEXT_Y + NEXT_H / 2);
 
-  // 중앙: 페이지 인디케이터 + IP
+  // 중앙: 페이지 이름 + x/y + IP (A — 이름은 기본 폰트로 렌더 가능한 ASCII만)
   String ipStr = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "NO WIFI";
-  char buf[40];
-  snprintf(buf, sizeof(buf), "PAGE %d/%d  %s", currentPage + 1, numPages, ipStr.c_str());
+  char buf[48];
+  const char* pname = pageNames[currentPage];
+  if (pname[0] != '\0') {
+    char nameBuf[15];                        // 상태바 폭 대비 14자 + null 여유
+    strncpy(nameBuf, pname, 14);
+    nameBuf[14] = '\0';
+    snprintf(buf, sizeof(buf), "%s  %d/%d  %s", nameBuf, currentPage + 1, numPages, ipStr.c_str());
+  } else {
+    snprintf(buf, sizeof(buf), "PAGE %d/%d  %s", currentPage + 1, numPages, ipStr.c_str());
+  }
   lcd.setTextColor(lcd.color565(148, 163, 184));
   lcd.drawString(buf, 160, STATUS_TOP + 14);
 }
@@ -791,6 +926,15 @@ void handleTouch() {
     if (touchStart == 0) {
       // 새 누름 시작
       touchStart = millis();
+      lastTouchTime = touchStart;   // [C] 터치 시각 갱신 (디밍 취소)
+      // [C] 디밍 상태였다면 즉시 조도 기반 밝기로 복귀
+      if (lastBrightness == BRIGHT_DIM) {
+        int ldr = analogRead(LDR_PIN);
+        int b = map(ldr, 200, 3800, BRIGHT_FULL, BRIGHT_MIN);
+        b = constrain(b, BRIGHT_MIN, BRIGHT_FULL);
+        lcd.setBrightness((uint8_t)b);
+        lastBrightness = (uint8_t)b;
+      }
       pressX = tx;
       pressY = ty;
       pressInGrid = (ty < STATUS_TOP);
@@ -841,9 +985,32 @@ void handleTouch() {
 // ==========================================
 // 13. 메인 루프
 // ==========================================
+// [E] 마지막 페이지 복원용 상태: 페이지/페이지 수 변경을 5초 디바운스 후 1회만 NVS 저장
+static uint8_t lastShownPage = 0xFF;
+static uint8_t lastSavedPages = 0xFF;
+static unsigned long pageChangeTime = 0;
+static bool pageChangePending = false;
+
 void loop() {
+  unsigned long now = millis();
+
   // 페이지 수 감소로 현재 페이지가 범위 밖이면 보정 (안전망 — onConfigPacket도 클램프)
   if (currentPage >= numPages) currentPage = numPages - 1;
+
+  // [C] 백라이트 디밍/조도 자동 밝기 (60s 무터치 시 디밍, 터치 즉시 복귀)
+  updateBrightness();
+
+  // [E] 페이지 전환/수 변경 감지 → 5초 안정되면 1회 저장 (연타는 1회로 합침, NVS 웨어 방지)
+  if (lastShownPage != currentPage || lastSavedPages != numPages) {
+    lastShownPage = currentPage;
+    lastSavedPages = numPages;
+    pageChangeTime = now;
+    pageChangePending = true;
+  } else if (pageChangePending && now - pageChangeTime >= 5000) {
+    prefsPad.putUChar("lastPage", currentPage);
+    prefsPad.putUChar("numPages", numPages);
+    pageChangePending = false;
+  }
 
   // 호스트 설정 도착 시 그리드 재렌더 (플리커 방지: 변경 시에만)
   if (labelsDirty) {
@@ -851,9 +1018,24 @@ void loop() {
     drawGrid(currentPage);
   }
 
-  handleTouch();
+  // [B] 피드백 렌더: 상태는 AsyncUDP 콜백이 세우고, 그리기는 loop()에서 (레이스 방지).
+  //     색상은 반드시 RGB565(lcd.color565)로 변환해 전달 — 24비트 hex를 그대로 넘기면 잘림.
+  if (feedbackPending) {
+    feedbackPending = false;
+    if (feedbackPage >= 0 && feedbackPage == currentPage) {
+      drawButtonFlash(feedbackPage, feedbackBtn,
+                      feedbackOk ? lcd.color565(34, 197, 94) : lcd.color565(239, 68, 68));
+    }
+  }
 
-  unsigned long now = millis();
+  // [B] 피드백 플래시 종료 → 원상 복귀 (현재 페이지일 때만)
+  if (feedbackPage >= 0 && now >= feedbackUntil) {
+    int8_t p = feedbackPage, b = feedbackBtn;
+    feedbackPage = -1;
+    if (p == currentPage) drawButton(p, b, false);
+  }
+
+  handleTouch();
 
   // 디스커버리 비콘: 호스트가 IP를 자동 검색하도록 3초 주기 브로드캐스트
   static unsigned long lastBeaconTime = 0;

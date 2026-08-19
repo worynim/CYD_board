@@ -42,7 +42,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 # ==========================================
 # 크로스파일 계약 (CYD_Macro_Pad/CYD_Macro_Pad.ino와 정확히 일치해야 함)
@@ -51,12 +51,15 @@ UDP_PORT = 8890              # 매크로 패드 전용 포트 (스트리밍 8888
 MAGIC_CONFIG = 0x4D434647    # "MCFG" 호스트→디바이스 설정 패킷
 MAGIC_EVENT = 0x4D504144     # "MPAD" 디바이스→호스트 이벤트 패킷
 MAGIC_BEACON = 0x4D504245    # "MPBE" 디바이스→브로드캐스트 디스커버리 비콘
+MAGIC_OK = 0x4D504F4B        # "MPOK" 액션 성공 피드백 → 디바이스 (B)
+MAGIC_ERR = 0x4D504552       # "MPER" 액션 실패 피드백 → 디바이스 (B)
 MAX_PAGES = 8                # 최대 페이지 수 (펌웨어와 일치)
 DEFAULT_PAGES = 2            # 최초 페이지 수
 GRID_COLS = 4
 GRID_ROWS = 3
 BUTTONS_PER_PAGE = GRID_COLS * GRID_ROWS   # 12
 LABEL_MAX = 24               # 라벨 최대 바이트 (UTF-8)
+PAGE_NAME_MAX = 20           # 페이지 이름 최대 바이트 (UTF-8) — 펌웨어와 일치 (A)
 
 # 버튼 색상 팔레트 (인덱스 → 펌웨어 BTN_PALETTE와 정확히 일치해야 함)
 COLOR_NAMES = ["slate", "red", "orange", "yellow", "green",
@@ -123,11 +126,12 @@ def _trunc_utf8(text: str, max_bytes: int) -> bytes:
     return b[:end]
 
 
-def build_config_packet(page_idx: int, buttons, num_pages: int) -> bytes:
+def build_config_packet(page_idx: int, buttons, num_pages: int, page_name: str = "") -> bytes:
     """한 페이지 설정 패킷을 만든다. buttons는 {'label', 'color', ...} 딕셔너리 리스트.
 
-    >IBBBB 헤더(magic, page, count, num_pages, 0) + count개 엔트리(>BBB + label bytes).
-    엔트리: button_id u8, label_len u8, color_idx u8 (0..COLOR_NAMES-1).
+    >IBBBB 헤더(magic, page, count, num_pages, 0)
+    + page_name_len u8 + page_name(≤PAGE_NAME_MAX)   ← [A] len==0 = "변경 없음"
+    + count개 엔트리(>BBB + label bytes). 엔트리: button_id u8, label_len u8, color_idx u8.
     """
     if not (0 <= page_idx < MAX_PAGES):
         page_idx = max(0, min(page_idx, MAX_PAGES - 1))
@@ -139,7 +143,9 @@ def build_config_packet(page_idx: int, buttons, num_pages: int) -> bytes:
             color = 0
         entries += struct.pack(">BBB", bid, len(label), color)
         entries += label
-    return CONFIG_HEADER.pack(MAGIC_CONFIG, page_idx, len(buttons), num_pages, 0) + bytes(entries)
+    name_b = _trunc_utf8(page_name or "", PAGE_NAME_MAX)
+    return (CONFIG_HEADER.pack(MAGIC_CONFIG, page_idx, len(buttons), num_pages, 0)
+            + struct.pack(">B", len(name_b)) + name_b + bytes(entries))
 
 
 def parse_event_packet(data: bytes):
@@ -330,6 +336,14 @@ class MacroPadGUI:
                                    bg="#0ea5e9", fg="white", relief=tk.FLAT, padx=14, pady=6,
                                    cursor="pointinghand", font=("Pretendard", 10, "bold"))
         self.apply_btn.pack(side=tk.LEFT)
+        self.export_btn = tk.Button(bot_row, text="⬇ 내보내기", command=self._export_config,
+                                    bg="#334155", fg="white", relief=tk.FLAT, padx=10, pady=6,
+                                    cursor="pointinghand", font=("Pretendard", 10))
+        self.export_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.import_btn = tk.Button(bot_row, text="⬆ 가져오기", command=self._import_config,
+                                    bg="#334155", fg="white", relief=tk.FLAT, padx=10, pady=6,
+                                    cursor="pointinghand", font=("Pretendard", 10))
+        self.import_btn.pack(side=tk.LEFT, padx=(8, 0))
         log_frame = tk.Frame(bot_card, bg=self.card_bg)
         log_frame.pack(fill=tk.BOTH, pady=(8, 0))
         self.log_text = tk.Text(log_frame, height=6, bg="#020617", fg=self.text_color,
@@ -525,6 +539,57 @@ class MacroPadGUI:
                 "pages": pages}
 
     # ------------------------------------------------------------------
+    # 설정 내보내기/가져오기 (D)
+    # ------------------------------------------------------------------
+    def _export_config(self) -> None:
+        config = self._collect_config()
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json", initialfile="macro_config.json",
+            filetypes=[("JSON 파일", "*.json")])
+        if not path:
+            return
+        try:
+            Path(path).write_text(json.dumps(config, ensure_ascii=False, indent=2),
+                                  encoding="utf-8")
+            self._log("⬇ 설정 내보내기: %s (%d페이지)" % (path, len(config["pages"])))
+        except OSError as e:
+            self._log("⚠️ 내보내기 실패: %s" % e, error=True)
+
+    def _import_config(self) -> None:
+        path = filedialog.askopenfilename(
+            filetypes=[("JSON 파일", "*.json"), ("모든 파일", "*.*")])
+        if not path:
+            return
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception as e:
+            messagebox.showerror("가져오기 실패", "설정 파일을 읽지 못했습니다:\n%s" % e)
+            return
+        new_config = self._normalize_config(raw)
+        with self._config_lock:
+            self.config = new_config
+        self._rebuild_all_tabs()
+        self._save_config(new_config)
+        self._log("⬆ 설정 가져오기: %s (%d페이지)" % (path, len(new_config["pages"])))
+        # 디바이스가 알려진 경우 즉시 재전송 요청 (리스너가 큐를 드레인)
+        if self._listener_running:
+            self._resend_queue.put("resend")
+
+    def _rebuild_all_tabs(self) -> None:
+        """가져오기 후 페이지 탭을 전부 다시 만든다 (페이지 수/이름이 바뀔 수 있음)."""
+        for tab in self._page_tabs:
+            self.notebook.forget(tab)
+            tab.destroy()
+        self._page_tabs = []
+        self._button_widgets = []
+        pages = self.config.get("pages") or []
+        for page in range(len(pages)):
+            self._make_page_tab(page, pages[page].get("name") or "Page %d" % (page + 1))
+        self._populate_from_config()
+        if self._page_tabs:
+            self.notebook.select(self._page_tabs[0])
+
+    # ------------------------------------------------------------------
     # 설정 적용 (Apply)
     # ------------------------------------------------------------------
     def _apply(self) -> None:
@@ -570,7 +635,8 @@ class MacroPadGUI:
             btns = pages[page].get("buttons", []) if page < len(pages) else []
             if len(btns) < BUTTONS_PER_PAGE:
                 btns = btns + [{"label": "", "color": 0}] * (BUTTONS_PER_PAGE - len(btns))
-            sock.sendto(build_config_packet(page, btns, num_pages), (ip, port))
+            name = pages[page].get("name", "") if page < len(pages) else ""
+            sock.sendto(build_config_packet(page, btns, num_pages, name), (ip, port))
 
     # ------------------------------------------------------------------
     # 리스너 스레드 (UDP 수신 + 액션 실행)
@@ -631,7 +697,7 @@ class MacroPadGUI:
                     if parse_beacon_packet(data):
                         self._handle_beacon(sock, addr, port)   # IP 자동 검색 + 설정 재푸시
                     else:
-                        self._handle_event_packet(data, addr)
+                        self._handle_event_packet(sock, data, addr)
                 except socket.timeout:
                     pass
                 except OSError:
@@ -651,7 +717,7 @@ class MacroPadGUI:
             sock.close()
             self._log("리스너 스레드 종료", debug=True)
 
-    def _handle_event_packet(self, data: bytes, addr) -> None:
+    def _handle_event_packet(self, sock: socket.socket, data: bytes, addr) -> None:
         parsed = parse_event_packet(data)
         if parsed is None:
             return
@@ -669,9 +735,24 @@ class MacroPadGUI:
             desc = self._action_desc(btn)
             self._event_queue.put((page, button, "✓ page%d · #%d: %s 실행됨" % (page + 1, button, desc),
                                    False))
+            self._send_feedback(sock, addr, page, button, True)    # [B] MPOK
         except Exception as e:
             self._event_queue.put((page, button, "✗ page%d · #%d: %s" % (page + 1, button, e),
                                    True))
+            self._send_feedback(sock, addr, page, button, False)   # [B] MPER
+
+    def _send_feedback(self, sock: socket.socket, addr, page: int, button: int, ok: bool) -> None:
+        """액션 실행 결과(성공=MPOK/실패=MPER)를 디바이스로 회신 — 버튼 플래시 피드백(B).
+
+        디바이스는 항상 UDP_PORT(8890)에서 listen 중이므로, 이벤트 소스 IP + 고정 포트로 보낸다.
+        (이벤트 패킷의 소스 포트는 WiFiUDP가 임의 할당하므로 회신 대상이 아니다.)
+        """
+        magic = MAGIC_OK if ok else MAGIC_ERR
+        pkt = EVENT_HEADER.pack(magic, page, button, 0, 0)
+        try:
+            sock.sendto(pkt, (addr[0], UDP_PORT))
+        except OSError:
+            pass
 
     def _handle_beacon(self, sock: socket.socket, addr, port: int) -> None:
         """디스커버리 비콘("MPBE") 수신: 소스 IP를 학습하고 설정을 재푸시한다.
@@ -818,24 +899,34 @@ if __name__ == "__main__":
                 {"label": "안녕", "action_type": "text", "action_value": "x", "color": 7},
                 {"label": "", "action_type": "app", "action_value": "", "color": 2}] + \
                [{"label": "", "action_type": "shortcut", "action_value": "", "color": 0}] * 9
-        pkt = build_config_packet(0, btns, 3)
+        pkt = build_config_packet(0, btns, 3)   # page_name 기본 "" → name_len 0
         assert pkt[:8] == struct.pack(">IBBBB", MAGIC_CONFIG, 0, 12, 3, 0)  # num_pages=3
-        assert len(pkt) == 8 + 12 * 3 + 4 + 6   # 엔트리 12×3B(bid/llen/color) + 4="Copy" + 6="안녕"
+        assert pkt[8] == 0                       # [A] page_name_len == 0 (이름 없음)
+        assert len(pkt) == 9 + 12 * 3 + 4 + 6    # [A] 헤더8 + name_len1 + 엔트리 + 라벨
         magic, page, count, num_pages, r2 = CONFIG_HEADER.unpack(pkt[:8])
         assert magic == MAGIC_CONFIG and page == 0 and count == 12 and num_pages == 3
         # 엔트리 >BBB (button_id, label_len, color_idx) 검증 — 라벨은 엔트리 사이에 교차 배치
-        # layout: [8B헤더][bid0 llen0 col0]["Copy" 4B][bid1 llen1 col1]["안녕" 6B]...
-        assert pkt[8:11] == bytes([0, 4, 0])    # bid0 "Copy" color 0
-        assert pkt[15:18] == bytes([1, 6, 7])   # bid1 "안녕"(UTF-8 6B) color 7
-        assert pkt[24:27] == bytes([2, 0, 2])   # bid2 빈 라벨 color 2
-        assert pkt[11:15] == b"Copy"                            # 라벨0 "Copy"
-        assert pkt[18:24] == "안녕".encode("utf-8")             # 라벨1 "안녕"(6B)
+        # layout: [8B헤더][name_len 1B][bid0 llen0 col0]["Copy" 4B][bid1 llen1 col1]["안녕" 6B]...
+        assert pkt[9:12] == bytes([0, 4, 0])     # bid0 "Copy" color 0
+        assert pkt[16:19] == bytes([1, 6, 7])    # bid1 "안녕"(UTF-8 6B) color 7
+        assert pkt[25:28] == bytes([2, 0, 2])    # bid2 빈 라벨 color 2
+        assert pkt[12:16] == b"Copy"                            # 라벨0 "Copy"
+        assert pkt[19:25] == "안녕".encode("utf-8")             # 라벨1 "안녕"(6B)
+        # [A] page_name이 있으면 name_len+name 뒤에 엔트리가 온다
+        pkt2 = build_config_packet(1, btns[:2], 3, "Page 2")
+        assert pkt2[8] == 6 and pkt2[9:15] == b"Page 2"
+        assert pkt2[15:18] == bytes([0, 4, 0])   # page_name 뒤 엔트리 시작
         # 라벨 24바이트 초과 절단 검증 (멀티바이트 비분할)
         long_label = _trunc_utf8("가" * 30, LABEL_MAX)
         assert len(long_label) <= LABEL_MAX and long_label.decode("utf-8").endswith("가")
         # 이벤트 파싱
         evt = struct.pack(">IBBBB", MAGIC_EVENT, 1, 5, 0, 0)
         assert parse_event_packet(evt) == (1, 5, 0)
+        # [B] 피드백 패킷 (MPOK/MPER) 구성 검증
+        ok_pkt = EVENT_HEADER.pack(MAGIC_OK, 1, 5, 0, 0)
+        err_pkt = EVENT_HEADER.pack(MAGIC_ERR, 1, 5, 0, 0)
+        assert ok_pkt[:4] == b"MPOK" and ok_pkt[4] == 1 and ok_pkt[5] == 5
+        assert err_pkt[:4] == b"MPER" and err_pkt[4] == 1 and err_pkt[5] == 5
         assert parse_event_packet(evt[:7]) is None          # 짧은 패킷
         bad = struct.pack(">IBBBB", 0xDEADBEEF, 0, 0, 0, 0)  # 잘못된 magic
         assert parse_event_packet(bad) is None
