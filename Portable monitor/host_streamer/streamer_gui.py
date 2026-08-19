@@ -12,6 +12,7 @@ import io
 import socket
 import struct
 import threading
+import queue
 import logging
 from dataclasses import dataclass
 import tkinter as tk
@@ -33,6 +34,11 @@ logging.basicConfig(
 )
 
 PAYLOAD_CHUNK_SIZE = 1400
+
+# [FIX #12] 디바이스 렌더 상한. rt≈54ms(픽셀 푸시 17ms + 디코드 37ms) → 최대 ~18fps.
+# 이보다 빠르게 전송하면 commitFrame()의 isRendering 가드에 걸려 프레임이 폐기됨
+# (호스트 전송 FPS만 높고 CYD는 recv≈0·drop 폭증). 안전 마진을 두고 16fps로 클램프.
+DEVICE_RENDER_FPS_CAP = 16
 
 
 @dataclass
@@ -57,8 +63,15 @@ class CYDStreamerGUI:
         self.root.resizable(False, False)
 
         self.is_streaming = False
-        self.stream_thread: threading.Thread | None = None
+        self.stream_thread: threading.Thread | None = None   # 소비자(UDP 전송)
+        self.capture_thread: threading.Thread | None = None  # 생산자(캡처+인코딩)
+        self._frame_queue: queue.Queue | None = None         # 생산자→소비자 JPEG 큐
+        self._stage_times: Dict[str, float] = {}             # 스테이지별 누적 타이밍 (2s 로그용)
+        self._stage_last_log = 0.0
+        self._ui_stage: Dict[str, float] = {}                # GUI 표시용 스테이지 누적 (500ms 갱신)
+        self._ui_frames: int = 0
         self.sock: socket.socket | None = None
+        self._last_sent_ctrl: tuple = (-1, -1)  # 마지막으로 보낸 (rot_code, show_fps) — [FIX #11] 중복 전송 방지
 
         # 워커 스레드와 메인 스레드 간 파라미터 공유 (스레드 안전)
         # 메인 스레드가 새 StreamConfig 객체로 교체하고, 워커 스레드는 Lock으로 읽음
@@ -224,11 +237,13 @@ class CYDStreamerGUI:
         fps_frame = tk.Frame(card, bg=self.card_bg)
         fps_frame.pack(fill=tk.X, pady=4)
 
-        self.fps_label = ttk.Label(fps_frame, text="목표 FPS (25 FPS):")
+        self.fps_label = ttk.Label(fps_frame, text="목표 FPS (16 FPS):")
         self.fps_label.pack(anchor="w")
 
+        # [FIX #12] 디바이스 렌더가 54ms/frame(≈18fps 상한)이므로 기본 16으로 설정.
+        # 위로 올려도 안전 상한 16에서 전송량이 클램프됨(아래 _capture_worker 참조).
         self.fps_scale = ttk.Scale(fps_frame, from_=10, to=30, orient=tk.HORIZONTAL, command=self.on_fps_change)
-        self.fps_scale.set(25)
+        self.fps_scale.set(16)
         self.fps_scale.pack(fill=tk.X, pady=2)
 
         # 8. 통계 패널
@@ -292,13 +307,18 @@ class CYDStreamerGUI:
         with self._config_lock:
             self._stream_config = cfg
 
-        # 회전·FPS 오버레이 제어 명령을 CYD로 전송
+        # [FIX #11] 제어 패킷은 회전(rot_code)·오버레이(show_fps)가 실제로 바뀔 때만 전송.
+        # 품질·FPS·비율은 호스트 전용 설정이라 디바이스 알림이 불필요. 슬라이더 드래그마다
+        # 제어 패킷을 보내면 디바이스가 세션 리셋(재조립 버퍼 클리어)을 반복해 프레임이 폐기됨.
+        if (cfg.rot_code, cfg.show_fps) == self._last_sent_ctrl:
+            return
         ip = self.ip_entry.get().strip()
         try:
             port = int(self.port_entry.get().strip())  # [FIX #4] ValueError 안전 처리
         except ValueError:
             return
         self.send_control_command(self.sock, (ip, port), cfg.rot_code, cfg.show_fps)
+        self._last_sent_ctrl = (cfg.rot_code, cfg.show_fps)
 
     # ------------------------------------------------------------------
     # UI 콜백
@@ -311,7 +331,9 @@ class CYDStreamerGUI:
 
     def on_fps_change(self, val: str) -> None:
         f = int(float(val))
-        self.fps_label.config(text=f"목표 FPS ({f} FPS):")
+        # [FIX #12] 디바이스 렌더 상한(≈16fps) 반영해 실제 전송 FPS를 표시
+        eff = min(f, DEVICE_RENDER_FPS_CAP)
+        self.fps_label.config(text=f"목표 FPS ({f} FPS){'' if eff == f else f' → {eff} 적용'}:")
         self._update_stream_config()
 
     def on_control_param_changed(self, event=None) -> None:
@@ -323,7 +345,9 @@ class CYDStreamerGUI:
 
     def send_control_command(self, sock: socket.socket, dest_addr: tuple, rot_val: int, show_fps: int) -> None:
         try:
-            cmd_packet = struct.pack(">IBBBB", 0xFFFFFFFF, rot_val, show_fps, 0, 0)
+            # data[6] = FEC 프로토콜 활성 플래그 (1). 펌웨어가 마지막 청크를 패리티로 해석하도록 통보.
+            # 레거시(패딩 없음) 호스트와 섞여도 펌웨어가 프로토콜을 구분해 화면 보존.
+            cmd_packet = struct.pack(">IBBBB", 0xFFFFFFFF, rot_val, show_fps, 1, 0)
             sock.sendto(cmd_packet, dest_addr)
         except Exception:
             pass
@@ -372,14 +396,15 @@ class CYDStreamerGUI:
         if sel_mon < 0:
             sel_mon = 0
 
-        # [DEBUG] 이전 워커 스레드 생존 여부 확인
-        if self.stream_thread is not None and self.stream_thread.is_alive():
-            logging.warning("[START] 이전 워커 스레드가 아직 살아있음! 재시작 경쟁 조건 위험. 잠시 대기...")
-            self.stream_thread.join(timeout=2.0)
-            if self.stream_thread.is_alive():
-                logging.error("[START] 이전 워커 스레드가 2초 내 종료되지 않음. 강제 진행.")
-            else:
-                logging.debug("[START] 이전 워커 스레드 정상 종료 확인.")
+        # [DEBUG] 이전 워커/캡처 스레드 생존 여부 확인
+        for tname, t in (("워커", self.stream_thread), ("캡처", self.capture_thread)):
+            if t is not None and t.is_alive():
+                logging.warning("[START] 이전 %s 스레드가 아직 살아있음! 재시작 경쟁 조건 위험. 잠시 대기...", tname)
+                t.join(timeout=2.0)
+                if t.is_alive():
+                    logging.error("[START] 이전 %s 스레드가 2초 내 종료되지 않음. 강제 진행.", tname)
+                else:
+                    logging.debug("[START] 이전 %s 스레드 정상 종료 확인.", tname)
 
         logging.debug("[START] 스트리밍 시작 → %s:%d, 모니터=%d", ip, port, sel_mon)
         self.is_streaming = True
@@ -397,13 +422,22 @@ class CYDStreamerGUI:
         self.port_entry.config(state="disabled")
         self.mon_combo.config(state="disabled")
 
-        self.stream_thread = threading.Thread(
-            target=self._stream_worker,
-            args=(ip, port, sel_mon),
-            daemon=True,
-        )
+        # [Phase 4] 파이프라인: 캡처(생산자) → JPEG 큐 → UDP 전송(소비자)
+        # 큐가 가득 차면 오래된 프레임을 버리고 최신 프레임을 유지 → 지연 최소화
+        self._frame_queue = queue.Queue(maxsize=2)
+        self._stage_times.clear()
+        self._stage_last_log = time.time()
+        self._ui_stage.clear()
+        self._ui_frames = 0
+        # [FIX #11] 새 스트림 시작 시 초기 제어 명령은 반드시 재전송되도록 리셋
+        self._last_sent_ctrl = (-1, -1)
+
+        self.stream_thread = threading.Thread(target=self._stream_worker, args=(ip, port), daemon=True)
+        self.capture_thread = threading.Thread(target=self._capture_worker, args=(sel_mon,), daemon=True)
         self.stream_thread.start()
-        logging.debug("[START] 워커 스레드 시작됨 (id=%d)", self.stream_thread.ident or -1)
+        self.capture_thread.start()
+        logging.debug("[START] 워커(id=%d) + 캡처(id=%d) 스레드 시작됨",
+                      self.stream_thread.ident or -1, self.capture_thread.ident or -1)
 
     def stop_streaming(self) -> None:
         """스트리밍 플래그만 해제합니다.
@@ -432,9 +466,10 @@ class CYDStreamerGUI:
         logging.debug("[CLOSE] 창 닫기 요청.")
         if self.is_streaming:
             self.stop_streaming()
-        if self.stream_thread is not None and self.stream_thread.is_alive():
-            logging.debug("[CLOSE] 워커 스레드 종료 대기 중...")
-            self.stream_thread.join(timeout=2.0)
+        for tname, t in (("워커", self.stream_thread), ("캡처", self.capture_thread)):
+            if t is not None and t.is_alive():
+                logging.debug("[CLOSE] %s 스레드 종료 대기 중...", tname)
+                t.join(timeout=2.0)
         logging.debug("[CLOSE] 창 종료.")
         self.root.destroy()
 
@@ -442,13 +477,14 @@ class CYDStreamerGUI:
     # 워커 스레드
     # ------------------------------------------------------------------
 
-    def _stream_worker(self, ip: str, port: int, monitor_idx: int) -> None:
-        """화면 캡처 및 UDP 전송 워커 스레드.
+    def _stream_worker(self, ip: str, port: int) -> None:
+        """UDP 전송 소비자 스레드: 청크 분할 + FEC 패리티 + 전송.
 
         소켓의 생명주기 전체(생성~종료)를 이 메서드가 책임집니다.
+        캡처/인코딩은 _capture_worker(생산자)가 수행하고, JPEG 바이트만 큐로 전달받습니다.
         """
         my_thread_id = threading.current_thread().ident
-        logging.debug("[WORKER:%d] 워커 시작. 대상=%s:%d, 모니터=%d", my_thread_id, ip, port, monitor_idx)
+        logging.debug("[WORKER:%d] 소비자 시작. 대상=%s:%d", my_thread_id, ip, port)
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock = sock
@@ -461,94 +497,89 @@ class CYDStreamerGUI:
         if cfg is not None:
             logging.debug("[WORKER:%d] 초기 제어 명령 전송 → rot=%d, show_fps=%d", my_thread_id, cfg.rot_code, cfg.show_fps)
             self.send_control_command(sock, dest_addr, cfg.rot_code, cfg.show_fps)
+            # [FIX #11] 초기 전송분을 추적해 UI 콜백이 중복 전송하지 않도록 함
+            self._last_sent_ctrl = (cfg.rot_code, cfg.show_fps)
 
         frame_id = 0
         frame_count = 0
         fps_start_time = time.time()
         loop_exit_reason = "is_streaming=False (정상 종료)"
+        # 재시작 시 self._frame_queue가 교체돼도 이 스레드의 큐를 고정 (오염 방지)
+        my_queue = self._frame_queue
 
         try:
-            with mss.mss() as sct:
-                if monitor_idx >= len(self.monitors_info):
-                    logging.warning("[WORKER:%d] 모니터 인덱스 초과(%d), 0번으로 대체.", my_thread_id, monitor_idx)
-                    monitor_idx = 0
-                monitor = self.monitors_info[monitor_idx]
-                logging.debug("[WORKER:%d] 캡처 영역: %dx%d", my_thread_id, monitor["width"], monitor["height"])
+            while True:
+                # 생산자가 넣은 JPEG 바이트 (None = 생산자 종료 시그널)
+                jpeg_bytes = my_queue.get()
+                if jpeg_bytes is None:
+                    loop_exit_reason = "캡처(생산자) 스레드 종료"
+                    break
+                if not self.is_streaming:
+                    break
 
-                while self.is_streaming:
-                    loop_start = time.time()
+                try:
+                    # [FEC] 제로패딩 블록 → XOR 패리티 1개를 마지막 청크로 전송
+                    total_len = len(jpeg_bytes)
+                    data_chunks = (total_len + PAYLOAD_CHUNK_SIZE - 1) // PAYLOAD_CHUNK_SIZE
+                    padded = jpeg_bytes + b"\x00" * (data_chunks * PAYLOAD_CHUNK_SIZE - total_len)
 
-                    # [FIX #6] 스레드 안전하게 현재 설정 스냅샷 획득
-                    # tkinter 위젯을 워커 스레드에서 직접 읽지 않음
+                    parity = 0
+                    for i in range(data_chunks):
+                        parity ^= int.from_bytes(padded[i * PAYLOAD_CHUNK_SIZE:(i + 1) * PAYLOAD_CHUNK_SIZE], "little")
+                    parity_bytes = parity.to_bytes(PAYLOAD_CHUNK_SIZE, "little")
+                    total_chunks = data_chunks + 1
+
+                    # [FIX #2] frame_id 마스크 (0xFFFFFFFF는 컨트롤 패킷 식별자로 예약)
+                    frame_id = (frame_id + 1) & 0x7FFFFFFF
+
+                    # [FIX #13] 청크 미세버스트 제거: 15개 청크를 1.5ms에 몰아 보내면
+                    # Wi-Fi AP/CYD RX가 버스트 꼬리(마지막 데이터+패리티)를 연속 유실 →
+                    # 프레임당 2+ 청크 유실로 프레임 폐기(drop 폭증, fec≈0, rend_fps 폭락).
+                    # 프레임 주기에 걸쳐 분산하면 손실이 단일 청크(FEC 복원)에 그친다.
+                    #
+                    # [FIX #14] 패리티도 분산 전송 + 프레임 간격 확보:
+                    # 이전엔 패리티 직후 다음 프레임 chunk 0을 백투백(간격 0) 전송 →
+                    # 2패킷 미니버스트로 다음 프레임의 첫 청크가 드롭되어
+                    # "[FEC] ... 청크 0 복원"이 반복되는 패턴이 발생. (시간 경과 저하의 신호)
+                    # 이제 (데이터+패리티) 전체를 프레임 주기에 균등 분산하고 패리티 뒤에도
+                    # sleep을 남겨 다음 프레임 시작 전 10ms 여유를 둔다.
                     with self._config_lock:
-                        cfg = self._stream_config
+                        cur_cfg = self._stream_config
+                    eff_fps = min(cur_cfg.target_fps if cur_cfg else DEVICE_RENDER_FPS_CAP,
+                                  DEVICE_RENDER_FPS_CAP)
+                    frame_period = 1.0 / eff_fps
+                    total_packets = data_chunks + 1  # 데이터 + 패리티
+                    inter_chunk = max(1.5e-3, (frame_period - 0.010) / total_packets)
 
-                    if cfg is None:
-                        time.sleep(0.01)
-                        continue
+                    for chunk_idx in range(total_packets):  # 마지막 인덱스 = 패리티
+                        if not self.is_streaming:
+                            break
+                        start_offset = chunk_idx * PAYLOAD_CHUNK_SIZE
+                        header = struct.pack(">IHH", frame_id, total_chunks, chunk_idx)
+                        payload = (parity_bytes if chunk_idx == data_chunks
+                                   else padded[start_offset:start_offset + PAYLOAD_CHUNK_SIZE])
+                        sock.sendto(header + payload, dest_addr)
+                        time.sleep(inter_chunk)  # [FIX #13/#14] 전체 패킷 균등 분산 + 프레임 간 여유
 
-                    is_portrait = cfg.rot_code in (0, 2)
-                    target_w, target_h = (240, 320) if is_portrait else (320, 240)
-                    frame_interval = 1.0 / cfg.target_fps
+                    frame_count += 1
 
-                    try:
-                        sct_img = sct.grab(monitor)
-                        img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                    now = time.time()
+                    if now - fps_start_time >= 0.8:
+                        dt = now - fps_start_time
+                        self.current_fps = frame_count / dt
+                        self.current_frame_kb = total_len / 1024.0
+                        self.current_kbps = (frame_count * total_len * 8) / (1024.0 * dt)
+                        frame_count = 0
+                        fps_start_time = now
 
-                        if cfg.aspect_mode == 0:
-                            img_final = ImageOps.pad(img, (target_w, target_h), method=Image.Resampling.BILINEAR, color=(0, 0, 0))
-                        elif cfg.aspect_mode == 1:
-                            img_final = img.resize((target_w, target_h), Image.Resampling.BILINEAR)
-                        elif cfg.aspect_mode == 2:
-                            img_final = ImageOps.fit(img, (target_w, target_h), method=Image.Resampling.BILINEAR, centering=(0.5, 0.5))
-                        else:
-                            img_final = img.resize((target_w, target_h), Image.Resampling.BILINEAR)
-
-                        buffer = io.BytesIO()
-                        img_final.save(buffer, format="JPEG", quality=cfg.jpeg_quality)
-                        jpeg_bytes = buffer.getvalue()
-                        total_len = len(jpeg_bytes)
-
-                        total_chunks = (total_len + PAYLOAD_CHUNK_SIZE - 1) // PAYLOAD_CHUNK_SIZE
-                        # [FIX #2] frame_id 마스크를 streamer.py와 통일 (0x7FFFFFFF)
-                        # 0xFFFFFFFF는 컨트롤 패킷 식별자로 예약되어 있으므로 명확히 구분
-                        frame_id = (frame_id + 1) & 0x7FFFFFFF
-
-                        for chunk_idx in range(total_chunks):
-                            if not self.is_streaming:
-                                break
-                            start_offset = chunk_idx * PAYLOAD_CHUNK_SIZE
-                            end_offset = min(start_offset + PAYLOAD_CHUNK_SIZE, total_len)
-                            chunk_payload = jpeg_bytes[start_offset:end_offset]
-
-                            header = struct.pack(">IHH", frame_id, total_chunks, chunk_idx)
-                            sock.sendto(header + chunk_payload, dest_addr)
-                            time.sleep(0.0001)  # 청크 간 미세 간격으로 패킷 폭주 방지
-
-                        frame_count += 1
-
-                        now = time.time()
-                        if now - fps_start_time >= 0.8:
-                            dt = now - fps_start_time
-                            self.current_fps = frame_count / dt
-                            self.current_frame_kb = total_len / 1024.0
-                            self.current_kbps = (frame_count * total_len * 8) / (1024.0 * dt)
-                            frame_count = 0
-                            fps_start_time = now
-
-                        elapsed = time.time() - loop_start
-                        sleep_time = frame_interval - elapsed
-                        if sleep_time > 0:
-                            time.sleep(sleep_time)
-
-                    except OSError as e:
-                        # [FIX #5] 소켓이 닫혔거나 네트워크 오류 → 루프 탈출
-                        loop_exit_reason = f"OSError: {e}"
-                        logging.warning("[WORKER:%d] 소켓/네트워크 오류로 루프 탈출: %s", my_thread_id, e)
-                        break
-                    except Exception as e:
-                        # [FIX #5] 프레임 처리 오류는 로그로 기록하고 다음 프레임 계속 시도
-                        logging.warning("[WORKER:%d] 프레임 처리 오류: %s", my_thread_id, e)
+                except OSError as e:
+                    # [FIX #5] 소켓이 닫혔거나 네트워크 오류 → 루프 탈출
+                    loop_exit_reason = f"OSError: {e}"
+                    logging.warning("[WORKER:%d] 소켓/네트워크 오류로 루프 탈출: %s", my_thread_id, e)
+                    break
+                except Exception as e:
+                    # 프레임 전송 오류는 로그로 기록하고 다음 프레임 계속 시도
+                    logging.warning("[WORKER:%d] 프레임 전송 오류: %s", my_thread_id, e)
 
         finally:
             # [FIX #1 강화] 자신이 만든 소켓만 정리하고, self.sock 참조도 자신 것일 때만 None으로 설정.
@@ -571,6 +602,139 @@ class CYDStreamerGUI:
                 )
             logging.debug("[WORKER:%d] 워커 종료.", my_thread_id)
 
+    def _capture_worker(self, monitor_idx: int) -> None:
+        """캡처 + 변환 + JPEG 인코딩 생산자 스레드.
+
+        Tkinter 위젯을 건드리지 않고 _config_lock으로 설정 스냅샷을 읽습니다.
+        인코딩된 JPEG를 _frame_queue에 넣고, 큐가 가득 차면 오래된 프레임을 버려 최신을 유지합니다.
+        """
+        my_thread_id = threading.current_thread().ident
+        logging.debug("[CAP:%d] 생산자 시작. 모니터=%d", my_thread_id, monitor_idx)
+        # 재시작 시 self._frame_queue가 교체돼도 이 스레드의 큐를 고정 (오염 방지)
+        my_queue = self._frame_queue
+
+        try:
+            with mss.mss() as sct:
+                if monitor_idx >= len(self.monitors_info):
+                    logging.warning("[CAP:%d] 모니터 인덱스 초과(%d), 0번으로 대체.", my_thread_id, monitor_idx)
+                    monitor_idx = 0
+                monitor = self.monitors_info[monitor_idx]
+                logging.debug("[CAP:%d] 캡처 영역: %dx%d", my_thread_id, monitor["width"], monitor["height"])
+
+                while self.is_streaming:
+                    loop_start = time.time()
+
+                    # [FIX #6] 스레드 안전하게 현재 설정 스냅샷 획득
+                    with self._config_lock:
+                        cfg = self._stream_config
+
+                    if cfg is None:
+                        time.sleep(0.01)
+                        continue
+
+                    is_portrait = cfg.rot_code in (0, 2)
+                    target_w, target_h = (240, 320) if is_portrait else (320, 240)
+                    # [FIX #12] 디바이스 렌더(rt≈54ms → ~18fps)를 넘는 전송은 커밋이 렌더 중
+                    # 차단돼 프레임이 폐기됨. 안전 상한(16fps)으로 전송률을 클램프.
+                    frame_interval = 1.0 / min(cfg.target_fps, DEVICE_RENDER_FPS_CAP)
+
+                    try:
+                        t0 = time.time()
+                        sct_img = sct.grab(monitor)
+                        img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                        t1 = time.time()
+
+                        # [FIX #10] 대형 소스(최대 3.7MP) 다운스케일은 BOX 리샘플 사용.
+                        # 소스 전체에 BILINEAR를 직접 걸면 세로 모니터(1296x2304) 기준 ~25ms → 호스트 15fps 벽.
+                        # BOX(C 타일 필터, 대형 축소 전용) + 목표 비율 선크롭으로 절반 이하로 단축.
+                        img_final = self._fast_resize_for_display(img, target_w, target_h, cfg.aspect_mode)
+                        t2 = time.time()
+
+                        buffer = io.BytesIO()
+                        img_final.save(buffer, format="JPEG", quality=cfg.jpeg_quality)
+                        jpeg_bytes = buffer.getvalue()
+                        t3 = time.time()
+
+                        # [Phase 1] 스테이지별 타이밍 계측
+                        self._accum_stage("grab", t1 - t0)
+                        self._accum_stage("convert", t2 - t1)
+                        self._accum_stage("encode", t3 - t2)
+                        self._ui_frames += 1
+
+                        # 큐가 가득 차면 오래된 프레임을 버리고 최신 유지 (지연 최소화)
+                        while my_queue.full():
+                            try:
+                                my_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        my_queue.put(jpeg_bytes)
+
+                    except OSError as e:
+                        # [FIX #5] 캡처 오류 → 루프 탈출
+                        logging.warning("[CAP:%d] 캡처/네트워크 오류로 루프 탈출: %s", my_thread_id, e)
+                        break
+                    except Exception as e:
+                        # [FIX #5] 프레임 처리 오류는 로그로 기록하고 다음 프레임 계속 시도
+                        logging.warning("[CAP:%d] 프레임 처리 오류: %s", my_thread_id, e)
+
+                    elapsed = time.time() - loop_start
+                    sleep_time = frame_interval - elapsed
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+
+        finally:
+            # 소비자가 queue.get()에서 영원히 대기하지 않도록 종료 시그널 전달
+            # (고정된 my_queue로만 시그널 → 재시작 후 새 큐를 오염시키지 않음)
+            try:
+                my_queue.put(None)
+            except Exception:
+                pass
+            logging.debug("[CAP:%d] 생산자 종료.", my_thread_id)
+
+    @staticmethod
+    def _fast_resize_for_display(img, tw: int, th: int, aspect_mode: int):
+        """대형 스크린샷 → 표시용(tw x th) 다운스케일. BILINEAR 대신 BOX 리샘플 사용.
+
+        소스 전체에 BILINEAR를 걸면 픽셀 2D 필터가 3.7MP 전체를 훑어 느림.
+        BOX(C 타일 박스 필터, 대형 축소 전용)로 한 번에 줄이고, 크롭 모드는
+        목표 비율로 먼저 자른 뒤 축소해 낭비 픽셀을 없앱니다.
+        aspect_mode: 0=letterbox(여백) · 1=stretch(비율 무시) · 2=crop(중앙 크롭)
+        """
+        iw, ih = img.size
+        if aspect_mode == 1:
+            return img.resize((tw, th), Image.Resampling.BOX)
+
+        if aspect_mode == 2:
+            # cover: 소스를 목표 비율(tw:th)로 중앙 크롭한 뒤 BOX 축소
+            tar = tw / th
+            if iw / ih > tar:
+                nw = int(ih * tar)
+                x0 = (iw - nw) // 2
+                img = img.crop((x0, 0, x0 + nw, ih))
+            else:
+                nh = int(iw / tar)
+                y0 = (ih - nh) // 2
+                img = img.crop((0, y0, iw, y0 + nh))
+            return img.resize((tw, th), Image.Resampling.BOX)
+
+        # contain(letterbox): 내용 크기(원본 비율 유지)로 BOX 축소 후 검은 여백만 pad
+        scale = min(tw / iw, th / ih)
+        cw = max(1, round(iw * scale))
+        ch = max(1, round(ih * scale))
+        small = img.resize((cw, ch), Image.Resampling.BOX)
+        return ImageOps.pad(small, (tw, th), method=Image.Resampling.BILINEAR, color=(0, 0, 0))
+
+    def _accum_stage(self, name: str, dt: float) -> None:
+        """[Phase 1] 스테이지별 소요 시간을 누적하고 2초마다 로그로 출력합니다."""
+        self._stage_times[name] = self._stage_times.get(name, 0.0) + dt
+        self._ui_stage[name] = self._ui_stage.get(name, 0.0) + dt
+        now = time.time()
+        if now - self._stage_last_log >= 2.0:
+            ms = {k: v * 1000 for k, v in self._stage_times.items()}
+            logging.info("[TIMING] 2s 누적 → %s", " | ".join(f"{k}={v:.0f}ms" for k, v in ms.items()))
+            self._stage_times.clear()
+            self._stage_last_log = now
+
     # ------------------------------------------------------------------
     # UI 갱신
     # ------------------------------------------------------------------
@@ -582,9 +746,17 @@ class CYDStreamerGUI:
         """
         try:
             if self.is_streaming:
+                # [FIX #10] 스테이지별 평균(프레임당 ms) 표시 — 병목(캡처 vs 리사이즈 vs 인코딩) 즉시 파악용
+                stage_str = ""
+                if self._ui_frames > 0:
+                    stage_str = " | " + " ".join(
+                        f"{k}={v * 1000 / self._ui_frames:.1f}ms" for k, v in sorted(self._ui_stage.items())
+                    )
                 self.stats_lbl.config(
-                    text=f"전송 FPS: {self.current_fps:.1f} | 프레임: {self.current_frame_kb:.1f} KB | 대역폭: {self.current_kbps:.0f} kbps"
+                    text=f"전송 FPS: {self.current_fps:.1f} | 프레임: {self.current_frame_kb:.1f} KB | 대역폭: {self.current_kbps:.0f} kbps{stage_str}"
                 )
+                self._ui_stage.clear()
+                self._ui_frames = 0
             self.root.after(500, self.update_stats_ui)
         except tk.TclError:
             pass  # 창이 이미 닫혔을 때 정상 종료

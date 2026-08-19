@@ -12,19 +12,111 @@
 #include <AsyncUDP.h>
 #include <Preferences.h>
 #include <esp_wifi.h>
-#define LGFX_AUTODETECT
 #include <LovyanGFX.hpp>
+#include <JPEGDEC.h>   // 고속 JPEG 디코더 (Larry Bank). Arduino 라이브러리 매니저에서 "JPEGDEC" 설치 필요.
 
 // ==========================================
 // 1. 객체 및 설정 정의
 // ==========================================
+// LGFX 커스텀 설정: 패널 SPI를 80MHz + DMA로 구동 (자동감지 기본 40MHz보다 2배).
+// 기본값은 ILI9341 (대부분의 CYD). ST7789 버전 보드면 아래 주석을 해제:
+#define CYD_PANEL_ST7789
+// 패널 종류는 시리얼 출력 "[Autodetect] Sunton_2432S028 (??? )"에서 확인할 수 있습니다.
+
+// 화면 SPI 클럭. 노이즈/색상 이상/글리치 발생 시 아래 값으로 낮춰 테스트하세요:
+//   80000000 (80MHz) → 60000000 (60MHz) → 40000000 (40MHz, 자동감지 기본)
+#define CYD_SPI_FREQ_WRITE 80000000
+class LGFX : public lgfx::LGFX_Device
+{
+  lgfx::Bus_SPI _bus_instance;
+#ifdef CYD_PANEL_ST7789
+  lgfx::Panel_ST7789 _panel_instance;
+#else
+  lgfx::Panel_ILI9341 _panel_instance;
+#endif
+  lgfx::Light_PWM _light_instance;
+  lgfx::Touch_XPT2046 _touch_instance;
+
+public:
+  LGFX(void)
+  {
+    { // 버스(패널 SPI): 80MHz + DMA
+      auto cfg = _bus_instance.config();
+      cfg.spi_host    = SPI2_HOST;          // VSPI_HOST
+      cfg.spi_mode    = 0;
+      cfg.freq_write  = CYD_SPI_FREQ_WRITE;  // (자동감지 기본 40MHz → 상향)
+      cfg.freq_read   = 16000000;
+      cfg.spi_3wire   = false;
+      cfg.use_lock    = true;
+      cfg.dma_channel = SPI_DMA_CH_AUTO;    // 하드웨어 DMA 활성화
+      cfg.pin_sclk    = 14;
+      cfg.pin_mosi    = 13;
+      cfg.pin_miso    = 12;
+      cfg.pin_dc      = 2;
+      _bus_instance.config(cfg);
+      _panel_instance.setBus(&_bus_instance);
+    }
+    { // 패널
+      // (설치된 LovyanGFX 버전은 Panel config에 freq_write가 없음 → 클럭은 버스 config에서만 설정)
+      auto cfg = _panel_instance.config();
+      cfg.pin_cs          = 15;
+      cfg.pin_rst         = -1;
+#ifdef CYD_PANEL_ST7789
+      cfg.offset_rotation = 0;              // ST7789: 패널 오프셋 0
+#else
+      cfg.offset_rotation = 2;              // ILI9341: CYD 오프셋 2
+#endif
+      cfg.invert          = false;
+      cfg.rgb_order       = false;
+      cfg.dlen_16bit      = false;
+      cfg.bus_shared      = false;
+      _panel_instance.config(cfg);
+    }
+    { // 백라이트 (GPIO21 PWM)
+      auto cfg = _light_instance.config();
+      cfg.pin_bl       = 21;
+      cfg.invert       = false;
+      cfg.freq         = 44100;
+      cfg.pwm_channel  = 7;
+      _light_instance.config(cfg);
+      _panel_instance.setLight(&_light_instance);
+    }
+    { // 터치 XPT2046: 소프트웨어 SPI (패널 SPI와 독립 → 클럭 상향 영향 없음)
+      auto cfg = _touch_instance.config();
+      cfg.x_min       =  300;
+      cfg.x_max       = 3900;
+      cfg.y_min       = 3700;
+      cfg.y_max       =  200;
+      cfg.pin_int     = -1;
+      cfg.bus_shared  = false;
+      cfg.spi_host    = -1;                 // -1 = 소프트웨어 SPI
+#ifdef CYD_PANEL_ST7789
+      cfg.offset_rotation = 2;
+#else
+      cfg.offset_rotation = 0;
+#endif
+      cfg.pin_sclk    = 25;
+      cfg.pin_mosi    = 32;
+      cfg.pin_miso    = 39;
+      cfg.pin_cs      = 33;
+      _touch_instance.config(cfg);
+      _panel_instance.setTouch(&_touch_instance);
+    }
+    setPanel(&_panel_instance);
+  }
+};
+
 static LGFX lcd;
+static JPEGDEC jpeg;   // 고속 JPEG 디코더 인스턴스 (Larry Bank JPEGDEC 라이브러리)
 AsyncUDP udp;
 Preferences prefs;
 
 const uint16_t UDP_PORT = 8888;
 
-#define MAX_JPEG_SIZE 35000
+// JPEG 버퍼 크기. 풀해상도 320x240(런타임 할당된 RX/render 2중 버퍼) 기준.
+// 원래 35000이었으나 JPEGDEC 라이브러리 정적 버퍼로 DRAM BSS 오버플로 발생 → 24576로 축소.
+// 품질85의 노이즈 많은 장면은 초과 시 프레임 버려질 수 있음(기본값 품질45엔 무관).
+#define MAX_JPEG_SIZE 24576
 #define PACKET_PAYLOAD_SIZE 1400
 
 static uint8_t rxBuffer[MAX_JPEG_SIZE];
@@ -32,6 +124,10 @@ static uint8_t renderBuffer[MAX_JPEG_SIZE];
 static size_t renderBufferSize = 0;
 volatile bool isRendering = false;
 volatile bool hasNewFrame = false;
+// [FIX#R2] 렌더 중 완성된 프레임을 버리지 않고 "대기"시켜, 렌더 종료 직후 곧바로 스테이징한다.
+// rxBuffer에는 완성된 프레임이 남아 있고, loop()가 이를 renderBuffer로 옮겨 바로 렌더한다.
+// 이러면 디바이스가 자기 속도(≈16.7fps)로 항상 최신 프레임을 그려 "수초 지연"이 사라진다.
+volatile bool pendingCommit = false;
 
 static uint16_t expectedChunks = 0;
 static uint16_t receivedChunks = 0;
@@ -50,6 +146,23 @@ bool streamActive = false;
 #define MAX_CHUNKS_BITMASK 32
 static uint32_t chunkReceivedMask = 0;
 static uint32_t chunkExpectedMask = 0;
+
+// ---- FEC(1-패리티) ----
+static bool fecEnabled = false;                   // 제어 패킷으로 정해지는 프로토콜 모드 (호스트가 통보)
+static uint8_t parityBuffer[PACKET_PAYLOAD_SIZE]; // 호스트가 마지막 청크로 보내는 XOR 패리티
+static bool fecHasParity = false;                 // 패리티 수신 여부
+static bool frameCommitted = false;               // 현재 프레임이 완성되어 커밋됐는지
+static uint16_t dataChunks = 0;                   // 데이터 청크 수 (FEC: expected-1, 레거시: expected)
+static size_t lastPayloadLen = 0;                 // 레거시 모드: 마지막 데이터 청크의 실제 길이
+
+// ---- 계측 (초당 1회 [STAT] 시리얼 출력) ----
+static uint32_t statRecvFrames = 0;   // 수신 완성(커밋) 프레임
+static uint32_t statRendFrames = 0;   // 실제 렌더 프레임
+static uint32_t statDropFrames = 0;   // 유실로 폐기된 프레임
+static uint32_t statReconstructs = 0; // FEC로 복원된 프레임
+static uint32_t statMissChunks = 0;   // [FIX#R3] 드롭된 프레임의 미수신 청크 수 집계 (miss=)
+static unsigned long renderTimeSum = 0;
+static uint16_t renderCount = 0;
 
 volatile unsigned long frameCount = 0;
 unsigned long lastFpsTime = 0;
@@ -80,6 +193,13 @@ void setup() {
   lcd.init();
   lcd.setRotation(currentRotation);
   lcd.setBrightness(200);
+
+  // [TEST] SPI 클럭 검증: fillScreen(320x240 전체 픽셀 푸시) 시간으로 클럭 효과 확인.
+  //   80MHz → 약 15ms, 40MHz → 약 30ms. (클럭 상향이 실제 적용되는지 판별)
+  unsigned long t0 = millis();
+  lcd.fillScreen(lcd.color565(40, 80, 200));
+  unsigned long fillMs = millis() - t0;
+  Serial.printf("[TEST] fillScreen 320x240 = %lums (클럭 효과 확인: 80MHz≈15ms, 40MHz≈30ms)\n", fillMs);
 
   prefs.begin("cyd_wifi", false);
   stored_ssid = prefs.getString("ssid", "");
@@ -385,9 +505,109 @@ void resetSessionState() {
   latestFrameId = 0;
   expectedChunks = 0;
   receivedChunks = 0;
+  dataChunks = 0;
   chunkReceivedMask = 0;
   chunkExpectedMask = 0;
+  fecHasParity = false;
+  frameCommitted = false;
+  pendingCommit = false;   // [FIX#R2] 대기 중인 프레임이 있으면 폐기 (세션 리셋)
+  lastPayloadLen = 0;
+  // fecEnabled는 리셋하지 않음: 제어 패킷이 프로토콜 모드를 관리 (타임아웃 후에도 유지)
   Serial.println("[UDP] 세션 상태 초기화 완료. latestFrameId 리셋.");
+}
+
+// JPEG의 실제 끝(EOI = 0xFFD9) 위치를 버퍼 끝에서 역방향 스캔으로 찾습니다.
+// 엔트로피 데이터 내부의 0xFF는 반드시 0x00으로 스터핑되므로, 마지막 0xFFD9가 진짜 EOI입니다.
+size_t findJpegEoi(const uint8_t* buf, size_t scanEnd) {
+  if (scanEnd < 2) return 0;
+  for (size_t i = scanEnd - 2; i > 0; i--) {
+    if (buf[i] == 0xFF && buf[i + 1] == 0xD9) return i + 2;
+  }
+  if (buf[0] == 0xFF && buf[1] == 0xD9) return 2;
+  return 0;
+}
+
+// [FIX#R2] rxBuffer의 완성 프레임을 renderBuffer로 옮기는 실제 스테이징.
+// EOI(0xFFD9)는 항상 마지막 블록에 있으므로(패딩은 마지막 블록에만 존재) 마지막 블록만 스캔합니다.
+// 성공 시 hasNewFrame=true → loop()가 바로 렌더. (렌더 중 호출 시에는 절대 실행 안 됨)
+bool stageCompletedFrame() {
+  size_t dataLen = (size_t)dataChunks * PACKET_PAYLOAD_SIZE; // ≤ MAX_JPEG_SIZE
+  if (dataLen > MAX_JPEG_SIZE) dataLen = MAX_JPEG_SIZE;
+
+  if (dataLen >= 4 && rxBuffer[0] == 0xFF && rxBuffer[1] == 0xD8) {
+    size_t scanStart = dataLen - PACKET_PAYLOAD_SIZE; // 마지막 블록 시작
+    size_t eoiLen = findJpegEoi(rxBuffer + scanStart, PACKET_PAYLOAD_SIZE);
+    size_t totalBytes = (eoiLen > 0) ? (scanStart + eoiLen) : dataLen; // EOI 미검출 → 전체 길이 폴백
+
+    memcpy(renderBuffer, rxBuffer, totalBytes);
+    renderBufferSize = totalBytes;
+    hasNewFrame = true;
+    frameCommitted = true;
+    statRecvFrames++;
+    return true;
+  }
+  Serial.printf("[UDP] JPEG 매직 바이트 불일치! 첫 2바이트: 0x%02X 0x%02X\n", rxBuffer[0], rxBuffer[1]);
+  return false;
+}
+
+// 완성된 프레임을 renderBuffer로 옮기고 렌더 큐에 넣습니다. (FEC 이후 호출)
+// [FIX#R1] 렌더(Core1) 중 renderBuffer를 덮어쓰면 JPEG 중간이 뒤섞여 화면이 크게 깨짐.
+// (콜백은 Core0에서 호출됨)
+// [FIX#R2] 렌더 중 완성된 프레임은 버리지 않고 pendingCommit만 세워 둔다. rxBuffer의
+// 데이터를 보존해 렌더가 끝나는 즉시 loop()가 스테이징 → 디바이스가 자기 속도로 항상
+// 최신 프레임을 그려 "버스트+프리즈" 지연이 사라진다.
+void commitFrame() {
+  if (isRendering) {
+    pendingCommit = true;
+    frameCommitted = true;  // 완성은 확정 (드롭 카운터 중복 방지)
+    return;
+  }
+  stageCompletedFrame();
+}
+
+// 레거시(패딩 없는) 호스트용 커밋: 마지막 청크의 실제 길이로 정확히 잘라냅니다.
+void commitLegacyFrame() {
+  if (isRendering) return;   // [FIX#R1] 렌더 중 덮어쓰기 방지 (위 commitFrame 주석 참조)
+  size_t totalBytes = ((size_t)(dataChunks - 1) * PACKET_PAYLOAD_SIZE) + lastPayloadLen;
+  if (totalBytes >= 4 && totalBytes <= MAX_JPEG_SIZE &&
+      rxBuffer[0] == 0xFF && rxBuffer[1] == 0xD8) {
+    memcpy(renderBuffer, rxBuffer, totalBytes);
+    renderBufferSize = totalBytes;
+    hasNewFrame = true;
+    frameCommitted = true;
+    statRecvFrames++;
+  } else {
+    Serial.printf("[UDP] 레거시 프레임 길이 오류: %u (chunks=%u, last=%u)\n",
+                  (unsigned)totalBytes, (unsigned)dataChunks, (unsigned)lastPayloadLen);
+  }
+}
+
+// 유실된 데이터 청크 1개를 패리티 XOR로 복원합니다.
+void reconstructMissingChunk(uint32_t missingMask) {
+  int missingIdx = 0;
+  while (!(missingMask & (1u << missingIdx))) missingIdx++;
+
+  if (missingIdx >= dataChunks) return;
+
+  size_t base = (size_t)missingIdx * PACKET_PAYLOAD_SIZE;
+  for (size_t j = 0; j < PACKET_PAYLOAD_SIZE; j++) {
+    uint8_t x = parityBuffer[j];
+    for (int i = 0; i < dataChunks; i++) {
+      if (i == missingIdx) continue;
+      x ^= rxBuffer[(size_t)i * PACKET_PAYLOAD_SIZE + j];
+    }
+    rxBuffer[base + j] = x;
+  }
+  statReconstructs++;
+  // [FIX#R3] FEC 프린트가 AsyncUDP 콜백을 막아 유실을 증폭하는 죽음의 나선 방지.
+  // Serial.printf는 115200보드에서 한 줄당 ~3.5ms씩 콜백(Core0 TCPIP)을 블록.
+  // FEC가 늘어날수록 블록→유실→FEC가 무한 증폭되어 "시간이 지나면 FPS 저하" 패턴을 만든다.
+  // 최초 5건만 출력하고 이후 집계는 [STAT] fec= 카운트로만 남긴다.
+  static uint8_t fecDbg = 0;
+  if (fecDbg < 5) {
+    Serial.printf("[FEC] 프레임 %u 청크 %d 복원 (패리티)\n", latestFrameId, missingIdx);
+    fecDbg++;
+  }
 }
 
 void onUdpPacketReceived(AsyncUDPPacket packet) {
@@ -412,18 +632,29 @@ void onUdpPacketReceived(AsyncUDPPacket packet) {
       }
     }
     showFpsOverlay = (data[5] != 0);
-    
-    // 새 스트리밍 세션 시작 신호: 세션 상태 리셋
-    Serial.println("[CTRL] 제어 패킷 수신 → 세션 상태 리셋 (재시작 대응)");
+    // 호스트가 FEC 프로토콜(패딩+패리티)을 쓰는지 통보 (data[6]).
+    // 레거시(패딩 없음) 호스트와 섞여도 마지막 청크를 데이터로 해석해 화면 보존.
+    fecEnabled = (data[6] != 0);
+    Serial.printf("[CTRL] 제어 패킷 수신 → 세션 리셋, FEC 모드=%s\n", fecEnabled ? "ON" : "OFF(레거시)");
     resetSessionState();
     lastPacketTime = millis();
     return;
   }
 
   // ---- 데이터 패킷 ----
+  // [FIX#R2] pendingCommit 동안 rxBuffer에는 "스테이징 대기 중인 완성 프레임"이 있다.
+  // 새 프레임이 rxBuffer를 덮어쓰면 대기 프레임이 파괴되므로, loop()가 스테이징할 때까지
+  // 데이터 패킷을 무시한다. (렌더 종료 후 loop()가 µs 안에 스테이징 → 손실은 수 프레임 한정)
+  if (pendingCommit) {
+    return;
+  }
+
+  // FEC 구성: totalChunks = 데이터 청크 N개 + 패리티 1개 (마지막 인덱스). 최소 2.
   uint16_t totalChunks = ((uint16_t)data[4] << 8) | (uint16_t)data[5];
   uint16_t chunkIdx    = ((uint16_t)data[6] << 8) | (uint16_t)data[7];
   size_t   payloadLen  = len - 8;
+
+  if (totalChunks < 2) return;
 
   isReceiving = true;
   lastPacketTime = millis();
@@ -449,11 +680,27 @@ void onUdpPacketReceived(AsyncUDPPacket packet) {
 
   // 새 프레임 시작
   if (frameId != latestFrameId) {
+    // 이전 프레임이 청크 유실로 완성되지 못했다면 드롭 카운트
+    if (receivedChunks > 0 && !frameCommitted) {
+      statDropFrames++;
+      // [FIX#R3] 진단: 폐기된 프레임에서 실제로 몇 청크가 유실됐는지 집계.
+      // 이 시점의 dataChunks/chunkExpectedMask/chunkReceivedMask는 "이전 프레임" 상태.
+      // miss=1이 대부분이면 1-패리티로 충분, miss≥2가 상당수면 2-패리티 FEC 필요.
+      if (dataChunks <= MAX_CHUNKS_BITMASK) {
+        statMissChunks += __builtin_popcount(chunkExpectedMask & ~chunkReceivedMask);
+      } else {
+        statMissChunks += 1; // 카운터 폴백 모드: 비트마스크 추적 불가 → 최소 1 유실로 가정
+      }
+    }
     latestFrameId = frameId;
     expectedChunks = totalChunks;
+    dataChunks     = fecEnabled ? (totalChunks - 1) : totalChunks;
     receivedChunks = 0;
+    lastPayloadLen = 0;
     // [FIX] 비트마스크 초기화 (최대 MAX_CHUNKS_BITMASK 청크까지 추적)
     chunkReceivedMask = 0;
+    fecHasParity      = false;
+    frameCommitted    = false;
     if (totalChunks <= MAX_CHUNKS_BITMASK) {
       chunkExpectedMask = (totalChunks == 32) ? 0xFFFFFFFF : ((1u << totalChunks) - 1);
     } else {
@@ -461,50 +708,147 @@ void onUdpPacketReceived(AsyncUDPPacket packet) {
     }
   }
 
-  // 청크 데이터 복사
-  size_t offset = (size_t)chunkIdx * PACKET_PAYLOAD_SIZE;
-  if (offset + payloadLen <= MAX_JPEG_SIZE) {
-    memcpy(rxBuffer + offset, data + 8, payloadLen);
-
-    // [FIX] 청크 수신 추적: bitmask 방식으로 중복 수신 오동작 방지
-    if (expectedChunks <= MAX_CHUNKS_BITMASK) {
-      // bitmask 방식: 이미 받은 청크는 비트가 세팅돼 있으므로 중복 카운트 없음
-      if (chunkIdx < MAX_CHUNKS_BITMASK && !(chunkReceivedMask & (1u << chunkIdx))) {
-        chunkReceivedMask |= (1u << chunkIdx);
-        receivedChunks++;
+  // ---- 청크 저장 (FEC: 마지막 인덱스=패리티 / 레거시: 전부 데이터) ----
+  if (chunkIdx < MAX_CHUNKS_BITMASK) {
+    if (fecEnabled) {
+      if (chunkIdx == totalChunks - 1) {
+        // FEC 패리티 청크
+        if (!(chunkReceivedMask & (1u << chunkIdx))) {
+          chunkReceivedMask |= (1u << chunkIdx);
+          receivedChunks++;
+        }
+        if (payloadLen <= PACKET_PAYLOAD_SIZE) {
+          memcpy(parityBuffer, data + 8, payloadLen);
+          fecHasParity = true;
+        }
+      } else {
+        // FEC 데이터 청크 (호스트가 1400B로 제로패딩)
+        size_t offset = (size_t)chunkIdx * PACKET_PAYLOAD_SIZE;
+        if (offset + payloadLen <= MAX_JPEG_SIZE) {
+          memcpy(rxBuffer + offset, data + 8, payloadLen);
+          // bitmask 방식: 이미 받은 청크는 중복 카운트 없음
+          if (!(chunkReceivedMask & (1u << chunkIdx))) {
+            chunkReceivedMask |= (1u << chunkIdx);
+            receivedChunks++;
+          }
+        }
       }
     } else {
-      // 청크 수 초과(32 이상): 기존 카운트 방식 폴백
-      receivedChunks++;
-    }
-
-    // 모든 청크 수신 완료 판정
-    bool allReceived = false;
-    if (expectedChunks <= MAX_CHUNKS_BITMASK) {
-      allReceived = (chunkReceivedMask == chunkExpectedMask);
-    } else {
-      allReceived = (receivedChunks == expectedChunks);
-    }
-
-    if (allReceived && expectedChunks > 0) {
-      if (!isRendering) {
-        size_t totalBytes = ((expectedChunks - 1) * PACKET_PAYLOAD_SIZE) + payloadLen;
-        if (totalBytes >= 4 && rxBuffer[0] == 0xFF && rxBuffer[1] == 0xD8) {
-          memcpy(renderBuffer, rxBuffer, totalBytes);
-          renderBufferSize = totalBytes;
-          hasNewFrame = true;
-        } else {
-          Serial.printf("[UDP] JPEG 매직 바이트 불일치! 첫 2바이트: 0x%02X 0x%02X\n", rxBuffer[0], rxBuffer[1]);
+      // 레거시: 모든 청크가 데이터 (마지막 청크는 가변 길이)
+      size_t offset = (size_t)chunkIdx * PACKET_PAYLOAD_SIZE;
+      if (offset + payloadLen <= MAX_JPEG_SIZE) {
+        memcpy(rxBuffer + offset, data + 8, payloadLen);
+        if (!(chunkReceivedMask & (1u << chunkIdx))) {
+          chunkReceivedMask |= (1u << chunkIdx);
+          receivedChunks++;
         }
+      }
+      if (chunkIdx == totalChunks - 1) {
+        lastPayloadLen = payloadLen;   // 정확한 JPEG 길이 산출용
+      }
+    }
+  } else {
+    // 32개 이상 청크 (bitmask 범위 초과) → 카운트 방식 폴백 (유효 프레임에서 미사용)
+    if (fecEnabled && chunkIdx == totalChunks - 1) {
+      if (payloadLen <= PACKET_PAYLOAD_SIZE) {
+        memcpy(parityBuffer, data + 8, payloadLen);
+        fecHasParity = true;
+      }
+      receivedChunks++;
+    } else {
+      size_t offset = (size_t)chunkIdx * PACKET_PAYLOAD_SIZE;
+      if (offset + payloadLen <= MAX_JPEG_SIZE) {
+        memcpy(rxBuffer + offset, data + 8, payloadLen);
+        receivedChunks++;
+      }
+      if (!fecEnabled && chunkIdx == totalChunks - 1) {
+        lastPayloadLen = payloadLen;
+      }
+    }
+  }
+
+  // ---- 프레임 완성 판정 (FEC 복원 포함) ----
+  if (expectedChunks <= MAX_CHUNKS_BITMASK && dataChunks > 0 && !frameCommitted) {
+    uint32_t dataMask = (dataChunks >= 32) ? 0xFFFFFFFFu : ((1u << dataChunks) - 1);
+    uint32_t dataMissing = dataMask & ~chunkReceivedMask;
+
+    if (dataMissing == 0) {
+      // 모든 데이터 청크 수신 완료 → 즉시 커밋
+      if (fecEnabled) {
+        commitFrame();            // FEC: 패딩 포함 → EOI 스캔으로 실제 길이 확정
+      } else {
+        commitLegacyFrame();      // 레거시: (N-1)*1400 + lastPayloadLen 정확 길이
+      }
+    } else if (fecEnabled && fecHasParity && (dataMissing & (dataMissing - 1)) == 0) {
+      // FEC 데이터 1개 유실 + 패리티 보유 → XOR 복원 후 커밋
+      reconstructMissingChunk(dataMissing);
+      commitFrame();
+    }
+    // 그 외 (유실 2개+ 또는 패리티 부족) → 다음 청크/프레임 대기
+  } else if (expectedChunks > MAX_CHUNKS_BITMASK && !frameCommitted) {
+    // 청크 수 초과: FEC 없이 총 청크 수 기준 (안전망 전용)
+    bool allReceived = (receivedChunks == expectedChunks);
+    if (allReceived && expectedChunks > 0 && !isRendering) {   // [FIX#R1] 렌더 중 덮어쓰기 방지
+      size_t totalBytes = ((expectedChunks - 1) * PACKET_PAYLOAD_SIZE) + payloadLen;
+      if (totalBytes >= 4 && rxBuffer[0] == 0xFF && rxBuffer[1] == 0xD8) {
+        memcpy(renderBuffer, rxBuffer, totalBytes);
+        renderBufferSize = totalBytes;
+        hasNewFrame = true;
+        frameCommitted = true;
       }
     }
   }
 }
 
 // ==========================================
+// 5.5 JPEG 고속 디코드 (JPEGDEC) — 디코드 병목 제거
+// ==========================================
+// [계측] 렌더 내 "픽셀 푸시" 시간(µs) 누적. [STAT]의 rt에서 이 값을 빼면
+// 실제 JPEG 디코드 시간이 나옴 → 다음 병목(디코드 vs 푸시) 판별용.
+static unsigned long pushTimeSum = 0;
+
+// jpegDbg: 처음 몇 프레임만 진단 출력 (통과 후엔 조용)
+static int jpegDbg = 0;
+
+// JPEGDEC 디코드 콜백: 디코드된 RGB565 블록을 LCD에 푸시.
+// JPEGDEC 디코드는 동기식이라 이 콜백은 loop() 스레드에서 실행됨 → 렌더 경합 없음.
+int jpegDrawCallback(JPEGDRAW* pDraw) {
+  unsigned long t0 = micros();
+  lcd.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
+  pushTimeSum += (micros() - t0);
+  return 1;
+}
+
+// renderBuffer의 JPEG을 JPEGDEC로 고속 디코드 후 화면에 그립니다.
+// (호스트는 항상 풀해상도 320x240/240x320을 보냄 — 반해상도 모드 제거됨)
+void renderJpegFast() {
+  // v1.8.4의 openRAM()은 성공 시 1을 반환. JPEG_SUCCESS 상수와 값이 달라
+  // 상수 비교가 아니라 "양수면 성공"으로 판정 (rc<=0 = 실패).
+  int rc = jpeg.openRAM(renderBuffer, (int)renderBufferSize, jpegDrawCallback);
+  if (rc <= 0) {
+    if (jpegDbg < 3) {
+      Serial.printf("[JPEG] openRAM 실패 rc=%d size=%u\n", rc, (unsigned)renderBufferSize);
+      jpegDbg++;
+    }
+    return;
+  }
+  jpeg.setPixelType(RGB565_BIG_ENDIAN);
+  jpeg.decode(0, 0, 0);
+  jpeg.close();
+}
+
+// ==========================================
 // 6. Loop 함수
 // ==========================================
 void loop() {
+  // [FIX#R2] 렌더 직후 대기 중이던 완성 프레임을 스테이징 → 다음 루프에서 즉시 렌더.
+  // 렌더 중 완성돼 드롭되던 프레임을 놓치지 않고, 디바이스가 항상 최신 프레임을 그린다.
+  if (pendingCommit) {
+    // memcpy가 끝날 때까지 pendingCommit을 유지해야 콜백(Core0)이 rxBuffer를 못 덮어씀
+    stageCompletedFrame();
+    pendingCommit = false;
+  }
+
   if (hasNewFrame) {
     isRendering = true;
     hasNewFrame = false;
@@ -512,7 +856,11 @@ void loop() {
     int w = lcd.width();
     int h = lcd.height();
 
-    lcd.drawJpg(renderBuffer, renderBufferSize, 0, 0, w, h);
+    unsigned long rt0 = millis();
+    renderJpegFast();  // JPEGDEC 고속 디코드. 내장 drawJpg 디코더(~60ms 병목) 대체.
+    renderTimeSum += (millis() - rt0);
+    renderCount++;
+    statRendFrames++;
 
     if (showFpsOverlay && currentFps > 0) {
       char fpsStr[16];
@@ -550,6 +898,28 @@ void loop() {
       frameCount = 0;
       lastFpsTime = now;
     }
+  }
+
+  // ---- [STAT] 초당 1회 계측 출력 ----
+  // recv=수신 완성 프레임, rend=렌더 프레임, drop=유실 폐기, fec=FEC 복원,
+  // rt=렌더 평균 소요 ms, push=프레임당 픽셀 푸시 평균 ms (rt-push≈디코드 시간)
+  static unsigned long lastStatTime = 0;
+  unsigned long statNow = millis();
+  if (statNow - lastStatTime >= 1000) {
+    float rtAvg = (renderCount > 0) ? (float)renderTimeSum / (float)renderCount : 0.0f;
+    float pushAvg = (renderCount > 0) ? (float)pushTimeSum / 1000.0f / (float)renderCount : 0.0f;
+    Serial.printf("[STAT] recv=%u rend=%u drop=%u fec=%u miss=%u rt=%.1fms push=%.1fms rend_fps=%.1f\n",
+                  statRecvFrames, statRendFrames, statDropFrames, statReconstructs, statMissChunks,
+                  rtAvg, pushAvg, currentFps);
+    renderTimeSum = 0;
+    renderCount = 0;
+    pushTimeSum = 0;
+    statRecvFrames = 0;
+    statRendFrames = 0;
+    statDropFrames = 0;
+    statReconstructs = 0;
+    statMissChunks = 0;
+    lastStatTime = statNow;
   }
 
   static unsigned long touchStart = 0;
