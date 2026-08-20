@@ -40,6 +40,7 @@
 #include <esp_wifi.h>
 #include <WiFiUdp.h>
 #include <vector>
+#include <math.h>      // [PLAN 7] roundButtonCorners() 코너 비트 반폭 계산용 sqrtf
 #include <LovyanGFX.hpp>
 #include <JPEGDEC.h>   // [G] 버튼 이름 이미지(JPEG) 디코더. Arduino 라이브러리 매니저 "JPEGDEC" 필요.
 #include <LittleFS.h>  // [H] 전체 설정/이미지 내장 저장 (Huge APP 파티션의 1MB SPIFFS 파티션을 마운트)
@@ -187,13 +188,17 @@ static LGFX lcd;
 #define BTN_H           61
 #define BTN_GAP_X       8
 #define BTN_GAP_Y       8
+// [PLAN 7] 버튼 모서리 라운드 반경. radius 6은 작아서 Chamfer처럼 보이고, 이미지 버튼은
+//     호스트가 JPEG에 구운 라운드(radius 6)가 4:2:0 손실 압축 후 거의 사라져 각지게 보였다.
+//     10이면 압축 후에도/텍스트 버튼 모두 확실한 라운드가 보인다. 호스트 BTN_RADIUS와 일치.
+#define BTN_RADIUS      10
 #define PREV_X          4
 #define PREV_Y          214
-#define PREV_W          60
+#define PREV_W          96              // [PLAN 6] 페이지 전환 버튼 좌우 확대 (누르기 쉽게)
 #define PREV_H          22
-#define NEXT_X          256
+#define NEXT_X          220
 #define NEXT_Y          214
-#define NEXT_W          60
+#define NEXT_W          96
 #define NEXT_H          22
 
 #define LONG_PRESS_MS   2500             // 상태바 길게 → Wi-Fi 재설정
@@ -215,7 +220,7 @@ struct BtnColor {
   bool    textWhite;
 };
 static const BtnColor BTN_PALETTE[BTN_COLOR_COUNT] = {
-  {100, 116, 139, true },   //  0 slate  #64748B
+  {100, 116, 139, true },   //  0 gray   #64748B
   {239,  68,  68, true },   //  1 red    #EF4444
   {249, 115,  22, true },   //  2 orange #F97316
   {234, 179,   8, true },   //  3 yellow #EAB308
@@ -239,7 +244,7 @@ String stored_pass = "";
 
 // 버튼 라벨/색 저장소 (호스트가 설정 패킷으로 채움)
 char labels[MAX_PAGES][BUTTONS_PER_PAGE][LABEL_MAX + 1] = {};
-uint8_t btnColors[MAX_PAGES][BUTTONS_PER_PAGE] = {};   // 0..BTN_COLOR_COUNT-1 (기본 0=slate)
+uint8_t btnColors[MAX_PAGES][BUTTONS_PER_PAGE] = {};   // 0..BTN_COLOR_COUNT-1 (기본 0=gray)
 uint8_t numPages = DEFAULT_PAGES;   // 현재 페이지 수 (설정 패킷 헤더로 갱신)
 volatile bool labelsDirty = false;   // AsyncUDP 콜백에서 세우고 loop()에서 소비
 uint8_t currentPage = 0;
@@ -288,7 +293,6 @@ volatile bool imagesDirty = false;                    // 이미지 도착 → lo
 volatile unsigned long lastImageTime = 0;             // 마지막 이미지 도착 시각 (debounce 기준)
 static uint32_t statImgRecv = 0;                      // [STAT] 수신 이미지 패킷 수
 static uint32_t statImgNew = 0;                       // [STAT] 실제 저장(변경)된 이미지 수
-static uint32_t statImgDrop = 0;                      // [STAT] 예산 초과로 거부된 이미지 수
 
 // [G] 이미지 패킷을 loop()로 넘기는 pending 큐. AsyncUDP 콜백(loop()와 다른 코어)은
 //     원본 JPEG를 임시 버퍼에 복사해 여기 넣기만 하고, imgJpeg/imgSize/imgHeapUsed 변경과
@@ -1097,16 +1101,14 @@ void freePageImages(uint8_t page) {
   }
 }
 
-// 현재 저장된 이미지 수 (nullptr 아닌 슬롯) — [STAT] 표시용
+// 현재 저장된 이미지 수 (nullptr 아닌 슬롯) — 예약 (필요 시 재사용)
 uint16_t countImages() {
   uint16_t n = 0;
   for (uint8_t p = 0; p < MAX_PAGES; p++)
     for (uint8_t b = 0; b < BUTTONS_PER_PAGE; b++)
       if (imgJpeg[p][b]) n++;
   return n;
-}
-
-// [H] 전체 설정(RAM) → LittleFS /config.bin (A.4 포맷). 내용이 실제로 바뀌었을 때만
+}// [H] 전체 설정(RAM) → LittleFS /config.bin (A.4 포맷). 내용이 실제로 바뀌었을 때만
 //     loop()가 호출(디바운스) — 웨어 방지. 최악 ~15KB를 힙 임시 버퍼에 조립 후 1회 쓰기.
 void saveConfigToFlash() {
   if (!fsMounted) return;
@@ -1393,8 +1395,8 @@ void drawButtonText(uint8_t page, uint8_t idx, int x, int y, bool pressed) {
     fill = lcd.color565(c.r, c.g, c.b);
   }
   uint16_t border = pressed ? TFT_WHITE : lcd.color565(100, 116, 139);
-  lcd.fillRoundRect(x, y, BTN_W, BTN_H, 6, fill);
-  lcd.drawRoundRect(x, y, BTN_W, BTN_H, 6, border);
+  lcd.fillRoundRect(x, y, BTN_W, BTN_H, BTN_RADIUS, fill);
+  lcd.drawRoundRect(x, y, BTN_W, BTN_H, BTN_RADIUS, border);
 
   lcd.setTextColor(c.textWhite ? TFT_WHITE : TFT_BLACK);
   lcd.setTextSize(1);
@@ -1426,6 +1428,30 @@ int jpegBtnCallback(JPEGDRAW* pDraw) {
   return 1;
 }
 
+// [PLAN 7] 이미지 버튼의 코너를 그리드 배경색으로 잘라 둥글게 만든다.
+//     JPEG 4:2:0 손실 압축은 호스트가 구운 라운드 코너를 3~5px 번지게 해 각진 버튼으로
+//     보이게 하므로, 호스트 쪽 라운딩만으로는 부족하다. 여기서 디바이스가 원
+//     (반경 BTN_RADIUS, 중심 = 코너 + BTN_RADIUS) 바깥의 모서리 비트를 행 단위 fillRect로
+//     정확히 덮어 크리스프한 라운드를 만든다. 호스트 rounded_rectangle(BTN_RADIUS)과
+//     동일한 기하이므로 두 쪽이 겹쳐도 어긋나지 않는다.
+void roundButtonCorners(int x, int y) {
+  const uint16_t bg = lcd.color565(15, 23, 42);  // 그리드 배경색 (호스트 GRID_BG_HEX와 일치)
+  const int R = BTN_RADIUS;
+  // 코너 정사각형(각 변 R)에서 디스크 밖의 비트 부분. 행 v(모서리→중심, 0-based)마다
+  // 디스크 반폭 half = sqrt(R²-(R-v)²)이므로 그 행의 비트 폭 w = R - half. 좌/우/상/하 대칭.
+  for (int v = 0; v < R; v++) {
+    int half = (int)sqrtf((float)(R * R - (R - v) * (R - v)));
+    int w = R - half;
+    if (w <= 0) continue;
+    int rCol = x + BTN_W - w;           // 우측 대칭 열 (오른쪽에서 w열)
+    int bRow = y + BTN_H - 1 - v;       // 하단 대칭 행 (아래에서 v번째)
+    lcd.fillRect(x,    y + v, w, 1, bg);  // TL
+    lcd.fillRect(rCol, y + v, w, 1, bg);  // TR
+    lcd.fillRect(x,    bRow,  w, 1, bg);  // BL
+    lcd.fillRect(rCol, bRow,  w, 1, bg);  // BR
+  }
+}
+
 // [G] 버튼 JPEG를 디코드해 버튼 위치에 그린다. 디코드 실패 시 텍스트 폴백.
 //     decode(x, y, 0)로 버튼 원점을 지정 → 콜백의 pDraw->x/y는 절대 화면 좌표.
 void drawButtonImage(uint8_t page, uint8_t idx, int x, int y, bool pressed) {
@@ -1454,10 +1480,14 @@ void drawButtonImage(uint8_t page, uint8_t idx, int x, int y, bool pressed) {
   lcd.clearClipRect();
   jpeg.close();
 
+  // [PLAN 7] JPEG가 번진 코너를 배경색 비트로 덮어 크리스프한 라운드 복원.
+  //     눌림 어둡게 처리(jpegBtnCallback의 픽셀 곱셈) 후에 그려야 코너가 항상 배경색.
+  roundButtonCorners(x, y);
+
   if (pressed) {
     // 눌림: 밝은 테두리 2px 오버레이 (텍스트 버튼 pressed 시각과 일치)
-    lcd.drawRoundRect(x + 1, y + 1, BTN_W - 2, BTN_H - 2, 6, TFT_WHITE);
-    lcd.drawRoundRect(x + 2, y + 2, BTN_W - 4, BTN_H - 4, 6, TFT_WHITE);
+    lcd.drawRoundRect(x + 1, y + 1, BTN_W - 2, BTN_H - 2, BTN_RADIUS, TFT_WHITE);
+    lcd.drawRoundRect(x + 2, y + 2, BTN_W - 4, BTN_H - 4, BTN_RADIUS, TFT_WHITE);
   }
 }
 
@@ -1470,14 +1500,14 @@ void drawButtonFlash(uint8_t page, uint8_t idx, uint16_t fill) {
   // [G] 이미지 버튼: 이미지는 유지하고 피드백 색 테두리를 3px 오버레이 (성공/실패 신호)
   if (imgJpeg[page][idx] && imgSize[page][idx] > 0) {
     drawButtonImage(page, idx, x, y, false);
-    lcd.drawRoundRect(x + 1, y + 1, BTN_W - 2, BTN_H - 2, 6, fill);
-    lcd.drawRoundRect(x + 2, y + 2, BTN_W - 4, BTN_H - 4, 6, fill);
-    lcd.drawRoundRect(x + 3, y + 3, BTN_W - 6, BTN_H - 6, 6, fill);
+    lcd.drawRoundRect(x + 1, y + 1, BTN_W - 2, BTN_H - 2, BTN_RADIUS, fill);
+    lcd.drawRoundRect(x + 2, y + 2, BTN_W - 4, BTN_H - 4, BTN_RADIUS, fill);
+    lcd.drawRoundRect(x + 3, y + 3, BTN_W - 6, BTN_H - 6, BTN_RADIUS, fill);
     return;
   }
 
-  lcd.fillRoundRect(x, y, BTN_W, BTN_H, 6, fill);
-  lcd.drawRoundRect(x, y, BTN_W, BTN_H, 6, TFT_WHITE);
+  lcd.fillRoundRect(x, y, BTN_W, BTN_H, BTN_RADIUS, fill);
+  lcd.drawRoundRect(x, y, BTN_W, BTN_H, BTN_RADIUS, TFT_WHITE);
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextSize(1);
   lcd.setTextDatum(MC_DATUM);
@@ -1529,17 +1559,16 @@ void drawStatusBar() {
                     currentPage < numPages - 1 ? lcd.color565(37, 99, 235) : lcd.color565(71, 85, 105));
   lcd.drawString(">", NEXT_X + NEXT_W / 2, NEXT_Y + NEXT_H / 2);
 
-  // 중앙: 페이지 이름 + x/y + IP (A — 이름은 기본 폰트로 렌더 가능한 ASCII만)
-  String ipStr = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "NO WIFI";
-  char buf[48];
+  // 중앙: 페이지 이름 + x/y만 (IP 미표시 — [PLAN 6] 전환 버튼 확대로 중앙 폭이 좁아짐)
+  char buf[40];
   const char* pname = pageNames[currentPage];
   if (pname[0] != '\0') {
-    char nameBuf[15];                        // 상태바 폭 대비 14자 + null 여유
-    strncpy(nameBuf, pname, 14);
-    nameBuf[14] = '\0';
-    snprintf(buf, sizeof(buf), "%s  %d/%d  %s", nameBuf, currentPage + 1, numPages, ipStr.c_str());
+    char nameBuf[9];                         // 중앙 폭 대비 8자 + null 여유
+    strncpy(nameBuf, pname, 8);
+    nameBuf[8] = '\0';
+    snprintf(buf, sizeof(buf), "%s  %d/%d", nameBuf, currentPage + 1, numPages);
   } else {
-    snprintf(buf, sizeof(buf), "PAGE %d/%d  %s", currentPage + 1, numPages, ipStr.c_str());
+    snprintf(buf, sizeof(buf), "PAGE %d/%d", currentPage + 1, numPages);
   }
   lcd.setTextColor(lcd.color565(148, 163, 184));
   lcd.drawString(buf, 160, STATUS_TOP + 14);
@@ -1717,7 +1746,12 @@ void loop() {
 
   // [G] 페이지 수 감소로 범위 밖이 된 페이지의 이미지 해제 + [H] 플래시 파일 정리
   if (numPages < lastTrimmedPages) {
-    for (uint8_t p = numPages; p < lastTrimmedPages; p++) {
+    // [FIX] 부팅 첫 루프: lastTrimmedPages 초기값 0xFF(센티널)로 p가 imgJpeg[MAX_PAGES] 배열
+    //     밖(8..254)까지 나가면 OOB 읽기로 쓰레기 포인터를 free → heap_caps_free 어설션 →
+    //     무한 리셋. 상한을 MAX_PAGES로 클램프해 배열 범위 안에서만 정리한다.
+    uint8_t trimHi = lastTrimmedPages;
+    if (trimHi > MAX_PAGES) trimHi = MAX_PAGES;
+    for (uint8_t p = numPages; p < trimHi; p++) {
       freePageImages(p);                        // [H] RAM 해제 (잘린 페이지는 현재 페이지가 아님 — 방어적)
       if (fsMounted) {
         for (uint8_t b = 0; b < BUTTONS_PER_PAGE; b++) {
@@ -1784,23 +1818,6 @@ void loop() {
   if (now - lastBeaconTime >= BEACON_INTERVAL_MS) {
     sendBeacon();
     lastBeaconTime = now;
-  }
-
-  // [STAT] 초당 1회 계측
-  static unsigned long lastStatTime = 0;
-  if (now - lastStatTime >= 1000) {
-    String hip = hostKnown ? hostIP.toString() : String("-");
-    Serial.printf("[STAT] page=%u pages=%u host=%s:%u evt=%u cfg=%u img=%u+%u/%u(drop=%u) kb=%u bcn=%u heap=%lukB wifi=%d\n",
-                  currentPage, numPages, hip.c_str(), hostPort,
-                  statEvents, statConfigs, statImgRecv, statImgNew, countImages(), statImgDrop, (unsigned)(imgHeapUsed / 1024), statBeacons,
-                  (unsigned long)(ESP.getFreeHeap() / 1024), WiFi.status());
-    statEvents = 0;
-    statConfigs = 0;
-    statImgRecv = 0;
-    statImgNew = 0;
-    statImgDrop = 0;
-    statBeacons = 0;
-    lastStatTime = now;
   }
 
   if (WiFi.status() != WL_CONNECTED) {

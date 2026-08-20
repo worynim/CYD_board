@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import queue
+import re
 import socket
 import struct
 import subprocess
@@ -65,7 +66,8 @@ LABEL_MAX = 24               # 라벨 최대 바이트 (UTF-8)
 PAGE_NAME_MAX = 20           # 페이지 이름 최대 바이트 (UTF-8) — 펌웨어와 일치 (A)
 
 # 버튼 색상 팔레트 (인덱스 → 펌웨어 BTN_PALETTE와 정확히 일치해야 함)
-COLOR_NAMES = ["slate", "red", "orange", "yellow", "green",
+# 색상은 index로 전송되므로 표시 이름만 바꿔도 펌웨어/저장 설정과 호환된다.
+COLOR_NAMES = ["gray", "red", "orange", "yellow", "green",
                "teal", "blue", "purple", "pink", "white"]
 COLOR_HEX = ["#64748B", "#EF4444", "#F97316", "#EAB308", "#22C55E",
              "#14B8A6", "#3B82F6", "#A855F7", "#EC4899", "#F8FAFC"]
@@ -79,13 +81,20 @@ IMAGE_HEADER = struct.Struct(">IBBBB")     # magic, page, button, format, rsvd
 MAGIC_IMAGE = 0x4D494D47      # "MIMG" 호스트→디바이스 버튼 이름 이미지 (G)
 BTN_IMG_W = 71                # 펌웨어 BTN_W와 일치
 BTN_IMG_H = 61                # 펌웨어 BTN_H와 일치
-JPEG_QUALITY = 85             # 기본 품질 (작은 텍스트 아티팩트 번짐 보정 — PLAN q85~90)
+JPEG_QUALITY = 90             # 기본 품질 — 4:4:4(subsampling=0)와 조합해 크로마 얼룩 제거
 JPEG_MIN_QUALITY = 45         # 1400B 초과 시 낮출 최저 품질
 JPEG_MAX_BYTES = 1400         # 이미지 페이로드 상한 (헤더 8B + 1400B = 1408 < UDP MTU 1472)
 GRID_BG_HEX = "#0F172A"       # 버튼 주변 그리드 배경색 (이미지 모서리와 동일 → 이음새 제거)
 BTN_BORDER_HEX = "#64748B"    # 비활성 버튼 테두리 (슬레이트 — 펌웨어 색상과 일치)
+# [PLAN 7] 버튼 모서리 라운드 반경. radius 6은 JPEG 4:2:0 손실 압축 후 코너가 거의
+#     채움색으로 번져 디바이스에서 각진 버튼으로 보인다(그리고 텍스트 버튼도 Chamfer처럼
+#     보임). 10은 압축 후에도 확실한 라운드가 남는다. 펌웨어 BTN_RADIUS와 일치해야 한다.
+BTN_RADIUS = 10
 
 ACTION_TYPES = ["shortcut", "text", "app"]
+# 드롭다운 표시 라벨 ↔ 내부 값(canonical, 와이어 프로토콜 그대로). "app"은 "app / URL"로 표시.
+ATYPE_LABELS = {"shortcut": "shortcut", "text": "text", "app": "app / URL"}
+ATYPE_FROM_LABEL = {v: k for k, v in ATYPE_LABELS.items()}
 
 # [H] 프로토콜 v3: 액션/덤프/ACK (펌웨어와 정확히 일치해야 함)
 MAGIC_REQUEST = 0x4D524551    # "MREQ" 설정 덤프 요청 (호스트→디바이스)
@@ -146,6 +155,71 @@ def _trunc_utf8(text: str, max_bytes: int) -> bytes:
         end += w
         i += w
     return b[:end]
+
+
+def _shade_hex(color: str, amount: int) -> str:
+    """hex 색을 amount만큼 밝게(+)/어둡게(-) 한 hex 반환. 버튼 active/눌림 상태용."""
+    c = color.lstrip("#")
+    if len(c) != 6:
+        return color
+    r = max(0, min(255, int(c[0:2], 16) + amount))
+    g = max(0, min(255, int(c[2:4], 16) + amount))
+    b = max(0, min(255, int(c[4:6], 16) + amount))
+    return "#%02X%02X%02X" % (r, g, b)
+
+
+# ttk.Entry에는 네이티브 placeholder가 없다 → 포커스 기반으로 직접 구현.
+# 상태는 entry._ph_text(플레이스홀더 문자열) / entry._ph_active(현재 표시 중인지)에 저장.
+_PH_COLOR = "#64748b"        # 플레이스홀더 회색
+
+
+def _setup_entry_placeholder(entry: ttk.Entry, ph: str) -> None:
+    """빈 Entry에 회색 힌트(예: "이름", "액션")를 보여준다.
+
+    포커스 진입 시 힌트 제거, 포커스 이탈 후 비어 있으면 다시 복원.
+    값 채움/읽기는 반드시 _set_entry_value()/_entry_text()를 거쳐야 한다 —
+    .get()을 직접 부르면 플레이스홀더 문자열이 실제 값으로 잡힌다.
+    """
+    entry._ph_text = ph
+    entry._ph_active = False
+    entry._ph_normal = entry.cget("foreground")   # 진짜 텍스트 색 보존
+
+    def _focus_in(_e):
+        if getattr(entry, "_ph_active", False):
+            entry.delete(0, tk.END)
+            entry.config(foreground=entry._ph_normal)
+            entry._ph_active = False
+
+    def _focus_out(_e):
+        if not entry.get():
+            entry.delete(0, tk.END)
+            entry.insert(0, ph)
+            entry.config(foreground=_PH_COLOR)
+            entry._ph_active = True
+
+    entry.bind("<FocusIn>", _focus_in)
+    entry.bind("<FocusOut>", _focus_out)
+    _set_entry_value(entry, "")                    # 초기: 비어 있으면 힌트 표시
+
+
+def _set_entry_value(entry: ttk.Entry, value: str) -> None:
+    """플레이스홀더를 반영해 Entry 값을 설정한다 (빈 값 → 힌트 표시)."""
+    entry.delete(0, tk.END)
+    if value:
+        entry.insert(0, value)
+        entry.config(foreground=entry._ph_normal)
+        entry._ph_active = False
+    else:
+        entry.insert(0, entry._ph_text)
+        entry.config(foreground=_PH_COLOR)
+        entry._ph_active = True
+
+
+def _entry_text(entry: ttk.Entry) -> str:
+    """플레이스홀더가 표시 중이면 ""(실제 값 없음)을, 아니면 입력값을 반환."""
+    if getattr(entry, "_ph_active", False):
+        return ""
+    return entry.get()
 
 
 def _build_config_chunk(page_idx: int, items, num_pages: int, page_name: str = "") -> bytes:
@@ -290,6 +364,164 @@ def _load_label_font(size: int):
     return font
 
 
+# ------------------------------------------------------------------
+# [PLAN 8] 이모지 라벨 렌더: 텍스트/이모지 런 분리 + Apple Color Emoji(32px 스트라이크)
+#     이모지는 기본 한글 폰트에 글리프가 없어 박스로 나온다. 라벨을 이모지 런과
+#     텍스트 런으로 쪼개, 이모지는 컬러 이모지 폰트로, 텍스트는 기존 폰트로 그린다.
+#     Pillow 11은 layout_engine을 받지 않고 RAQM이 없어 ZWJ 결합이 제한적이므로,
+#     이모지는 32px 스트라이크로 렌더 후 폰트 크기에 맞게 축소한다 (_emoji_glyph).
+# ------------------------------------------------------------------
+_EMOJI_FONT_CACHE = {}
+
+# 이모지 문자 + ZWJ(‍) + 변형 셀렉터(️) + 키캡(⃣) 연속을 한 런으로 묶는다.
+_EMOJI_CHAR = "[\U0001F000-\U0001FAFF☀-➿⬀-⯿←-⇿⌀-⏿️‍⃣]"
+_EMOJI_RUN_RE = re.compile("(" + _EMOJI_CHAR + "+)")
+
+
+def _load_emoji_font(size: int):
+    """Apple Color Emoji 폰트 (macOS). 비트맵 스트라이크 크기가 한정적이라 요청 크기 로드
+    실패 시 32px 스트라이크로 대체한다. 로드 불가/비macOS면 None → 텍스트 폰트 폴백."""
+    if size in _EMOJI_FONT_CACHE:
+        return _EMOJI_FONT_CACHE[size]
+    _ensure_pillow()
+    font = None
+    if sys.platform == "darwin":
+        p = "/System/Library/Fonts/Apple Color Emoji.ttc"
+        if os.path.exists(p):
+            for s in (size, 32):
+                try:
+                    font = ImageFont.truetype(p, s)
+                    _EMOJI_FONT_CACHE[s] = font
+                    break
+                except Exception:
+                    continue
+    _EMOJI_FONT_CACHE[size] = font
+    return font
+
+
+def _split_label_runs(label: str):
+    """라벨을 (run, is_emoji) 리스트로 분리 — 이모지/ZWJ 연속은 한 런으로."""
+    parts = []
+    pos = 0
+    for m in _EMOJI_RUN_RE.finditer(label):
+        if m.start() > pos:
+            parts.append((label[pos:m.start()], False))
+        parts.append((m.group(0), True))
+        pos = m.end()
+    if pos < len(label):
+        parts.append((label[pos:], False))
+    return parts
+
+
+def _emoji_glyph(run: str, target_size: int):
+    """이모지 런을 32px 스트라이크로 렌더해 target_size 높이 RGBA로 축소. 실패 시 None.
+
+    Pillow 11은 layout_engine 인자를 받지 않고(RAQM 없음), 크기 16 등 일부 스트라이크
+    로드가 실패하므로 항상 32px 스트라이크로 그린 뒤 폰트 크기에 맞게 축소한다.
+    """
+    f = _load_emoji_font(32)
+    if f is None:
+        return None
+    pad = 4
+    tmp = Image.new("RGBA", (BTN_IMG_W * 3, BTN_IMG_H * 3), (0, 0, 0, 0))
+    dt = ImageDraw.Draw(tmp)
+    dt.text((pad, pad), run, font=f, embedded_color=True)
+    bbox = tmp.getbbox()
+    if not bbox:
+        return None
+    glyph = tmp.crop(bbox)
+    gw, gh = glyph.size
+    if gw == 0 or gh == 0:
+        return None
+    scale = target_size / gh
+    new_w = max(1, round(gw * scale))
+    new_h = target_size
+    if new_w > BTN_IMG_W - 2:               # 너무 넓으면 폭 기준으로 다시 축소
+        scale = (BTN_IMG_W - 2) / gw
+        new_w = round(gw * scale)
+        new_h = max(1, round(gh * scale))
+    return glyph.resize((new_w, new_h), Image.LANCZOS)
+
+
+def _compose_button_image_emoji(label: str, color_idx: int):
+    """이모지 포함 라벨을 버튼 JPEG로 렌더. 맞는 폰트 크기를 못 찾으면 None 반환 → 기본 경로 폴백.
+
+    텍스트 런은 라벨 폰트로, 이모지 런은 _emoji_glyph(컬러 32px 스트라이크 축소)로
+    그린다. 이모지 폭은 실제 축소 글리프 폭을 사용해 줄바꿈/정렬이 어긋나지 않게 한다.
+    """
+    _ensure_pillow()
+    color_hex = COLOR_HEX[color_idx]
+    text_hex = "#0f172a" if color_idx == 9 else "#ffffff"
+
+    img = Image.new("RGB", (BTN_IMG_W, BTN_IMG_H), GRID_BG_HEX)
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, BTN_IMG_W - 1, BTN_IMG_H - 1], radius=BTN_RADIUS, fill=color_hex)
+
+    max_w, max_h = BTN_IMG_W - 10, BTN_IMG_H - 10
+    tokens = [_split_label_runs(tok) for tok in label.split() if tok]
+    if not tokens:
+        return None
+
+    for fs in range(18, 7, -1):
+        text_font = _load_label_font(fs)
+        space_w = d.textlength(" ", font=text_font)
+
+        # 런별 (is_emoji, width, glyph|None, run) — 이모지 폭은 실제 축소 글리프 폭
+        runs = []
+        for tok in tokens:
+            for run, is_emoji in tok:
+                if is_emoji:
+                    g = _emoji_glyph(run, fs)
+                    w = g.width if g is not None else d.textlength(run, font=text_font)
+                    runs.append((True, w, g, run))
+                else:
+                    runs.append((False, d.textlength(run, font=text_font), None, run))
+
+        # 런 단위 greedy 줄바꿈 (최대 2줄)
+        lines = []
+        cur = []
+        cur_w = 0.0
+        too_wide = False
+        for r in runs:
+            sep = 0.0 if not cur else space_w
+            if cur and cur_w + sep + r[1] > max_w:
+                lines.append(cur)
+                cur = []
+                cur_w = 0.0
+                sep = 0.0
+                if len(lines) >= 2:
+                    too_wide = True
+                    break
+            cur.append(r)
+            cur_w += sep + r[1]
+        if too_wide:
+            continue
+        if cur:
+            lines.append(cur)
+        if not lines:
+            continue
+        line_h = fs + 4
+        if len(lines) * line_h > max_h:
+            continue
+        total_h = len(lines) * line_h
+        y0 = (BTN_IMG_H - total_h) / 2
+        for i, line in enumerate(lines):
+            line_w = sum(r[1] for r in line)
+            x = (BTN_IMG_W - line_w) / 2
+            y = y0 + i * line_h
+            for is_emoji, _w, g, run in line:
+                if is_emoji and g is not None:
+                    ey = y + (line_h - g.height) // 2      # 줄 안에서 세로 중앙
+                    img.paste(g, (int(x), int(ey)), g)
+                    x += g.width
+                else:
+                    bbox = d.textbbox((0, 0), run, font=text_font)
+                    d.text((x - bbox[0], y - bbox[1]), run, font=text_font, fill=text_hex)
+                    x += d.textlength(run, font=text_font)
+        return img
+    return None
+
+
 def _wrap_words(draw, words, font, max_w, max_lines):
     """공백 기준 워드랩. max_lines줄 이내로 못 넣으면 None 반환 (폰트 축소 유도)."""
     lines, cur = [], ""
@@ -314,13 +546,19 @@ def _compose_button_image(label: str, color_idx: int):
     이미지 모서리는 GRID_BG_HEX — 펌웨어가 그대로 push하면 라운드 코너가 주변
     배경과 이어진다. 테두리는 눌림 상태(펌웨어 drawRoundRect)에 따라 그리므로 여기엔 안 넣는다.
     """
+    # [PLAN 8] 이모지 포함 라벨은 텍스트/이모지 런 분리 렌더 (실패 시 아래 기본 경로로 폴백)
+    if _EMOJI_RUN_RE.search(label):
+        emo = _compose_button_image_emoji(label, color_idx)
+        if emo is not None:
+            return emo
+
     _ensure_pillow()
     color_hex = COLOR_HEX[color_idx]
     text_hex = "#0f172a" if color_idx == 9 else "#ffffff"   # 흰색 배경 → 검정 글자
 
     img = Image.new("RGB", (BTN_IMG_W, BTN_IMG_H), GRID_BG_HEX)
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([0, 0, BTN_IMG_W - 1, BTN_IMG_H - 1], radius=6, fill=color_hex)
+    d.rounded_rectangle([0, 0, BTN_IMG_W - 1, BTN_IMG_H - 1], radius=BTN_RADIUS, fill=color_hex)
 
     max_w, max_h = BTN_IMG_W - 10, BTN_IMG_H - 10
     words = label.split()
@@ -350,11 +588,16 @@ def _compose_button_image(label: str, color_idx: int):
 
 
 def _jpeg_fit(img) -> bytes:
-    """JPEG 인코딩. JPEG_MAX_BYTES 초과 시 품질을 낮춰 맞춘다 (단일 패킷 보장)."""
+    """JPEG 인코딩. JPEG_MAX_BYTES 초과 시 품질을 낮춰 맞춘다 (단일 패킷 보장).
+
+    [FIX] subsampling=0(4:4:4)로 크로마 서브샘플링 아티팩트 제거 — 단색 버튼에서
+    텍스트/모서리 경계가 얼룩덜룩(chroma smear)하게 보이던 원인. 크기는 커지지만
+    아래 품질 루프가 1400B 예산 안으로 맞춘다.
+    """
     q = JPEG_QUALITY
     while q >= JPEG_MIN_QUALITY:
         buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=q, optimize=True)
+        img.save(buf, "JPEG", quality=q, subsampling=0, optimize=True)
         data = buf.getvalue()
         if len(data) <= JPEG_MAX_BYTES:
             return data
@@ -377,6 +620,8 @@ def _image_to_button_jpeg(img) -> bytes:
 
     비율은 유지하되 버튼보다 작은 축을 채우도록 확대하고 중앙을 크롭한다.
     (늘어나지도, 빈 여백도 생기지 않는다 — 스트림덱 아이콘 방식)
+    [PLAN 7] 모서리는 그리드 배경 위 rounded_rectangle(BTN_RADIUS) 알파 마스크로 합성해
+    펌웨어 텍스트 버튼(fillRoundRect BTN_RADIUS)과 같은 둥근 모서리로 표시한다.
     """
     _ensure_pillow()
     ratio = max(BTN_IMG_W / img.width, BTN_IMG_H / img.height)
@@ -385,7 +630,13 @@ def _image_to_button_jpeg(img) -> bytes:
     left = (w - BTN_IMG_W) // 2
     top = (h - BTN_IMG_H) // 2
     img = img.crop((left, top, left + BTN_IMG_W, top + BTN_IMG_H))
-    return _jpeg_fit(img)
+    # 라운드 코너 마스크: rounded_rectangle 알파로 잘라 그리드 배경 위에 올린다.
+    canvas = Image.new("RGB", (BTN_IMG_W, BTN_IMG_H), GRID_BG_HEX)
+    mask = Image.new("L", (BTN_IMG_W, BTN_IMG_H), 0)
+    d = ImageDraw.Draw(mask)
+    d.rounded_rectangle([0, 0, BTN_IMG_W - 1, BTN_IMG_H - 1], radius=BTN_RADIUS, fill=255)
+    canvas.paste(img, (0, 0), mask)
+    return _jpeg_fit(canvas)
 
 
 def _image_file_to_b64(path) -> str:
@@ -501,15 +752,15 @@ class MacroPadGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("CYD Wireless Macro Pad Host")
-        # 창 크기: 화면 높이보다 크면 하단 적용/내보내기/가져오기 버튼이 잘린다.
-        # 화면에 맞게 높이를 제한하고, 리사이즈를 허용해 사용자가 조절할 수 있게 한다.
-        w, h = 520, 820
+        # 창 크기: [PLAN 2] 버튼 설정(4x3 카드)이 스크롤 없이 다 보이도록 기본 크기를 키운다.
+        # 화면이 작을 때만 높이를 줄이고(스크롤 폴백), 리사이즈로 조절 가능하게 한다.
+        w, h = 600, 940
         sh = self.root.winfo_screenheight()
-        if h > sh - 120:                       # 메뉴바/독 여유를 뺀 가용 높이
-            h = max(480, sh - 120)
+        if h > sh - 40:                        # 메뉴바/독 여유만 빼고 최대 높이 사용
+            h = max(480, sh - 40)
         self.root.geometry("%dx%d" % (w, h))
         self.root.resizable(True, True)
-        self.root.minsize(480, 420)
+        self.root.minsize(520, 560)
 
         self.config_path = Path(__file__).resolve().parent / "macro_config.json"
         self.config = self._load_config()          # dict (런타임 스냅샷: 메인/리스너가 lock으로 읽음)
@@ -624,15 +875,45 @@ class MacroPadGUI:
                         font=("Pretendard", 10))
         style.configure("TFrame", background=self.card_bg)
 
+    def _button(self, parent, text, command, bg, fg="#ffffff",
+                font=("Pretendard", 10), padx=10, pady=6, **kw):
+        """색상 버튼 생성. tk.Button이 아니라 clam 테마 ttk.Button을 쓴다.
+
+        [PLAN 3] macOS는 tk.Button을 네이티브(Aqua)로 그려서 창이 활성/포커스되면 커스텀 bg가
+        무시되고 밝은 흰 배경 + 흰 글자가 되어 구분이 안 된다. clam 테마 커스텀 스타일은
+        창 상태와 무관하게 background/foreground를 유지하므로 모든 상태에서 읽힌다.
+        """
+        # [FIX] ttk는 레이아웃을 스타일명의 마지막 점 뒤(베이스)에서 찾는다. 즉 "커스텀.베이스"
+        #     형태여야 clam의 TButton 레이아웃을 쓰면서 색만 덮어쓴다. "커스텀"만 쓰면
+        #     "Layout ... not found", "베이스.커스텀"(예: TButton.X)도 실패한다.
+        tag = "Cbtn_%s_%s_%s.TButton" % (bg.lstrip("#").upper(), font[1], padx)
+        style = ttk.Style()
+        style.configure(tag, background=bg, foreground=fg, bordercolor=bg,
+                        lightcolor=bg, darkcolor=bg, focuscolor=bg,
+                        relief="flat", padding=(padx, pady), font=font)
+        style.map(tag,
+                  background=[("active", _shade_hex(bg, 24)),
+                              ("pressed", _shade_hex(bg, -16))],
+                  foreground=[("active", fg), ("pressed", fg)])
+        return ttk.Button(parent, text=text, command=command, style=tag,
+                          cursor="pointinghand", **kw)
+
     # ------------------------------------------------------------------
     # 위젯 구성
     # ------------------------------------------------------------------
     def create_widgets(self) -> None:
-        # 헤더
+        # 헤더 (제목 좌측 + 사용법 '?' 버튼 우측 상단)
         header_frame = tk.Frame(self.root, bg=self.bg_color, pady=8)
         header_frame.pack(fill=tk.X, padx=16)
-        ttk.Label(header_frame, text="⌨️ CYD Wireless Macro Pad Host",
-                  style="Header.TLabel").pack(anchor="w")
+        title_row = tk.Frame(header_frame, bg=self.bg_color)
+        title_row.pack(fill=tk.X)
+        ttk.Label(title_row, text="⌨️ CYD Wireless Macro Pad Host",
+                  style="Header.TLabel").pack(side=tk.LEFT)
+        # [FIX] '?' 버튼도 내보내기/가져오기와 같은 모양(ttk clam, #334155)으로 통일 —
+        #       macOS Aqua 렌더링에서 bg/fg가 무시돼 '?'가 안 보일 수 있던 문제도 해결
+        self.help_btn = self._button(title_row, "?", self._show_help, "#334155",
+                                     font=("Pretendard", 12), padx=8, pady=6, width=2)
+        self.help_btn.pack(side=tk.RIGHT, padx=(8, 0))
         tk.Label(header_frame, text="ESP32-2432S028 터치 버튼 → UDP 이벤트 → 매크로 실행",
                  bg=self.bg_color, fg=self.sub_text, font=("Pretendard", 9)).pack(anchor="w")
 
@@ -650,14 +931,14 @@ class MacroPadGUI:
         self.page_name_entry = ttk.Entry(page_row, width=18)
         self.page_name_entry.pack(side=tk.LEFT, padx=6)
         self.page_name_entry.bind("<KeyRelease>", lambda e: self._page_name_edited())
-        self.del_page_btn = tk.Button(page_row, text="− 페이지", command=self._del_page,
-                                      bg="#ef4444", fg="white", relief=tk.FLAT, padx=10, pady=4,
-                                      cursor="pointinghand", font=("Pretendard", 9, "bold"))
+        # [FIX] +/− 페이지 버튼을 내보내기/가져오기와 동일한 모양(배경/폰트/패딩)으로 통일.
+        #       사이 간격도 내보내기↔가져오기와 같은 8px를 둔다.
+        self.del_page_btn = self._button(page_row, "− 페이지", self._del_page, "#334155",
+                                         font=("Pretendard", 12), padx=8, pady=6)
         self.del_page_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.add_page_btn = tk.Button(page_row, text="+ 페이지", command=self._add_page,
-                                      bg="#10b981", fg="white", relief=tk.FLAT, padx=10, pady=4,
-                                      cursor="pointinghand", font=("Pretendard", 9, "bold"))
-        self.add_page_btn.pack(side=tk.RIGHT)
+        self.add_page_btn = self._button(page_row, "+ 페이지", self._add_page, "#334155",
+                                         font=("Pretendard", 12), padx=8, pady=6)
+        self.add_page_btn.pack(side=tk.RIGHT, padx=(0, 8))
 
         # 페이지 노트북 (최대 MAX_PAGES × 4×3 버튼) — pack은 하단 바를 먼저 고정한 뒤 진행
         self.notebook = ttk.Notebook(self.root)
@@ -671,28 +952,24 @@ class MacroPadGUI:
         bot_card.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(0, 8))
         bot_row = tk.Frame(bot_card, bg=self.card_bg)
         bot_row.pack(fill=tk.X)
-        self.apply_btn = tk.Button(bot_row, text="💾 설정 적용 (Apply)", command=self._apply,
-                                   bg="#0ea5e9", fg="white", relief=tk.FLAT, padx=14, pady=6,
-                                   cursor="pointinghand", font=("Pretendard", 10, "bold"))
+        self.apply_btn = self._button(bot_row, "💾 설정 적용 (Apply)", self._apply, "#0ea5e9",
+                                      font=("Pretendard", 12, "bold"), padx=12, pady=6)
         self.apply_btn.pack(side=tk.LEFT)
-        self.export_btn = tk.Button(bot_row, text="⬇ 내보내기", command=self._export_config,
-                                    bg="#334155", fg="white", relief=tk.FLAT, padx=10, pady=6,
-                                    cursor="pointinghand", font=("Pretendard", 10))
+        self.export_btn = self._button(bot_row, "⬇ 내보내기", self._export_config, "#334155",
+                                       font=("Pretendard", 12), padx=8, pady=6)
         self.export_btn.pack(side=tk.LEFT, padx=(8, 0))
-        self.import_btn = tk.Button(bot_row, text="⬆ 가져오기", command=self._import_config,
-                                    bg="#334155", fg="white", relief=tk.FLAT, padx=10, pady=6,
-                                    cursor="pointinghand", font=("Pretendard", 10))
+        self.import_btn = self._button(bot_row, "⬆ 가져오기", self._import_config, "#334155",
+                                       font=("Pretendard", 12), padx=8, pady=6)
         self.import_btn.pack(side=tk.LEFT, padx=(8, 0))
-        self.device_import_btn = tk.Button(bot_row, text="🖥 디바이스에서 불러오기",
-                                           command=self._import_from_device,
-                                           bg="#334155", fg="white", relief=tk.FLAT, padx=10, pady=6,
-                                           cursor="pointinghand", font=("Pretendard", 10))
+        self.device_import_btn = self._button(bot_row, "🖥 디바이스에서 불러오기",
+                                              self._import_from_device, "#334155",
+                                              font=("Pretendard", 12), padx=8, pady=6)
         self.device_import_btn.pack(side=tk.LEFT, padx=(8, 0))
         log_frame = tk.Frame(bot_card, bg=self.card_bg)
         log_frame.pack(fill=tk.BOTH, pady=(8, 0))
         self.log_text = tk.Text(log_frame, height=6, bg="#020617", fg=self.text_color,
                                 insertbackground=self.text_color, state=tk.DISABLED,
-                                font=("Pretendard", 9), relief=tk.FLAT, padx=6, pady=4)
+                                font=("Pretendard", 12), relief=tk.FLAT, padx=6, pady=4)
         self.log_text.pack(fill=tk.BOTH)
         self.log_text.tag_configure("error", foreground="#ef4444")
         self._log("준비됨. CYD에 설정을 적용하려면 '설정 적용'을 누르세요.")
@@ -703,17 +980,94 @@ class MacroPadGUI:
         for page in range(len(pages)):
             self._make_page_tab(page, pages[page].get("name") or "Page %d" % (page + 1))
 
+    def _show_help(self) -> None:
+        """[?] 버튼 — 프로그램 사용법 안내 대화상자를 연다."""
+        win = tk.Toplevel(self.root)
+        win.title("프로그램 사용법")
+        win.configure(bg=self.bg_color)
+        win.geometry("640x600")
+        win.transient(self.root)
+        win.resizable(True, True)
+
+        txt = tk.Text(win, bg=self.card_bg, fg=self.text_color,
+                      insertbackground=self.text_color, wrap=tk.WORD,
+                      font=("Pretendard", 14), relief=tk.FLAT,
+                      padx=18, pady=14, spacing1=4, spacing3=4)
+        sb = ttk.Scrollbar(win, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 4))
+
+        txt.tag_configure("h",   foreground=self.text_color, font=("Pretendard", 17, "bold"))
+        txt.tag_configure("sub", foreground=self.sub_text, font=("Pretendard", 14, "bold"))
+        txt.tag_configure("code", foreground="#7dd3fc", font=("Menlo", 13))
+        txt.tag_configure("warn", foreground="#fbbf24", font=("Pretendard", 14, "bold"))
+
+        # (태그, 본문) — 실제 동작 정의(_exec_shortcut/_exec_text/_exec_app)와 일치시킬 것
+        guide = [
+            ("h",   "⌨️ CYD 무선 매크로 패드 사용법\n"),
+            ("sub", "\n[ 시작하기 ]\n"),
+            ("",    "1. CYD 전원 → 같은 Wi-Fi에 자동 연결 → 하단 로그에 "
+                    "\"디바이스 발견\"이 뜹니다. IP 입력은 필요 없습니다 (자동 발견, UDP 8890).\n"),
+            ("",    "2. 페이지 탭(최대 8개)에서 4×3 버튼 12개를 설정한 뒤 [설정 적용]을 누르세요.\n"),
+            ("",    "3. 장치에서 버튼을 터치하면 호스트가 등록된 동작을 실행합니다.\n"),
+            ("sub", "\n[ 버튼 동작 3종 ]\n"),
+            ("",    "▪ 단축키 (shortcut) — 키 조합 입력. 예: "), ("code", "cmd+shift+4, cmd+c\n"),
+            ("",    "▪ 문구 (text) — 입력할 문자열. 예: "), ("code", "안녕하세요"),
+            ("",    " (한글 포함 가능).\n"),
+            ("sub", "    클립보드(pbcopy) + Cmd+V 방식이라 한/영 입력기(IME)와 무관하게 동작합니다.\n"),
+            ("",    "▪ app / URL — \""),
+            ("code", "://"),
+            ("",    "\"가 들어가면 URL로 열고, 아니면 macOS 앱 이름으로 실행합니다.\n"),
+            ("code", "    - 앱 예: Safari, Calculator, Notes   (Finder에 보이는 영문 이름)\n"),
+            ("code", "    - URL 예: https://www.google.com , https://www.youtube.com\n"),
+            ("sub", "\n[ 단축키에 쓸 수 있는 특수키 ]\n"),
+            ("code", "  cmd(⌘)/command, ctrl(⌃)/control, alt(⌥)/option, shift(⇧)\n"),
+            ("code", "  space, enter/return, tab, esc/escape\n"),
+            ("code", "  up/down/left/right, backspace, delete, caps_lock\n"),
+            ("code", "  home, end, page_up/page_down, fn, insert, print_screen\n"),
+            ("",    "- 조합은 "), ("code", "+"), ("", " 로 연결: "), ("code", "cmd+option+v"),
+            ("",    "  등.\n"),
+            ("",    "- 영문·숫자 한 글자는 그대로: "), ("code", "cmd+a, cmd+1"),
+            ("",    "  (대소문자 무시).\n"),
+            ("sub", "\n[ 이모지 ]\n"),
+            ("",    "버튼 이름·액션 값에 이모지(예: "),
+            ("code", "📷 촬영"),
+            ("",    ")를 넣으면 이미지로 렌더링되어 장치에 표시됩니다.\n"),
+            ("warn", "\n[ 필수 macOS 권한 ]\n"),
+            ("",    "키보드 입력(단축키·문구)은 시스템 설정 → 개인정보 보호 및 보안 → "
+                    "손쉬운 사용에서\n터미널/호스트 프로그램에 권한을 줘야 동작합니다. "
+                    "없으면 조용히 무시됩니다.\n"),
+            ("sub", "\n[ 백업 / 복원 ]\n"),
+            ("",    "▪ 내보내기: 현재 설정을 JSON 파일로 저장\n"),
+            ("",    "▪ 가져오기: JSON 파일 불러오기\n"),
+            ("",    "▪ 디바이스에서 불러오기: 장치 내부 저장 설정을 읽어 편집 화면에 채움 "
+                    "([설정 적용]으로 동기화).\n"),
+        ]
+        for tag, text in guide:
+            txt.insert(tk.END, text, tag)
+        txt.config(state=tk.DISABLED)
+
+        close = tk.Button(win, text="닫기", command=win.destroy, width=8,
+                          bg="#334155", fg=self.text_color, activebackground="#475569",
+                          activeforeground=self.text_color, relief=tk.FLAT, bd=0, cursor="hand2",
+                          font=("Pretendard", 14))
+        close.pack(pady=10)
+        win.bind("<Escape>", lambda e: win.destroy())
+
     def _make_button_card(self, parent: tk.Widget, page: int, bid: int) -> dict:
         """버튼 한 개의 편집 카드 (라벨/동작/값/색 + [G] 이미지 업로드 + 힌트)."""
-        f = tk.Frame(parent, bg="#1e293b", bd=1, relief=tk.SOLID, padx=6, pady=5)
+        f = tk.Frame(parent, bg="#1e293b", bd=1, relief=tk.SOLID, padx=5, pady=3)
         tk.Label(f, text="#%d" % bid, bg="#1e293b", fg=self.sub_text,
-                 font=("Pretendard", 8)).pack(anchor="w")
+                 font=("Pretendard", 10)).pack(anchor="w")
         lbl = ttk.Entry(f, width=12)
         lbl.pack(fill=tk.X, pady=(2, 2))
-        act = ttk.Combobox(f, values=ACTION_TYPES, width=10, state="readonly")
+        _setup_entry_placeholder(lbl, "이름")     # 빈 칸일 때 힌트 (어느 칸인지 표시)
+        act = ttk.Combobox(f, values=list(ATYPE_LABELS.values()), width=10, state="readonly")
         act.pack(fill=tk.X, pady=(0, 2))
         val = ttk.Entry(f, width=12)
         val.pack(fill=tk.X, pady=(0, 2))
+        _setup_entry_placeholder(val, "액션")     # 액션 값(단축키/문구/앱·URL) 힌트
         # 색상 선택 (구분용): 스와치 + 팔레트 Combobox
         color_row = tk.Frame(f, bg="#1e293b")
         color_row.pack(fill=tk.X, pady=(0, 2))
@@ -726,19 +1080,19 @@ class MacroPadGUI:
         # [G] 이미지 업로드: 업로드 버튼 + 썸네일(미리보기) + 제거 버튼
         img_row = tk.Frame(f, bg="#1e293b")
         img_row.pack(fill=tk.X, pady=(0, 2))
-        img_btn = tk.Button(img_row, text="🖼", command=lambda: self._pick_image(page, bid),
-                            bg="#334155", fg="white", relief=tk.FLAT, padx=5, pady=1,
-                            cursor="pointinghand", font=("Pretendard", 9))
+        # [FIX] 이모지 글리프가 ttk 버튼 폭을 크게(약 84px) 만들어 행이 넘쳐 '✕'가 잘렸다.
+        #       expand 제거 + 명시적 width(문자 단위)로 고정해 세 요소가 모두 보이게 한다.
+        img_btn = self._button(img_row, "🖼", lambda: self._pick_image(page, bid), "#334155",
+                               font=("Pretendard", 10), padx=2, pady=1, width=3)
         img_btn.pack(side=tk.LEFT)
         img_preview = tk.Label(img_row, text="라벨/색상", bg="#0f172a", fg=self.sub_text,
-                               font=("Pretendard", 7), padx=4, pady=2, width=9)
-        img_preview.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-        img_clear = tk.Button(img_row, text="✕", command=lambda: self._clear_image(page, bid),
-                              bg="#334155", fg="#f8fafc", relief=tk.FLAT, padx=5, pady=1,
-                              cursor="pointinghand", font=("Pretendard", 9))
+                               font=("Pretendard", 9), padx=4, pady=2, width=7)
+        img_preview.pack(side=tk.LEFT, padx=4)
+        img_clear = self._button(img_row, "✕", lambda: self._clear_image(page, bid), "#334155",
+                                 fg="#f8fafc", font=("Pretendard", 10), padx=2, pady=1, width=3)
         img_clear.pack(side=tk.LEFT)
         hint = tk.Label(f, text="", bg="#1e293b", fg=self.sub_text,
-                        font=("Pretendard", 7), anchor="w")
+                        font=("Pretendard", 9), anchor="w")
         hint.pack(fill=tk.X)
         act.bind("<<ComboboxSelected>>",
                  lambda e, h=hint, a=act: self._update_hint(h, a))
@@ -848,7 +1202,7 @@ class MacroPadGUI:
         for bid in range(BUTTONS_PER_PAGE):
             r, c = divmod(bid, GRID_COLS)
             card = self._make_button_card(grid, idx, bid)
-            card["frame"].grid(row=r, column=c, padx=5, pady=5, sticky="nsew")
+            card["frame"].grid(row=r, column=c, padx=4, pady=2, sticky="nsew")
             page_widgets.append(card)
         for c in range(GRID_COLS):
             grid.columnconfigure(c, weight=1, uniform="col")
@@ -862,7 +1216,8 @@ class MacroPadGUI:
         hints = {"shortcut": "단축키: cmd+shift+4",
                  "text": "문구: 한글 가능",
                  "app": "영문 앱명(예: Calculator) or URL"}
-        hint.config(text=hints.get(act.get(), ""))
+        label = act.get()
+        hint.config(text=hints.get(ATYPE_FROM_LABEL.get(label, label), ""))
 
     # ------------------------------------------------------------------
     # 설정 ↔ 위젯
@@ -877,11 +1232,9 @@ class MacroPadGUI:
                     btns = pages[page].get("buttons", [])
                     if bid < len(btns):
                         btn = btns[bid]
-                w["label"].delete(0, tk.END)
-                w["label"].insert(0, btn.get("label") or "")
-                w["action"].set(btn.get("action_type", "shortcut"))
-                w["value"].delete(0, tk.END)
-                w["value"].insert(0, btn.get("action_value") or "")
+                _set_entry_value(w["label"], btn.get("label") or "")
+                w["action"].set(ATYPE_LABELS.get(btn.get("action_type") or "shortcut", "shortcut"))
+                _set_entry_value(w["value"], btn.get("action_value") or "")
                 color = int(btn.get("color", 0) or 0)
                 if not (0 <= color < len(COLOR_NAMES)):
                     color = 0
@@ -950,7 +1303,8 @@ class MacroPadGUI:
         if not (0 <= idx < len(self._button_widgets)):
             return
         has_content = any(
-            w["label"].get().strip() or w["value"].get().strip() for w in self._button_widgets[idx])
+            _entry_text(w["label"]).strip() or _entry_text(w["value"]).strip()
+            for w in self._button_widgets[idx])
         if has_content and not messagebox.askyesno(
                 "페이지 삭제", "페이지 %d의 설정이 삭제됩니다. 계속할까요?" % (idx + 1)):
             return
@@ -989,9 +1343,9 @@ class MacroPadGUI:
                         img = cbtns[bid].get("image")
                         image = img if isinstance(img, str) and img else None
                 buttons.append({
-                    "label": w["label"].get().strip()[:LABEL_MAX],
-                    "action_type": w["action"].get() or "shortcut",
-                    "action_value": w["value"].get(),
+                    "label": _entry_text(w["label"]).strip()[:LABEL_MAX],
+                    "action_type": ATYPE_FROM_LABEL.get(w["action"].get(), "shortcut"),
+                    "action_value": _entry_text(w["value"]),
                     "color": color,
                     "image": image,
                 })
@@ -1454,7 +1808,7 @@ class MacroPadGUI:
         if atype == "text":
             return "문구 \"%s\"" % aval[:20]
         if atype == "app":
-            return "앱/URL %s" % aval
+            return "app / URL %s" % aval
         return "단축키 %s" % aval
 
     # ------------------------------------------------------------------
@@ -1642,6 +1996,12 @@ if __name__ == "__main__":
                 assert jpg[:2] == b"\xff\xd8", "JPEG 마커 확인: %r" % lbl
                 assert len(jpg) <= JPEG_MAX_BYTES, \
                     "JPEG %dB > %dB (단일 UDP 패킷 불가): %r" % (len(jpg), JPEG_MAX_BYTES, lbl)
+            # [PLAN 8] 이모지 라벨도 텍스트/이모지 런 렌더 → 단일 패킷 크기 이내
+            for lbl, ci in [("🎉", 6), ("안녕 🎉", 6), ("Copy 🐱 👨‍👩‍👧", 6)]:
+                jpg = _render_button_image(lbl, ci)
+                assert jpg[:2] == b"\xff\xd8", "이모지 JPEG 마커 확인: %r" % lbl
+                assert len(jpg) <= JPEG_MAX_BYTES, \
+                    "이모지 JPEG %dB > %dB (단일 UDP 패킷 불가): %r" % (len(jpg), JPEG_MAX_BYTES, lbl)
             # [G] 업로드 이미지 경로: 임의 크기 이미지 → 중앙 크롭 채움 71x61 JPEG → base64 왕복
             src = Image.new("RGB", (200, 100), (200, 30, 30))
             up_jpg = _image_to_button_jpeg(src)
@@ -1653,6 +2013,23 @@ if __name__ == "__main__":
             reopened = Image.open(io.BytesIO(up_jpg))
             assert reopened.size == (BTN_IMG_W, BTN_IMG_H), \
                 "중앙 크롭 채움 결과 크기 %r ≠ 71x61" % (reopened.size,)
+            # [PLAN 7] 업로드 이미지도 라운드 코너: 네 귀퉁이 픽셀은 그리드 배경색이어야 한다
+            # (JPEG 손실 압축 때문에 정확 등가가 아니라 허용 오차로 비교. 코너 픽셀은
+            #  DCT 블록 경계에서 배경↔채움 급경계 링잉으로 최대 ~30 벗어날 수 있음 —
+            #  실제로는 어두운 배경색으로 보이고 디바이스 roundButtonCorners가 정확히 덮음.
+            #  반면 라운드 미적용(채움색 그대로)이면 팔레트 최저 97 이상 벗어나므로 ±45로 구분된다)
+            bg = tuple(int(GRID_BG_HEX.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+            reopen_rgb = reopened.convert("RGB")
+            for cx, cy in ((0, 0), (BTN_IMG_W - 1, 0), (0, BTN_IMG_H - 1),
+                           (BTN_IMG_W - 1, BTN_IMG_H - 1)):
+                px = reopen_rgb.getpixel((cx, cy))
+                assert all(abs(a - b) <= 45 for a, b in zip(px, bg)), \
+                    "모서리 (%d,%d) %r이 그리드 배경 %s에서 너무 벗어남 (라운드 코너 미적용)" \
+                    % (cx, cy, px, GRID_BG_HEX)
+            # 중앙은 버튼 채움색(원본 빨강 200,30,30)이어야 한다 — 라운드 마스크가 전체를 가리지 않았는지
+            center = reopen_rgb.getpixel((BTN_IMG_W // 2, BTN_IMG_H // 2))
+            assert all(abs(a - b) <= 24 for a, b in zip(center, (200, 30, 30))), \
+                "중앙 %r이 원본 채움색과 다름 — 라운드 마스크가 이미지를 가림" % (center,)
         # [H] 청크 분할: 최악 엔트리(24B 라벨 + 128B 액션) 12개 = 1893B > CHUNK_MAX → 2청크
         fat_btns = [{"label": "L" * LABEL_MAX, "action_type": "shortcut",
                      "action_value": "v" * ACTION_VAL_MAX, "color": 3}] * 12
