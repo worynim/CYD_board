@@ -21,7 +21,7 @@ import subprocess
 import sys
 
 try:
-    from pynput.keyboard import Controller, Key
+    from pynput.keyboard import Controller, Key, KeyCode
 except ImportError:
     print("ERROR: pynput 미설치 (pip install -r requirements.txt)", file=sys.stderr)
     sys.exit(2)
@@ -53,24 +53,61 @@ for _i in range(1, 21):
         _KEY_MAP[_fn] = getattr(Key, _fn)
 
 
+# [FIX] 단일 문자 키의 키코드 오매핑 해결.
+# pynput의 Controller.press(char)는 유니코드→키코드 맵(get_unicode_to_keycode_map)을 쓰는데,
+# 이 맵은 키코드를 0..127로 순회하며 "문자 → 키코드"를 만들 때 나중에 덮어써서, 한 문자를
+# 여러 키(예: '.' = 일반 마침표 47 / 키패드 소수점 65)가 만들 수 있으면 "가장 높은 키코드"를
+# 선택한다. 그래서 '.'을 키패드 키(65)로 보내게 되고, 키코드는 문자 위치가 아니라 물리 키
+# 위치라 활성 레이아웃/키패드 유무에 따라 실제로 입력되지 않는다 ('.', '/', 숫자 등 공통).
+# 여기서는 현재 레이아웃에서 그 문자를 만드는 "가장 낮은(주) 키코드"를 직접 찾아
+# KeyCode.from_vk(vk)로 보낸다. 이후는 pynput의 _handle이 키코드·수정자 플래그를 모두
+# 처리하므로 cmd+. / shift+. 같은 조합도 올바르게 유지된다.
+# 참고: Controller.modifiers는 컨텍스트 매니저(@contextmanager)라 set()으로 읽으면 안 된다.
+_char_keycode_cache = {}
+
+
+def _char_keycode(ch: str):
+    """현재 키보드 레이아웃에서 ch(1자)를 입력하는 가장 낮은 키코드(주 키).
+
+    pynput 기본 맵이 키패드 변형(높은 키코드)을 우선하는 것과 달리, 각 문자가 만들어질
+    수 있는 가장 낮은 키코드를 찾아 일반(주) 키를 선택한다 ('.'=47, '/'=44, 숫자=18..29).
+    못 찾으면 None → 호출부가 pynput 기본 맵으로 폴백. 결과는 캐시한다.
+    """
+    if ch in _char_keycode_cache:
+        return _char_keycode_cache[ch]
+    vk = None
+    try:
+        from pynput._util.darwin import keycode_context, keycode_to_string
+        with keycode_context() as ctx:
+            for k in range(128):
+                if keycode_to_string(ctx, k) == ch:
+                    vk = k
+                    break
+    except Exception:
+        pass
+    _char_keycode_cache[ch] = vk
+    return vk
+
+
 def exec_shortcut(s: str) -> None:
     """'cmd+shift+4' 같은 단축키를 press→release 조합으로 실행한다."""
-    keys = []
+    kb = Controller()
+    actions = []                         # 각 항목: pynput Key 또는 KeyCode(주 키)
     for part in s.split("+"):
         p = part.strip().lower()
         if not p:
             continue
         if p in _KEY_MAP:
-            keys.append(_KEY_MAP[p])
+            actions.append(_KEY_MAP[p])
         elif len(p) == 1:
-            keys.append(p)   # 일반 문자 키
-    if not keys:
+            vk = _char_keycode(p)
+            actions.append(KeyCode.from_vk(vk) if vk is not None else p)
+    if not actions:
         return
-    kb = Controller()
-    for k in keys:
-        kb.press(k)
-    for k in reversed(keys):
-        kb.release(k)
+    for a in actions:
+        kb.press(a)
+    for a in reversed(actions):
+        kb.release(a)
 
 
 def exec_text(text: str) -> None:
