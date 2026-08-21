@@ -208,10 +208,10 @@ static LGFX lcd;
 
 // [C] 백라이트 절전 + 주변 밝기 자동 조절
 #define LDR_PIN         34               // GPIO34 CDS 조도 센서 (아날로그 ADC1)
-#define IDLE_DIM_MS     60000            // 무터치 60s 후 백라이트 디밍 (off 아님)
-#define BRIGHT_FULL     200              // 기본 밝기 (최대)
+#define IDLE_DIM_MS     90000            // 무터치 90s 후 백라이트 디밍 (off 아님)
+#define BRIGHT_FULL     220              // 기본 밝기 (최대)
 #define BRIGHT_DIM      40               // 디밍 밝기
-#define BRIGHT_MIN      60               // 조도 기반 밝기 하한 (어두운 곳)
+#define BRIGHT_MIN      80               // 조도 기반 밝기 하한 (어두운 곳)
 
 // ==========================================
 // 3.5 버튼 색상 팔레트 (호스트 COLOR_NAMES/COLOR_HEX와 순서·값 정확히 일치)
@@ -1715,7 +1715,7 @@ void handleTouch() {
       // [C] 디밍 상태였다면 즉시 조도 기반 밝기로 복귀
       if (lastBrightness == BRIGHT_DIM) {
         int ldr = analogRead(LDR_PIN);
-        int b = map(ldr, 200, 3800, BRIGHT_FULL, BRIGHT_MIN);
+        int b = map(ldr, 500, 3800, BRIGHT_FULL, BRIGHT_MIN);
         b = constrain(b, BRIGHT_MIN, BRIGHT_FULL);
         lcd.setBrightness((uint8_t)b);
         lastBrightness = (uint8_t)b;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CYD 무선 매크로 패드 호스트 (Wireless Macro Pad Host)
+CYD 무선 매크로 패드 호스트 (CYD Macro Pad Host)
 
 CYD(ESP32-2432S028, 2.8" 터치 LCD)의 버튼 그리드를 터치하면 디바이스가 UDP 이벤트를
 보내고, 이 호스트가 이를 수신해 액션을 실행한다.
@@ -804,7 +804,7 @@ def build_config_from_dump(dump: dict):
 class MacroPadGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("CYD Wireless Macro Pad Host")
+        self.root.title("CYD Macro Pad Host")
         # 창 크기: [PLAN 2] 버튼 설정(4x3 카드)이 스크롤 없이 다 보이도록 기본 크기를 키운다.
         # 화면이 작을 때만 높이를 줄이고(스크롤 폴백), 리사이즈로 조절 가능하게 한다.
         w, h = 600, 940
@@ -963,7 +963,7 @@ class MacroPadGUI:
         header_frame.pack(fill=tk.X, padx=16)
         title_row = tk.Frame(header_frame, bg=self.bg_color)
         title_row.pack(fill=tk.X)
-        ttk.Label(title_row, text="⌨️ CYD Wireless Macro Pad Host",
+        ttk.Label(title_row, text="⌨️ CYD Macro Pad Host",
                   style="Header.TLabel").pack(side=tk.LEFT)
         # [FIX] '?' 버튼도 내보내기/가져오기와 같은 모양(ttk clam, #334155)으로 통일 —
         #       macOS Aqua 렌더링에서 bg/fg가 무시돼 '?'가 안 보일 수 있던 문제도 해결
