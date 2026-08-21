@@ -5,7 +5,7 @@ CYD 무선 매크로 패드 호스트 (CYD Macro Pad Host)
 
 CYD(ESP32-2432S028, 2.8" 터치 LCD)의 버튼 그리드를 터치하면 디바이스가 UDP 이벤트를
 보내고, 이 호스트가 이를 수신해 액션을 실행한다.
-  - shortcut : 키보드 단축키 (예: cmd+shift+4)          → 격리된 헬퍼(_input_helper.py)
+  - shortcut : 키보드 단축키 (예: cmd+shift+4, win+r)   → 격리된 헬퍼(_input_helper.py)
   - text     : 문구/텍스트 입력 (한글 포함, IME 무관)     → 격리된 헬퍼(클립보드 + 붙여넣기)
   - app      : 앱 실행 또는 URL 열기                     → macOS open / 윈도우 os.startfile
 
@@ -159,7 +159,7 @@ L10N = {
     "ph_name": {"ko": "이름", "en": "Name"},
     "ph_action": {"ko": "액션", "en": "Action"},
     "preview_label": {"ko": "라벨/색상", "en": "Label/Color"},
-    "hint_shortcut": {"ko": "단축키: cmd+shift+4", "en": "Shortcut: cmd+shift+4"},
+    "hint_shortcut": {"ko": "단축키 (예: cmd+shift+4, win+r)", "en": "Shortcut (e.g. cmd+shift+4, win+r)"},
     "hint_text": {"ko": "문구: 한글 가능", "en": "Text: any characters"},
     "hint_app": {"ko": "영문 앱명(예: Calculator) or URL",
                  "en": "App name (e.g. Calculator) or URL"},
@@ -344,7 +344,7 @@ L10N = {
                         "en": "Put an emoji in a button name or action value (e.g. "},
     "help_emoji_tail": {"ko": ")를 넣으면 이미지로 렌더링되어 장치에 표시됩니다.\n",
                         "en": ") and it renders as an image on the device.\n"},
-    "help_ex_shortcut": {"ko": "cmd+shift+4, cmd+c\n", "en": "cmd+shift+4, cmd+c\n"},
+    "help_ex_shortcut": {"ko": "cmd+shift+4, cmd+c, win+r\n", "en": "cmd+shift+4, cmd+c, win+r\n"},
     "help_ex_text": {"ko": "안녕하세요", "en": "Hello"},
     "help_ex_emoji": {"ko": "📷 촬영", "en": "📷 Camera"},
     "help_act_url_open": {"ko": "\"가 들어가면 URL로 열고, 아니면 macOS 앱 이름으로 실행합니다.\n",
