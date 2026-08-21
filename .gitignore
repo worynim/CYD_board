@@ -3,5 +3,9 @@ CLAUDE.md
 __pycache__
 OPTIMIZATION_PLAN.md
 CYD_Macro_Pad/host_macro_pad/macro_config.json
+# PyInstaller 빌드 산출물 (호스트 실행 파일 패키징)
+CYD_Macro_Pad/host_macro_pad/build/
+CYD_Macro_Pad/host_macro_pad/dist/
+CYD_Macro_Pad/host_macro_pad/*.spec
 .DS_Store
 

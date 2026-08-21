@@ -44,6 +44,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -217,8 +218,17 @@ L10N = {
                       "en": "Incomplete device response (some pages/buttons missing). Try again."},
     "log_event_ok": {"ko": "✓ page%d · #%d: %s 실행됨", "en": "✓ page%d · #%d: %s executed"},
     "log_event_err": {"ko": "✗ page%d · #%d: %s", "en": "✗ page%d · #%d: %s"},
-    "log_device_found": {"ko": "디바이스 발견 (자동 검색): %s — 설정 전송",
-                         "en": "Device found (auto-discovery): %s — sending config"},
+    "log_device_found": {"ko": "디바이스 발견 (자동 검색): %s — 설정 비교",
+                         "en": "Device found (auto-discovery): %s — comparing settings"},
+    # 자동 동기화 보호 (첫 연결 시 디바이스 덮어쓰기 방지)
+    "log_autosync_same": {"ko": "디바이스(%s) 설정이 호스트와 동일합니다.",
+                          "en": "Device (%s) settings match the host."},
+    "log_autosync_loaded": {"ko": "디바이스(%s)에서 설정을 불러왔습니다.",
+                            "en": "Loaded settings from device (%s)."},
+    "log_autosync_none": {"ko": "디바이스(%s)는 건드리지 않았습니다. 호스트 설정을 유지합니다.",
+                          "en": "Device (%s) left untouched; keeping host settings."},
+    "log_autosync_fail": {"ko": "디바이스(%s) 설정을 읽지 못해 자동 비교를 건너뜁니다 (다음 비콘에서 재시도).",
+                          "en": "Could not read device (%s) settings; auto-sync skipped (retries on next beacon)."},
     # 메시지박스
     "msg_delpage_title": {"ko": "페이지 삭제", "en": "Delete Page"},
     "msg_min1page": {"ko": "최소 1개 페이지는 필요합니다.", "en": "At least 1 page is required."},
@@ -232,6 +242,15 @@ L10N = {
                  "en": "Device IP is unknown.\nWait until auto-discovery finds it, then retry."},
     "msg_listener_down": {"ko": "리스너가 동작하지 않습니다.", "en": "The listener is not running."},
     "msg_dumpfail_title": {"ko": "디바이스에서 불러오기 실패", "en": "Load from Device Failed"},
+    "msg_autosync_title": {"ko": "설정 동기화 확인", "en": "Sync Settings"},
+    "msg_autosync_ask": {"ko": "디바이스(%s)의 설정이 호스트와 다릅니다.\n"
+                                 "디바이스에서 불러오시겠습니까?\n\n"
+                                 "[예] 디바이스 설정을 호스트로 불러옴\n"
+                                 "[아니오] 아무것도 하지 않음 (디바이스 유지)",
+                         "en": "Device (%s) settings differ from the host.\n"
+                                 "Load from the device?\n\n"
+                                 "[Yes] Load device settings into the host\n"
+                                 "[No] Do nothing (keep the device as-is)"},
     # 액션 설명
     "desc_text": {"ko": "문구 \"%s\"", "en": "text \"%s\""},
     "desc_app": {"ko": "app / URL %s", "en": "app / URL %s"},
@@ -372,8 +391,29 @@ def _set_cur_lang(lang: str) -> None:
         _CUR_LANG = lang
 
 
+def _helper_executable() -> Path:
+    """실행할 입력 헬퍼의 경로를 돌려준다 (패키징 대응).
+
+    PyInstaller .app 번들 안에서는 sys.executable이 앱 바이너리라 .py를 실행할
+    수 없고 __file__도 읽기 전용 번들 안을 가리킨다. 따라서 빌드 시 함께 묶은
+    컴파일된 헬퍼 바이너리를 직접 실행한다 (--add-data "dist/macro_input_helper:helper").
+    개발 모드(스크립트)에서는 소스 _input_helper.py를 그대로 쓴다.
+    """
+    if getattr(sys, "frozen", False):
+        # onefile 실행 시 sys._MEIPASS는 추출용 임시 디렉터리(번들 데이터 위치)
+        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        return base / "helper" / "macro_input_helper"
+    return Path(__file__).resolve().parent / "_input_helper.py"
+
+
 def _pynput_installed() -> bool:
-    """pynput 존재 여부. import하지 않고 spec만 확인한다 (네이티브 import는 헬퍼에서만)."""
+    """pynput 존재 여부. import하지 않고 spec만 확인한다 (네이티브 import는 헬퍼에서만).
+
+    패키징(.app) 모드에서는 크래시 격리를 위해 GUI에 pynput을 묶지 않으므로,
+    대신 함께 묶은 헬퍼 바이너리(안에 pynput 포함)가 존재하면 True로 간주한다.
+    """
+    if getattr(sys, "frozen", False):
+        return _helper_executable().exists()
     try:
         return importlib.util.find_spec("pynput") is not None
     except Exception:
@@ -387,10 +427,13 @@ def run_input_helper(action_type: str, value: str) -> None:
     별도 프로세스에서 수행한다. 헬퍼가 죽어도 GUI는 RuntimeError로 실패를
     받아 이벤트 로그에 표시한다.
     """
-    helper = Path(__file__).resolve().parent / "_input_helper.py"
+    helper = _helper_executable()
+    # [패키징] frozen(.app)에서는 묶인 헬퍼 바이너리를 직접 실행하고,
+    #           개발 모드에서는 sys.executable로 소스 헬퍼를 실행한다.
+    argv = [str(helper), "--input"] if getattr(sys, "frozen", False) else [sys.executable, str(helper), "--input"]
     try:
         proc = subprocess.run(
-            [sys.executable, str(helper), "--input"],
+            argv,
             input=json.dumps({"type": action_type, "value": value}).encode("utf-8"),
             capture_output=True, timeout=10)
     except subprocess.TimeoutExpired:
@@ -1124,6 +1167,27 @@ def build_config_from_dump(dump: dict):
     return {"version": 3, "port": UDP_PORT, "device_ip": dump.get("device_ip", ""), "pages": pages}
 
 
+def _settings_projection(config: dict) -> tuple:
+    """디바이스와 호스트 설정 비교용 투영: 페이지 수/이름 + 버튼 라벨·색·액션.
+
+    이미지(base64/바이트)는 표시용 파생물이라 비교에서 제외 — 한글/이모지 라벨은 label로
+    재현되므로 설정(라벨·색·액션)이 같으면 이미지도 자연히 같아진다. 빈 호스트가 디바이스
+    내용을 지우는 원래 버그를 설정 비교만으로 정확히 잡아낸다.
+    """
+    pages = config.get("pages") or []
+    proj = []
+    for p in pages:
+        name = (p.get("name") or "").strip()
+        btns = []
+        for b in (p.get("buttons") or [])[:BUTTONS_PER_PAGE]:
+            btns.append(((b.get("label") or "").strip(),
+                         int(b.get("color") or 0),
+                         b.get("action_type") or "shortcut",
+                         (b.get("action_value") or "").strip()))
+        proj.append((name, tuple(btns)))
+    return (len(pages), tuple(proj))
+
+
 class MacroPadGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -1138,7 +1202,13 @@ class MacroPadGUI:
         self.root.resizable(True, True)
         self.root.minsize(520, 560)
 
-        self.config_path = Path(__file__).resolve().parent / "macro_config.json"
+        if getattr(sys, "frozen", False):
+            # [패키징] .app 번들 안은 읽기 전용이므로 설정 파일은 사용자 Application Support에 저장
+            app_support = Path.home() / "Library" / "Application Support" / "CYD Macro Pad"
+            app_support.mkdir(parents=True, exist_ok=True)
+            self.config_path = app_support / "macro_config.json"
+        else:
+            self.config_path = Path(__file__).resolve().parent / "macro_config.json"
         self.config = self._load_config()          # dict (런타임 스냅샷: 메인/리스너가 lock으로 읽음)
 
         # [PLAN] 언어 설정 (호스트 표시 전용 — config에만 저장, 와이어 프로토콜 무관)
@@ -1170,6 +1240,12 @@ class MacroPadGUI:
         self._pushed_ip: str | None = None         # 이번 세션에서 전체 푸시한 디바이스 IP (1회 푸시 판정)
         self._dump = None                           # 리스너 스레드 전용 MREQ 덤프 수집 상태 (None=미수집)
         self._dump_queue: "queue.Queue[tuple]" = queue.Queue()   # 메인→리스너: ("dump_start", ip)
+        # [DBG] 리스너 진단 로그 경로 (Application Support — 창 모드 앱도 쓸 수 있는 곳)
+        self._debug_log_path = Path.home() / "Library" / "Application Support" / "CYD Macro Pad" / "listener_debug.log"
+        try:
+            self._debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
         self.setup_ui_style()
         self.create_widgets()
@@ -2016,7 +2092,7 @@ class MacroPadGUI:
         if not self._listener_running:
             messagebox.showerror(_t("msg_devimport_title"), _t("msg_listener_down"))
             return
-        self._dump_queue.put(("dump_start", ip))
+        self._dump_queue.put(("dump_start", ip, UDP_PORT, False))   # auto=False: 수동 불러오기
         self._log(_tf("log_device_import_req", ip))
 
     def _apply_dump_config(self, config: dict, n_img_recv: int = 0) -> None:
@@ -2047,6 +2123,44 @@ class MacroPadGUI:
         self._populate_from_config()
         if self._page_tabs:
             self.notebook.select(self._page_tabs[0])
+
+    def _ask_yesno(self, title: str, msg: str) -> bool:
+        """예/아니오 질문. macOS에서 메시지박스가 메인 창 뒤로 숨는 문제 방지.
+
+        기본 messagebox는 parent가 없으면 앱 활성화 상태에 따라 메인 창 뒤에 숨어
+        안 보일 수 있다 (보고된 "멈춤" 증상의 원인 — 코드는 정상 실행 중이었음).
+        루트를 앞으로 올리고 parent를 명시해 대화창이 항상 앞에 보이게 한다.
+        """
+        try:
+            self.root.lift()
+            self.root.focus_force()
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+        return messagebox.askyesno(parent=self.root, title=title, message=msg)
+
+    def _handle_auto_sync(self, config: dict, n_img: int, ip: str, port: int) -> None:
+        """[동기화 보호] 첫 연결 시 디바이스 설정과 호스트 설정을 비교해 방향을 묻는다.
+
+        무조건 푸시하면 빈(신규) 호스트가 디바이스 설정을 지울 수 있어, MREQ 덤프로
+        디바이스 설정을 읽어 호스트와 다르면 사용자에게 묻는다 (메인 스레드).
+          - [예]     → 디바이스 설정을 호스트로 불러옴 (디바이스는 이미 그 내용이라 재푸시 안 함)
+          - [아니오] → 아무것도 안 함 — 디바이스 보호 (다음 실행 시 다시 질문)
+        동일하면 푸시/질문 없이 조용히 통과.
+        """
+        dev_proj = _settings_projection(config)
+        host_proj = _settings_projection(self.config)
+        self._debug_log("[autosync] ip=%s equal=%s dev_pages=%d host_pages=%d"
+                        % (ip, dev_proj == host_proj, len(dev_proj[1]), len(host_proj[1])))
+        if dev_proj == host_proj:
+            self._log(_tf("log_autosync_same", ip))
+            return
+        ask = self._ask_yesno(_t("msg_autosync_title"), _tf("msg_autosync_ask", ip))
+        if ask:
+            self._apply_dump_config(config, n_img)
+            self._log(_tf("log_autosync_loaded", ip))
+        else:
+            self._log(_tf("log_autosync_none", ip))
 
     # ------------------------------------------------------------------
     # 설정 적용 (Apply)
@@ -2100,7 +2214,7 @@ class MacroPadGUI:
             name = pages[page].get("name", "") if page < len(pages) else ""
             # [H] 큰 페이지는 MCFG 여러 청크로 분할 (MTU 1472 방지, bid별 갱신으로 합쳐짐)
             for pkt in chunk_config_packets(page, btns, num_pages, name):
-                sock.sendto(pkt, (ip, port))
+                self._safe_sendto(sock, pkt, (ip, port))
 
     def _push_config(self, sock: socket.socket, ip: str, port: int, retries: int = 1,
                      reason: str = "푸시") -> None:
@@ -2157,7 +2271,7 @@ class MacroPadGUI:
                         self._img_cache[key] = jpeg
                     keys.add(key)
                     for pkt in build_image_packets(page, bid, jpeg):
-                        sock.sendto(pkt, (ip, port))
+                        self._safe_sendto(sock, pkt, (ip, port))
                     continue
 
                 # (2) 한글(비-ASCII) 라벨 → 텍스트를 71x61 JPEG로 렌더해 전송
@@ -2187,14 +2301,14 @@ class MacroPadGUI:
                         self._img_cache[key] = jpeg
                         rendered += 1
                     for pkt in build_image_packets(page, bid, jpeg):
-                        sock.sendto(pkt, (ip, port))
+                        self._safe_sendto(sock, pkt, (ip, port))
                     continue
 
                 # (3) ASCII/빈 라벨 → clear(fmt=1): 디바이스의 구 이미지를 제거하고 텍스트로 폴백.
                 #     매 푸시마다 보내 호스트/디바이스 재시작 후에도 의도가 수렴된다.
                 #     (한글→ASCII 전환 시 남는 스테일 이미지 제거 — 펌웨어는 이미지 없으면 no-op)
                 keys.add((page, bid, "clear"))
-                sock.sendto(build_image_packet(page, bid, b"", 1), (ip, port))
+                self._safe_sendto(sock, build_image_packet(page, bid, b"", 1), (ip, port))
         # 캐시 정리: 더 이상 존재하지 않는 키(버튼/라벨/색/이미지 변경) 제거
         for k in list(self._img_cache):
             if k not in keys:
@@ -2206,6 +2320,31 @@ class MacroPadGUI:
     # ------------------------------------------------------------------
     # 리스너 스레드 (UDP 수신 + 액션 실행)
     # ------------------------------------------------------------------
+    def _debug_log(self, msg: str) -> None:
+        """[DBG] 리스너 스레드 진단 로그 (파일). 창 모드 앱은 stderr이 /dev/null이라
+        파일로 남긴다. 문제 진단/회귀 확인용으로 유지."""
+        try:
+            with open(self._debug_log_path, "a", encoding="utf-8") as f:
+                f.write("[dbg] %s\n" % msg)
+        except Exception:
+            pass
+
+    def _safe_sendto(self, sock: socket.socket, data: bytes, addr) -> bool:
+        """UDP 전송 — 리스너 스레드가 sendto 에러로 죽지 않게 보호한다.
+
+        macOS UDP는 도달 불가(ARP 실패/EHOSTUNREACH)나 ICMP 오류가 소켓에 큐잉되어
+        다음 sendto/recvfrom을 OSError로 터뜨릴 수 있다. 무조건 푸시처럼 멀티캐스트
+        전송 중 실패하면 리스너가 통째로 죽어 "설정 비교에서 멈춤"이 된다. 여기서는
+        전송 실패를 무시하고 수신 루프를 계속 유지한다 (비콘→ACK 루프가 자가치유).
+        성공 시 True, 실패 시 False.
+        """
+        try:
+            sock.sendto(data, addr)
+            return True
+        except OSError as e:
+            self._debug_log("sendto %s → %s: %s" % (addr, e))
+            return False
+
     def _start_listener(self) -> None:
         """리스너 자동 시작: 고정 포트 UDP_PORT(8890)로 바인드해 실시간 수신."""
         if self._listener_running:
@@ -2235,6 +2374,9 @@ class MacroPadGUI:
 
         bind → 시작 시 설정 1회 → 수신 루프(+하트비트/재전송 요청 처리) → finally: close.
         """
+        # [DBG] 리스너 스레드 생명주기/예외를 파일로 기록 (윈도우 모드 앱은 stderr이 /dev/null)
+        self._debug_log("[listener] start t=%s port=%d" % (time.time(), port))
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -2242,6 +2384,7 @@ class MacroPadGUI:
         except OSError as e:
             self._listener_running = False
             self._event_queue.put(("log", _tf("log_bind_fail", port, e), True))
+            self._debug_log("[listener] BIND FAIL %s" % e)
             try:
                 sock.close()
             except OSError:
@@ -2253,9 +2396,11 @@ class MacroPadGUI:
         with self._config_lock:
             ip = self.config.get("device_ip", "") or ""
         if _is_valid_ip(ip):
-            # [H] 호스트 시작 시 1회 푸시 (IP 아는 경우에만) + 세션 첫 푸시로 기록
+            # [H] 호스트 시작 시 무조건 푸시하지 않고, MREQ로 디바이스 설정을 읽어 호스트와
+            #     비교 후 방향을 묻는다 (동기화 보호). IP를 아는 건 이전 연결 기록이므로
+            #     _pushed_ip를 미리 세워 비콘이 이중 트리거하지 않게 한다.
             self._pushed_ip = ip
-            self._push_config(sock, ip, port, retries=1, reason="호스트 시작")
+            self._dump_queue.put(("dump_start", ip, port, True))
 
         try:
             while self._listener_running:
@@ -2293,22 +2438,43 @@ class MacroPadGUI:
                     msg = self._dump_queue.get_nowait()
                     if msg[0] == "dump_start":
                         dip = msg[1]
-                        sock.sendto(build_mreq_packet(), (dip, UDP_PORT))
-                        self._dump = {"pages": {}, "images": {}, "num_pages": None,
-                                      "device_ip": dip, "start": time.time(), "last_pkt": time.time()}
-                        # [H] 경쟁 방지: 불러오기 직후 첫 비콘 푸시를 억제한다.
-                        #     _pushed_ip가 None(아직 미발견)인 채로 불러오기를 하면, 덤프 완료로 호스트
-                        #     config가 디바이스 데이터로 채워진 뒤 들어오는 첫 비콘이 "새 IP"로 오인돼
-                        #     방금 불러온 설정을 디바이스로 재푸시("Apply 안 눌렀는데 적용")한다.
-                        self._pushed_ip = dip
-                        sock.settimeout(0.5)   # 수집 중 더 자주 기상해 quiet 판정
+                        dport = msg[2] if len(msg) > 2 else UDP_PORT
+                        auto = msg[3] if len(msg) > 3 else False
+                        # [FIX] MREQ 발송 실패(일시적 ARP/ICMP "No route to host" 등) 시 리스너가
+                        #     죽지 않도록 _safe_sendto로 보호. 전송에 성공했을 때만 덤프를 수집하고,
+                        #     실패하면 _pushed_ip를 풀어 다음 비콘이 자동 비교를 재시도한다
+                        #     (안 풀면 "설정 비교에서 멈춤"이 되어 디바이스와 비교가 아예 안 된다).
+                        sent = self._safe_sendto(sock, build_mreq_packet(), (dip, UDP_PORT))
+                        if sent:
+                            self._dump = {"pages": {}, "images": {}, "num_pages": None,
+                                          "device_ip": dip, "device_port": dport, "auto": auto,
+                                          "start": time.time(), "last_pkt": time.time()}
+                            # [H] 경쟁 방지: 불러오기 직후 첫 비콘 푸시를 억제한다.
+                            #     _pushed_ip가 None(아직 미발견)인 채로 불러오기를 하면, 덤프 완료로 호스트
+                            #     config가 디바이스 데이터로 채워진 뒤 들어오는 첫 비콘이 "새 IP"로 오인돼
+                            #     방금 불러온 설정을 디바이스로 재푸시("Apply 안 눌렀는데 적용")한다.
+                            self._pushed_ip = dip
+                            sock.settimeout(0.5)   # 수집 중 더 자주 기상해 quiet 판정
+                        else:
+                            self._pushed_ip = None   # [FIX] 다음 비콘이 자동 비교 재시도
                 except queue.Empty:
                     pass
 
                 # [H] 덤프 완료/타임아웃 판정
                 self._maybe_finalize_dump(sock)
+        except BaseException:
+            # [DBG] 리스너 스레드 비정상 종료 → 예외를 파일로 남긴다
+            try:
+                with open(self._debug_log_path, "a", encoding="utf-8") as f:
+                    f.write("[listener] CRASH t=%s\n" % time.time())
+                    traceback.print_exc(file=f)
+                    f.write("---\n")
+            except Exception:
+                pass
+            raise
         finally:
             # [FIX #1] 소켓은 리스너 스레드에서만 닫는다. 메인 스레드는 절대 닫지 않음.
+            self._debug_log("[listener] exit t=%s" % time.time())
             sock.close()
             self._log("리스너 스레드 종료", debug=True)
 
@@ -2334,16 +2500,31 @@ class MacroPadGUI:
                 len(d["pages"].get(p, {}).get("buttons", {})) >= BUTTONS_PER_PAGE
                 for p in range(d["num_pages"]))
         if complete or (now - d["start"]) >= 5.0:
+            auto = d.get("auto", False)
+            ip = d.get("device_ip", "")
             self._dump = None
             sock.settimeout(2.0)   # 정상 타임아웃 복원
             # [H] 진단: MREQ 덤프로 받은 이미지 패킷 수 — 0이면 디바이스 플래시에 이미지가
             #     없거나 유실된 것. build_config_from_dump 결과와 함께 로그로 남긴다.
             n_img = len(d.get("images") or {})
             config = build_config_from_dump(d)
+            self._debug_log("[dump] auto=%s ip=%s num_pages=%s pages=%s imgs=%d complete=%s"
+                            % (auto, ip, d.get("num_pages"),
+                               sorted(d.get("pages", {}).keys()), n_img, complete))
             if config is None:
-                self._event_queue.put(("dump_fail", _t("log_dump_fail")))
+                if auto:
+                    # [동기화 보호] 자동 비교 실패(오프라인 등)는 조용히 건너뛰고 _pushed_ip를
+                    #     풀어 다음 비콘이 재시도하게 한다 (디바이스가 오프라인이면 비콘도 안 옴).
+                    self._pushed_ip = None
+                    self._event_queue.put(("auto_sync_fail", ip))
+                else:
+                    self._event_queue.put(("dump_fail", _t("log_dump_fail")))
             else:
-                self._event_queue.put(("dump_ready", (config, n_img)))
+                if auto:
+                    self._event_queue.put(("auto_sync_ready",
+                                           (config, n_img, ip, d.get("device_port", UDP_PORT))))
+                else:
+                    self._event_queue.put(("dump_ready", (config, n_img)))
 
     def _handle_event_packet(self, sock: socket.socket, data: bytes, addr) -> None:
         parsed = parse_event_packet(data)
@@ -2377,10 +2558,7 @@ class MacroPadGUI:
         """
         magic = MAGIC_OK if ok else MAGIC_ERR
         pkt = EVENT_HEADER.pack(magic, page, button, 0, 0)
-        try:
-            sock.sendto(pkt, (addr[0], UDP_PORT))
-        except OSError:
-            pass
+        self._safe_sendto(sock, pkt, (addr[0], UDP_PORT))
 
     def _handle_beacon(self, sock: socket.socket, addr, port: int) -> None:
         """디스커버리 비콘("MPBE") 수신 — H 동기화 재설계.
@@ -2388,7 +2566,9 @@ class MacroPadGUI:
         3초마다 전체 재푸시하던 것을 제거하고:
           (a) 호스트 IP·포트 학습용 **ACK**(MCFG count=0, ~12B) 유니캐스트 회신
               → 디바이스가 호스트 IP 변경을 재실행 없이 자가치유.
-          (b) 전체 설정+이미지 푸시는 **새 디바이스 IP의 첫 비콘에만** (세션당 1회, _pushed_ip)
+          (b) 새 디바이스 IP의 첫 비콘: **무조건 푸시하지 않고** MREQ로 디바이스 설정을
+              읽어 호스트와 비교 후 방향을 묻는다 (동기화 보호 — 빈 호스트가 디바이스를
+              지우는 것 방지). 비교·질문은 메인 스레드, 1회는 _pushed_ip 가드 (세션당 1회).
         """
         device_ip = addr[0]
         is_new = False
@@ -2404,11 +2584,11 @@ class MacroPadGUI:
         # (a) ACK: 디바이스가 소스 IP/포트만 학습 (count=0 → 상태 변화 없음)
         with self._config_lock:
             num_pages = len(self.config.get("pages") or [])
-        sock.sendto(build_ack_packet(num_pages), (device_ip, UDP_PORT))
-        # (b) 전체 설정+이미지는 새 디바이스 IP의 첫 비콘에만 1회
+        self._safe_sendto(sock, build_ack_packet(num_pages), (device_ip, UDP_PORT))
+        # (b) 새 디바이스 IP의 첫 비콘: 자동 비교 덤프 시작 (재비콘 재트리거는 _pushed_ip로 방지)
         if device_ip != self._pushed_ip:
             self._pushed_ip = device_ip
-            self._push_config(sock, device_ip, port, retries=1, reason="첫 비콘")
+            self._dump_queue.put(("dump_start", device_ip, port, True))
 
     def _apply_detected_ip(self, ip: str, msg: str) -> None:
         """자동 검색된 디바이스를 상태바에 반영 (메인 스레드)."""
@@ -2501,6 +2681,12 @@ class MacroPadGUI:
                 elif item[0] == "dump_ready":   # [H] 디바이스 덤프 수신 완료 (config, 수신 이미지 수)
                     _, (config, n_img) = item   # [FIX] 생산자는 ("dump_ready", (config, n_img)) 중첩 튜플
                     self._apply_dump_config(config, n_img)
+                elif item[0] == "auto_sync_ready":  # [동기화 보호] 첫 연결 자동 비교 완료
+                    _, (config, n_img, ip, port) = item
+                    self._handle_auto_sync(config, n_img, ip, port)
+                elif item[0] == "auto_sync_fail":   # [동기화 보호] 자동 비교 실패 (로그만)
+                    _, ip = item
+                    self._log(_tf("log_autosync_fail", ip), error=True)
                 elif item[0] == "dump_fail":    # [H] 덤프 수집 실패/타임아웃
                     _, msg = item
                     self._log(msg, error=True)
