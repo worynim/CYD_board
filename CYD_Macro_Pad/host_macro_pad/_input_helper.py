@@ -45,9 +45,25 @@ def _cmd_key():
     return Key.ctrl
 
 
+def _win_key():
+    """win/windows 키 (⊞ 윈도우 키).
+
+    Windows : Key.cmd_l (LWIN). cmd(→Ctrl)와 달리 실제 윈도우 키로 동작한다.
+              예: win+r → 실행 대화상자, win+l → 잠금.
+    macOS/Linux : 실제 윈도우 키가 없으므로 OS 메타 키(Key.cmd)로 폴백.
+    """
+    if sys.platform == "win32":
+        # pynput 전 버전에 존재하는 cmd_l(LWIN) 우선, 없으면 cmd 폴백
+        return getattr(Key, "cmd_l", getattr(Key, "cmd", Key.ctrl))
+    if hasattr(Key, "cmd"):
+        return Key.cmd
+    return Key.ctrl
+
+
 # macOS 한정 키는 플랫폼마다 없을 수 있어 getattr로 방어
 _KEY_MAP = {
     "cmd": _cmd_key(), "command": _cmd_key(),
+    "win": _win_key(), "windows": _win_key(),
     "ctrl": Key.ctrl, "control": Key.ctrl,
     "alt": Key.alt, "option": Key.alt,
     "shift": Key.shift,
