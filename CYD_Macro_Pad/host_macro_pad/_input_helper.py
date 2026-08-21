@@ -3,9 +3,10 @@
 """
 매크로 패드 입력 헬퍼 (격리 서브프로세스)
 
-pynput(Quartz/CGEventPost)은 네이티브 코드라 드물게 프로세스를 통째로 죽일 수 있다
-(try/except로 잡을 수 없는 세그폴트 등). 이 크래시가 호스트 GUI를 죽이지 않도록,
-키보드 입력(단축키/붙여넣기)만 담당하는 별도 프로세스로 분리한다.
+pynput(네이티브 입력: macOS Quartz / Windows SendInput)은 네이티브 코드라 드물게
+프로세스를 통째로 죽일 수 있다 (try/except로 잡을 수 없는 세그폴트 등).
+이 크래시가 호스트 GUI를 죽이지 않도록, 키보드 입력(단축키/붙여넣기)만
+담당하는 별도 프로세스로 분리한다.
 
 GUI는 이 헬퍼를 subprocess로 호출하고, 헬퍼가 죽더라도 GUI는 살아남아
 이벤트 로그에 실패를 표시한다.
@@ -17,8 +18,10 @@ GUI는 이 헬퍼를 subprocess로 호출하고, 헬퍼가 죽더라도 GUI는 �
 """
 
 import json
+import os
 import subprocess
 import sys
+import tempfile
 
 try:
     from pynput.keyboard import Controller, Key, KeyCode
@@ -26,9 +29,25 @@ except ImportError:
     print("ERROR: pynput 미설치 (pip install -r requirements.txt)", file=sys.stderr)
     sys.exit(2)
 
+
+def _cmd_key():
+    """cmd/command 키 해석.
+
+    macOS : Key.cmd (실제 커맨드 키).
+    Windows: pynput 1.8+에는 Key.cmd가 VK.LWIN(윈도우 키)으로 존재하지만,
+             Win+... 조합은 OS가 가로채 유용하지 않다. 관례대로 cmd → Ctrl로
+             해석하면 기존 macOS 설정(cmd+...)을 그대로 쓸 수 있다.
+             (구버전 pynput은 Key.cmd가 아예 없어 getattr 없이는 import 크래시)
+    Linux : Super(Key.cmd)보다 Ctrl이 관례.
+    """
+    if sys.platform == "darwin":
+        return Key.cmd
+    return Key.ctrl
+
+
 # macOS 한정 키는 플랫폼마다 없을 수 있어 getattr로 방어
 _KEY_MAP = {
-    "cmd": Key.cmd, "command": Key.cmd,
+    "cmd": _cmd_key(), "command": _cmd_key(),
     "ctrl": Key.ctrl, "control": Key.ctrl,
     "alt": Key.alt, "option": Key.alt,
     "shift": Key.shift,
@@ -110,16 +129,61 @@ def exec_shortcut(s: str) -> None:
         kb.release(a)
 
 
+def _set_clipboard(text: str) -> None:
+    """클립보드에 텍스트를 설정한다 (플랫폼별 OS 명령).
+
+    macOS : pbcopy (UTF-8 stdin)
+    Windows: PowerShell Set-Clipboard. clip.exe는 콘솔 코드페이지(CP949 등) 의존이라
+             한글이 깨질 수 있어, BOM 포함 UTF-8 임시 파일을 만들어
+             Get-Content -Encoding UTF8 -Raw로 읽어 넣는다 (코드페이지와 무관하게 안전).
+    Linux : xclip -selection clipboard
+    """
+    # 클립보드 설정은 best-effort: 실패하면 기존 클립보드가 붙여넣어질 뿐이고,
+    # OSError(pbcopy/powershell/xclip 부재 등)로 헬퍼 자체는 죽지 않는다.
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
+        except OSError:
+            pass
+    elif sys.platform == "win32":
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(b"\xef\xbb\xbf" + text.encode("utf-8"))   # BOM → PS 5.1도 확실히 UTF-8
+            try:
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-Content -Encoding UTF8 -LiteralPath '%s' -Raw | Set-Clipboard" % path],
+                    check=False)
+            except OSError:
+                pass
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    else:
+        try:
+            subprocess.run(["xclip", "-selection", "clipboard"],
+                           input=text.encode("utf-8"), check=False)
+        except OSError:
+            pass
+
+
 def exec_text(text: str) -> None:
-    """클립보드 + Cmd+V: IME 상태와 무관하게 한글 포함 텍스트 입력 (macOS)."""
+    """클립보드 + 붙여넣기: IME 상태와 무관하게 한글 포함 텍스트 입력.
+
+    macOS : pbcopy + Cmd+V  /  Windows: Set-Clipboard + Ctrl+V
+    """
     if not text:
         return
-    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
+    _set_clipboard(text)
     kb = Controller()
-    kb.press(Key.cmd)
+    paste = Key.cmd if sys.platform == "darwin" else Key.ctrl
+    kb.press(paste)
     kb.press("v")
     kb.release("v")
-    kb.release(Key.cmd)
+    kb.release(paste)
 
 
 def main() -> None:

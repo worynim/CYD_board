@@ -6,19 +6,21 @@ CYD 무선 매크로 패드 호스트 (CYD Macro Pad Host)
 CYD(ESP32-2432S028, 2.8" 터치 LCD)의 버튼 그리드를 터치하면 디바이스가 UDP 이벤트를
 보내고, 이 호스트가 이를 수신해 액션을 실행한다.
   - shortcut : 키보드 단축키 (예: cmd+shift+4)          → 격리된 헬퍼(_input_helper.py)
-  - text     : 문구/텍스트 입력 (한글 포함, IME 무관)     → 격리된 헬퍼(pbcopy + Cmd+V)
-  - app      : 앱 실행 또는 URL 열기                     → open -a / open
+  - text     : 문구/텍스트 입력 (한글 포함, IME 무관)     → 격리된 헬퍼(클립보드 + 붙여넣기)
+  - app      : 앱 실행 또는 URL 열기                     → macOS open / 윈도우 os.startfile
 
 실행:
     pip install -r requirements.txt
     python3 macro_pad_gui.py
 
-macOS 접근성 권한 (키보드 입력에 필수):
-    시스템설정 → 개인정보 보호 및 보안 → 손쉬운 사용 → 터미널(또는 Python) 체크.
-    권한이 없으면 키보드/문구 액션은 조용히 무시된다.
+플랫폼별 키보드 입력 권한:
+    macOS: 시스템설정 → 개인정보 보호 및 보안 → 손쉬운 사용 → 터미널(또는 Python) 체크.
+           권한이 없으면 키보드/문구 액션은 조용히 무시된다.
+    Windows: 별도 권한 불필요 (pynput이 SendInput 사용).
 
 크래시 격리 (중요):
-    pynput(Quartz CGEventPost)은 네이티브 코드라 드물게 프로세스를 통째로 죽일 수 있다.
+    pynput(네이티브 입력: macOS Quartz / Windows SendInput)은 네이티브 코드라 드물게
+    프로세스를 통째로 죽일 수 있다.
     그래서 키보드 입력은 반드시 _input_helper.py 서브프로세스에서 실행한다 —
     헬퍼가 세그폴트로 죽어도 GUI는 살아남고 이벤트 로그에 실패만 남긴다.
     GUI 프로세스 자체에는 pynput이 전혀 import되지 않는다.
@@ -294,8 +296,8 @@ L10N = {
     "help_act_text": {"ko": "▪ 문구 (text) — 입력할 문자열. 예: ",
                       "en": "▪ Text — the string to type. e.g. "},
     "help_act_text_ime": {"ko": " (한글 포함 가능).\n", "en": " (Korean included).\n"},
-    "help_act_text_ime_sub": {"ko": "    클립보드(pbcopy) + Cmd+V 방식이라 한/영 입력기(IME)와 무관하게 동작합니다.\n",
-                              "en": "    Uses clipboard (pbcopy) + Cmd+V, so it works regardless of the IME.\n"},
+    "help_act_text_ime_sub": {"ko": "    클립보드 + 붙여넣기(맥 Cmd+V / 윈도우 Ctrl+V) 방식이라 한/영 입력기(IME)와 무관하게 동작합니다.\n",
+                              "en": "    Uses clipboard + paste (Cmd+V on macOS / Ctrl+V on Windows), so it works regardless of the IME.\n"},
     "help_act_app": {"ko": "▪ app / URL — \"", "en": "▪ App / URL — \""},
     "help_act_app_ex": {"ko": "    - 앱 예: Safari, Calculator, Notes   (Finder에 보이는 영문 이름)\n",
                         "en": "    - App e.g. Safari, Calculator, Notes   (English name as in Finder)\n"},
@@ -402,7 +404,8 @@ def _helper_executable() -> Path:
     if getattr(sys, "frozen", False):
         # onefile 실행 시 sys._MEIPASS는 추출용 임시 디렉터리(번들 데이터 위치)
         base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-        return base / "helper" / "macro_input_helper"
+        name = "macro_input_helper" + (".exe" if sys.platform == "win32" else "")
+        return base / "helper" / name
     return Path(__file__).resolve().parent / "_input_helper.py"
 
 
@@ -2630,12 +2633,26 @@ class MacroPadGUI:
             return
         if not _pynput_installed():
             raise RuntimeError(_t("err_pynput_missing"))
-        # pbcopy + Cmd+V: IME 상태와 무관하게 한글 포함 텍스트 입력 (macOS)
+        # 클립보드 + 붙여넣기(맥 Cmd+V / 윈도우 Ctrl+V): IME 상태와 무관하게 한글 포함 텍스트 입력
         run_input_helper("text", text)    # 격리된 서브프로세스에서 실행
 
     def _exec_app(self, value: str) -> None:
         value = value.strip()
         if not value:
+            return
+        if sys.platform == "win32":
+            # Windows: os.startfile — URL이면 기본 브라우저, 파일이면 연결된 프로그램으로 연다.
+            # "calc"처럼 확장자가 없는 실행 이름은 .exe를 붙여 PATH에서 재탐색한다.
+            try:
+                os.startfile(value)
+            except OSError:
+                if "://" not in value and "." not in os.path.basename(value):
+                    try:
+                        os.startfile(value + ".exe")
+                    except OSError as e:
+                        raise RuntimeError(_tf("err_app_os", e))
+                else:
+                    raise RuntimeError(_tf("err_app_os", e))
             return
         if "://" in value:
             cmd = ["open", value]                    # URL
