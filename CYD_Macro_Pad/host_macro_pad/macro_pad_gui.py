@@ -1456,7 +1456,7 @@ class MacroPadGUI:
                               ("pressed", _shade_hex(bg, -16))],
                   foreground=[("active", fg), ("pressed", fg)])
         return ttk.Button(parent, text=text, command=command, style=tag,
-                          cursor="pointinghand", **kw)
+                          cursor="hand2", **kw)
 
     # ------------------------------------------------------------------
     # 위젯 구성
@@ -2933,3 +2933,4 @@ if __name__ == "__main__":
             sys.exit(1)
         sys.exit(0)
     main()
+
