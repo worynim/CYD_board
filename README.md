@@ -28,7 +28,7 @@ PC(Mac/Windows)의 화면을 Wi-Fi로 실시간 스트리밍해 CYD에 표시하
 
 CYD 화면에 4×3 터치 버튼 그리드를 띄우고, 버튼을 누르면 Mac 호스트가 설정된 액션(단축키/문구/앱 실행)을 실행하는 Stream Deck 클론.
 
-- **주요 기능:** 최대 8페이지×12버튼, 이미지 버튼/한글 라벨(이미지 렌더), 액션 실행 피드백(초록/빨강 점멸), 백라이트 자동 조절(CDS), 설정 내보내기/가져오기, 디바이스 내장 저장(LittleFS) + 디바이스에서 불러오기
+- **주요 기능:** 최대 8페이지×12버튼, 페이지 탭 드래그 순서 변경(자동 동기화) + 페이지 롤링 이동(마지막↔첫 페이지), F1~F20 단축키, 이미지 버튼/한글 라벨(고품질, 청킹 전송), 액션 실행 피드백(초록/빨강 점멸), 백라이트 자동 조절(CDS), 설정 내보내기/가져오기, 디바이스 내장 저장(LittleFS) + 디바이스에서 불러오기
 - **실행:** `CYD_Macro_Pad/host_macro_pad`에서 `pip install -r requirements.txt` → `python3 macro_pad_gui.py`
   (macOS 키보드 입력은 **손쉬운 사용(Accessibility) 권한** 필요)
 - **구성:** `CYD_Macro_Pad.ino`(펌웨어, LovyanGFX+JPEGDEC) + `host_macro_pad/macro_pad_gui.py`(호스트)

@@ -46,6 +46,11 @@ _KEY_MAP = {
 for _fn in ("fn", "insert", "print_screen"):
     if hasattr(Key, _fn):
         _KEY_MAP[_fn] = getattr(Key, _fn)
+# F1~F20 (pynput Key.f1..f20). 플랫폼마다 없는 키는 hasattr로 방어.
+for _i in range(1, 21):
+    _fn = "f%d" % _i
+    if hasattr(Key, _fn):
+        _KEY_MAP[_fn] = getattr(Key, _fn)
 
 
 def exec_shortcut(s: str) -> None:

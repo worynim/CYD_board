@@ -160,7 +160,9 @@ static LGFX lcd;
 #define LABEL_MAX        24              // 라벨 최대 바이트 (호스트와 동일)
 #define PAGE_NAME_MAX    20              // 페이지 이름 최대 바이트 (호스트와 동일, A)
 #define BTN_COLOR_COUNT  10              // 버튼 팔레트 색 수 (호스트 COLOR_NAMES와 일치)
-#define IMG_MAX_BYTES    2048            // [G] 단일 이미지(JPEG) 바이트 상한 (방어 — 호스트는 ≤1400 맞춤)
+#define IMG_MAX_BYTES    4096            // [G] 단일 이미지(JPEG) 바이트 상한 — fmt=2 청킹 이미지 총 상한(호스트와 일치)
+#define IMG_CHUNK_DATA   1400            // [G] fmt=2 청크당 데이터 바이트 (8B MIMG + 8B 서브헤더 + 1400B = 1416 < MTU 1472)
+#define IMG_MAX_CHUNKS   16              // [G] fmt=2 최대 청크 수 (4096/1400 = 3, 16은 여유) — 비트마스크 u32 안
 #define IMG_REDRAW_DELAY 50              // [G] 이미지 배치 도착 후 재렌더 debounce(ms) — 버스트 1회 합침
 #define IMG_BUDGET_BYTES (96 * 1024)     // [G] 이미지 RAM 총 예산 (내부 DRAM, 최대 96장×1KB).
                                          //     [H] 거부 로직 제거 — 이미지는 LittleFS(/btns)에 저장되고
@@ -308,6 +310,15 @@ typedef struct {
 static PendingImage imgPending[IMG_PENDING_QUEUE] = {};
 static volatile uint16_t imgPendingHead = 0, imgPendingTail = 0;
 static portMUX_TYPE imgPendingMux = portMUX_INITIALIZER_UNLOCKED;
+
+// [G] fmt=2 청킹 이미지 재조립 상태 (onImagePacket에서만 접근 — AsyncUDP 콜백 단일 컨텍스트).
+//     모든 청크가 도착하면 완성 버퍼를 imgPending에 fmt=0으로 넘기고 상태를 리셋한다.
+//     새 이미지가 시작되면(첫 청크 or page/bid/total/chunks 변경) 이전 조립 버퍼는 폐기된다.
+static uint8_t*  imgAssemBuf   = nullptr;   // 조립 중 버퍼 (완성 시 소유권은 imgPending으로 이전)
+static uint32_t  imgAssemTotal = 0;         // 전체 JPEG 길이
+static uint16_t  imgAssemChunks = 0;        // 총 청크 수
+static uint32_t  imgAssemGot   = 0;         // 수신 청크 비트마스크 (중복 무시)
+static uint8_t   imgAssemPage  = 0, imgAssemBid = 0;   // 대상 버튼
 
 // [H] MREQ 수신 → loop()로 이전 (AsyncUDP 콜백에서 LittleFS I/O/UDP 전송 금지 — 교차 코어 안전).
 //     콜백은 mux 아래 필드만 세우고, loop()가 소비해 실제 덤프를 전송한다.
@@ -898,7 +909,7 @@ void onImagePacket(AsyncUDPPacket packet) {
   //     스테일 이미지 제거) — 큐에 기록만 하고 free는 loop()가 수행한다.
   if (fmt == 1) {
     // 위 pi 기본값 그대로 (buf=nullptr, len=0)
-  } else if (fmt == 0) {                       // format 0 = JPEG
+  } else if (fmt == 0) {                       // format 0 = JPEG (≤1400B 단일 패킷)
     size_t jlen = len - 8;
     if (jlen == 0 || jlen > IMG_MAX_BYTES) return;
     uint8_t* buf = (uint8_t*)malloc(jlen);
@@ -909,6 +920,39 @@ void onImagePacket(AsyncUDPPacket packet) {
     memcpy(buf, d + 8, jlen);
     pi.buf = buf;
     pi.len = (uint16_t)jlen;
+  } else if (fmt == 2) {                       // format 2 = 청킹 이미지 (8B MIMG + 8B 서브헤더 >IHH)
+    if (len < 16) return;
+    uint32_t total  = ((uint32_t)d[8] << 24) | ((uint32_t)d[9] << 16) | ((uint32_t)d[10] << 8) | d[11];
+    uint16_t chunks = ((uint16_t)d[12] << 8) | d[13];
+    uint16_t idx    = ((uint16_t)d[14] << 8) | d[15];
+    if (chunks == 0 || chunks > IMG_MAX_CHUNKS || total == 0 || total > IMG_MAX_BYTES || idx >= chunks) return;
+    size_t chunkLen = len - 16;
+    size_t off = (size_t)idx * IMG_CHUNK_DATA;
+    if (off + chunkLen > total) return;        // 서브헤더와 실제 크기 불일치 방어
+
+    // 새 세션 시작: 첫 청크, 또는 대상/크기가 다르면 이전 조립 상태 폐기 후 재시작
+    if (imgAssemBuf == nullptr || idx == 0 ||
+        imgAssemPage != page || imgAssemBid != bid ||
+        imgAssemTotal != total || imgAssemChunks != chunks) {
+      if (imgAssemBuf) free(imgAssemBuf);
+      imgAssemBuf = (uint8_t*)malloc(total);
+      if (!imgAssemBuf) {
+        Serial.println("[IMG] 청킹 조립 malloc 실패");
+        imgAssemTotal = 0; imgAssemChunks = 0; imgAssemGot = 0;
+        return;
+      }
+      imgAssemTotal = total; imgAssemChunks = chunks; imgAssemGot = 0;
+      imgAssemPage = page; imgAssemBid = bid;
+    }
+    if (imgAssemGot & ((uint32_t)1 << idx)) return;   // 중복 청크 → 무시
+    memcpy(imgAssemBuf + off, d + 16, chunkLen);
+    imgAssemGot |= ((uint32_t)1 << idx);
+    if (imgAssemGot != (((uint32_t)1 << chunks) - 1)) return;   // 아직 전부 안 옴
+
+    // 완성 → fmt=0 경로와 동일하게 pending 큐로 (flash 저장 + RAM 캐시는 loop()가 수행)
+    pi.page = imgAssemPage; pi.bid = imgAssemBid; pi.fmt = 0;
+    pi.buf = imgAssemBuf; pi.len = (uint16_t)imgAssemTotal;
+    imgAssemBuf = nullptr; imgAssemTotal = 0; imgAssemChunks = 0; imgAssemGot = 0;
   } else {
     return;                                    // 예약 형식
   }
@@ -1274,10 +1318,12 @@ void sendConfigDump(IPAddress ip, uint16_t port) {
   }
 }
 
-// [H] MREQ 응답: /btns/p{page}_{bid}.jpg 이미지 덤프 (존재하는 이미지 버튼만 MIMG fmt=0).
-//     파일 ≤IMG_MAX_BYTES라 단일 데이터그램 — WiFiUDP는 beginPacket~endPacket을 하나로 버퍼링.
-//     패킷 사이에 delay()를 두어 WiFi/AP TX 큐가 비우도록 한다 — ESP32는 연속 대형 UDP 버스트에서
-//     패킷 드랍이 발생할 수 있고, config(소형)는 통과해도 이미지(최대 1400B)가 유실되는 사례가 있다.
+// [H] MREQ 응답: /btns/p{page}_{bid}.jpg 이미지 덤프 (존재하는 이미지 버튼만 MIMG).
+//     파일 ≤IMG_CHUNK_DATA(1400B)면 fmt=0 단일 데이터그램, 초과면 fmt=2 청킹(8B 서브헤더
+//     `>IHH` + ≤1400B 청크)으로 분할 — 각 데이터그램 ≤1416B라 IP 단편화 없이 도착한다.
+//     WiFiUDP는 beginPacket~endPacket을 하나로 버퍼링. 패킷/청크 사이에 delay()를 두어
+//     WiFi/AP TX 큐가 비우도록 한다 — ESP32는 연속 대형 UDP 버스트에서 패킷 드랍이 발생할
+//     수 있고, config(소형)는 통과해도 이미지(최대 1400B)가 유실되는 사례가 있다.
 void sendImageDump(IPAddress ip, uint16_t port) {
   if (!fsMounted || port == 0) return;
   for (uint8_t p = 0; p < numPages; p++) {
@@ -1289,19 +1335,47 @@ void sendImageDump(IPAddress ip, uint16_t port) {
       if (!f) continue;
       size_t sz = f.size();
       if (sz == 0 || sz > IMG_MAX_BYTES) { f.close(); continue; }
-      uint8_t hdr[8] = {0x4D, 0x49, 0x4D, 0x47, p, b, 0, 0};   // "MIMG" page bid fmt=0 rsvd=0
-      udpSend.beginPacket(ip, port);
-      udpSend.write(hdr, 8);
-      uint8_t chunk[256];
-      while (sz > 0) {
-        size_t rd = f.read(chunk, min((size_t)sizeof(chunk), sz));
-        if (rd == 0) break;
-        udpSend.write(chunk, rd);
-        sz -= rd;
+
+      if (sz <= IMG_CHUNK_DATA) {                            // fmt=0 단일 데이터그램
+        uint8_t hdr[8] = {0x4D, 0x49, 0x4D, 0x47, p, b, 0, 0};   // "MIMG" page bid fmt=0 rsvd=0
+        udpSend.beginPacket(ip, port);
+        udpSend.write(hdr, 8);
+        uint8_t chunk[256];
+        size_t remain = sz;
+        while (remain > 0) {
+          size_t rd = f.read(chunk, min((size_t)sizeof(chunk), remain));
+          if (rd == 0) break;
+          udpSend.write(chunk, rd);
+          remain -= rd;
+        }
+        udpSend.endPacket();
+        f.close();
+        delay(15);   // [H] 버스트 유실 방지
+        continue;
       }
-      udpSend.endPacket();
+
+      // fmt=2 청킹: 첫 청크에 total/chunks, 각 청크에 idx (호스트 apply_mimg_to_dump가 재조립)
+      uint16_t nChunks = (uint16_t)((sz + IMG_CHUNK_DATA - 1) / IMG_CHUNK_DATA);
+      uint8_t hdr[16] = {0x4D, 0x49, 0x4D, 0x47, p, b, 2, 0};   // "MIMG" page bid fmt=2 rsvd=0
+      uint8_t* cbuf = (uint8_t*)malloc(IMG_CHUNK_DATA);
+      if (!cbuf) { f.close(); continue; }
+      for (uint16_t i = 0; i < nChunks; i++) {
+        size_t off = (size_t)i * IMG_CHUNK_DATA;
+        size_t thisLen = min((size_t)IMG_CHUNK_DATA, sz - off);
+        f.seek(off);
+        if (f.read(cbuf, thisLen) != thisLen) break;         // 읽기 실패 → 이 이미지 중단
+        hdr[8] = (uint8_t)(sz >> 24); hdr[9] = (uint8_t)(sz >> 16);
+        hdr[10] = (uint8_t)(sz >> 8);  hdr[11] = (uint8_t)sz;
+        hdr[12] = (uint8_t)(nChunks >> 8); hdr[13] = (uint8_t)nChunks;
+        hdr[14] = (uint8_t)(i >> 8);   hdr[15] = (uint8_t)i;
+        udpSend.beginPacket(ip, port);
+        udpSend.write(hdr, 16);
+        udpSend.write(cbuf, thisLen);
+        udpSend.endPacket();
+        delay(15);   // [H] 청크 간 버스트 유실 방지 (최악 96개×3청크×15ms ≈ 4.3s — 호스트 5s 안)
+      }
+      free(cbuf);
       f.close();
-      delay(15);   // [H] 버스트 유실 방지 — 최대 96개×15ms = 1.44s (호스트 5s 데드라인 안)
     }
   }
 }
@@ -1547,16 +1621,14 @@ void drawStatusBar() {
   // 상태바 배경 (그리드 배경색과 동일하게 채워 이음새 제거)
   lcd.fillRect(0, STATUS_TOP, 320, 240 - STATUS_TOP, lcd.color565(15, 23, 42));
 
-  // 이전/다음 페이지
-  lcd.fillRoundRect(PREV_X, PREV_Y, PREV_W, PREV_H, 4,
-                    currentPage > 0 ? lcd.color565(37, 99, 235) : lcd.color565(71, 85, 105));
+  // 이전/다음 페이지 — [롤링] 항상 어느 페이지에서나 동작하므로 항상 활성색(파랑)
+  lcd.fillRoundRect(PREV_X, PREV_Y, PREV_W, PREV_H, 4, lcd.color565(37, 99, 235));
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextDatum(MC_DATUM);
   lcd.setTextSize(1);
   lcd.drawString("<", PREV_X + PREV_W / 2, PREV_Y + PREV_H / 2);
 
-  lcd.fillRoundRect(NEXT_X, NEXT_Y, NEXT_W, NEXT_H, 4,
-                    currentPage < numPages - 1 ? lcd.color565(37, 99, 235) : lcd.color565(71, 85, 105));
+  lcd.fillRoundRect(NEXT_X, NEXT_Y, NEXT_W, NEXT_H, 4, lcd.color565(37, 99, 235));
   lcd.drawString(">", NEXT_X + NEXT_W / 2, NEXT_Y + NEXT_H / 2);
 
   // 중앙: 페이지 이름 + x/y만 (IP 미표시 — [PLAN 6] 전환 버튼 확대로 중앙 폭이 좁아짐)
@@ -1682,15 +1754,17 @@ void handleTouch() {
       }
     } else {
       // 상태바: 페이지 이동 — [H] 이미지 캐시를 페이지 단위로 스왑 (플래시에서 즉시 로드, 오프라인)
-      if (pressX >= PREV_X && pressX < PREV_X + PREV_W && currentPage > 0) {
+      // [롤링] 경계에서 순환: 첫 페이지에서 Prev → 마지막 페이지, 마지막 페이지에서 Next → 첫 페이지.
+      // numPages는 항상 >= 1이므로 numPages-1은 유효하다.
+      if (pressX >= PREV_X && pressX < PREV_X + PREV_W) {
         uint8_t oldPage = currentPage;
-        currentPage--;
+        currentPage = (currentPage == 0) ? (uint8_t)(numPages - 1) : (uint8_t)(currentPage - 1);
         freePageImages(oldPage);
         loadPageImages(currentPage);
         drawGrid(currentPage);
-      } else if (pressX >= NEXT_X && pressX < NEXT_X + NEXT_W && currentPage < numPages - 1) {
+      } else if (pressX >= NEXT_X && pressX < NEXT_X + NEXT_W) {
         uint8_t oldPage = currentPage;
-        currentPage++;
+        currentPage = (currentPage == numPages - 1) ? 0 : (uint8_t)(currentPage + 1);
         freePageImages(oldPage);
         loadPageImages(currentPage);
         drawGrid(currentPage);

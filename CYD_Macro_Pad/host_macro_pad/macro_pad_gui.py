@@ -82,8 +82,10 @@ MAGIC_IMAGE = 0x4D494D47      # "MIMG" 호스트→디바이스 버튼 이름 �
 BTN_IMG_W = 71                # 펌웨어 BTN_W와 일치
 BTN_IMG_H = 61                # 펌웨어 BTN_H와 일치
 JPEG_QUALITY = 90             # 기본 품질 — 4:4:4(subsampling=0)와 조합해 크로마 얼룩 제거
-JPEG_MIN_QUALITY = 45         # 1400B 초과 시 낮출 최저 품질
-JPEG_MAX_BYTES = 1400         # 이미지 페이로드 상한 (헤더 8B + 1400B = 1408 < UDP MTU 1472)
+JPEG_MIN_QUALITY = 70         # 품질 하한 — 1400B 예산과 무관하게 이 품질을 보장 (MIMG fmt=2 청킹 전송)
+JPEG_MAX_BYTES = 1400         # fmt=0 단일 패킷 이미지 페이로드 상한 (헤더 8B + 1400B = 1408 < UDP MTU 1472)
+IMG_CHUNK_DATA = 1400         # fmt=2 청크당 데이터 바이트 (8+8+1400 = 1416 < UDP MTU 1472 — 단편화 없음)
+IMG_MAX_BYTES = 4096          # 청킹 이미지 총 상한 (펌웨어 IMG_MAX_BYTES와 일치; 71×61 최악 노이즈 q=70 ≈ 2766B)
 GRID_BG_HEX = "#0F172A"       # 버튼 주변 그리드 배경색 (이미지 모서리와 동일 → 이음새 제거)
 BTN_BORDER_HEX = "#64748B"    # 비활성 버튼 테두리 (슬레이트 — 펌웨어 색상과 일치)
 # [PLAN 7] 버튼 모서리 라운드 반경. radius 6은 JPEG 4:2:0 손실 압축 후 코너가 거의
@@ -588,11 +590,12 @@ def _compose_button_image(label: str, color_idx: int):
 
 
 def _jpeg_fit(img) -> bytes:
-    """JPEG 인코딩. JPEG_MAX_BYTES 초과 시 품질을 낮춰 맞춘다 (단일 패킷 보장).
+    """JPEG 인코딩. 1400B 이하로 맞으면 즉시 반환, 초과 시 품질을 낮추되
+    JPEG_MIN_QUALITY(70) 하한을 지킨다. 1400B를 넘는 결과는 MIMG fmt=2 멀티 패킷
+    전송이 처리하므로 이 함수는 "단일 패킷 크기"가 아니라 "품질 하한"을 보장한다.
 
     [FIX] subsampling=0(4:4:4)로 크로마 서브샘플링 아티팩트 제거 — 단색 버튼에서
-    텍스트/모서리 경계가 얼룩덜룩(chroma smear)하게 보이던 원인. 크기는 커지지만
-    아래 품질 루프가 1400B 예산 안으로 맞춘다.
+    텍스트/모서리 경계가 얼룩덜룩(chroma smear)하게 보이던 원인.
     """
     q = JPEG_QUALITY
     while q >= JPEG_MIN_QUALITY:
@@ -601,12 +604,13 @@ def _jpeg_fit(img) -> bytes:
         data = buf.getvalue()
         if len(data) <= JPEG_MAX_BYTES:
             return data
-        q -= 10
+        q -= 5
     return data   # 최저 품질에도 초과 → 호출부에서 라벨을 줄여 재구성
 
 
 def _render_button_image(label: str, color_idx: int) -> bytes:
-    """라벨/색상 → JPEG 바이트(≤JPEG_MAX_BYTES). 극단적으로 큰 라벨은 축약 후 재구성."""
+    """라벨/색상 → JPEG 바이트(품질 하한 JPEG_MIN_QUALITY 보장; 초과는 fmt=2 청킹 전송).
+    극단적으로 큰 라벨은 축약 후 재구성."""
     img = _compose_button_image(label, color_idx)
     data = _jpeg_fit(img)
     if len(data) <= JPEG_MAX_BYTES:
@@ -653,6 +657,26 @@ def build_image_packet(page: int, button_id: int, jpeg_bytes: bytes, fmt: int = 
     디바이스는 해당 버튼을 펌웨어 텍스트/색 사각형으로 폴백).
     """
     return IMAGE_HEADER.pack(MAGIC_IMAGE, page, button_id, fmt, 0) + jpeg_bytes
+
+
+def build_image_packets(page: int, button_id: int, jpeg_bytes: bytes) -> list:
+    """버튼 이미지 전송 패킷 목록.
+
+    ≤JPEG_MAX_BYTES(1400B)면 기존 MIMG fmt=0 단일 패킷 그대로(하위호환).
+    초과면 MIMG fmt=2 청킹으로 나눈다 — 8B 헤더 + 8B 서브헤더 `>IHH`
+    (total_len u32, total_chunks u16, chunk_idx u16) + 청크 데이터(≤IMG_CHUNK_DATA).
+    데이터그램 총량 8+8+1400 = 1416 < UDP MTU 1472 → 단편화 없이 항상 도착.
+    """
+    if len(jpeg_bytes) <= JPEG_MAX_BYTES:
+        return [build_image_packet(page, button_id, jpeg_bytes, 0)]
+    total = len(jpeg_bytes)
+    chunks = (total + IMG_CHUNK_DATA - 1) // IMG_CHUNK_DATA
+    return [
+        IMAGE_HEADER.pack(MAGIC_IMAGE, page, button_id, 2, 0)
+        + struct.pack(">IHH", total, chunks, i)
+        + jpeg_bytes[i * IMG_CHUNK_DATA:(i + 1) * IMG_CHUNK_DATA]
+        for i in range(chunks)
+    ]
 
 
 def parse_beacon_packet(data: bytes) -> bool:
@@ -715,14 +739,43 @@ def apply_mcfg_to_dump(dump: dict, data: bytes) -> bool:
 
 
 def apply_mimg_to_dump(dump: dict, data: bytes) -> bool:
-    """MREQ 응답의 MIMG 덤프 패킷(fmt=0, 이미지 버튼만)을 base64로 저장."""
+    """MREQ 응답의 MIMG 덤프 패킷을 base64로 저장. fmt=0 단일 또는 fmt=2 청킹 지원.
+
+    fmt=2 청킹은 (page,bid)별 누적 버퍼를 dump["img_chunks"]에 두고, 모든 청크가
+    모이면 base64로 dump["images"]에 저장한다. 순서 무관·중복 무시.
+    """
     if len(data) < 8:
         return False
     magic, page, bid, fmt, rsvd = IMAGE_HEADER.unpack(data[:8])
-    if magic != MAGIC_IMAGE or fmt != 0:
+    if magic != MAGIC_IMAGE:
         return False
-    dump["images"][(page, bid)] = base64.b64encode(data[8:]).decode("ascii")
-    return True
+    if fmt == 0:
+        dump["images"][(page, bid)] = base64.b64encode(data[8:]).decode("ascii")
+        return True
+    if fmt == 2:
+        if len(data) < 16:
+            return False
+        total, chunks, idx = struct.unpack(">IHH", data[8:16])
+        chunk = data[16:]
+        if not (0 < total <= IMG_MAX_BYTES and 0 < chunks <= 16 and idx < chunks):
+            return False
+        off = idx * IMG_CHUNK_DATA
+        if off + len(chunk) > total:
+            return False
+        acc = dump.setdefault("img_chunks", {}).setdefault((page, bid), None)
+        if acc is None or acc["total"] != total or acc["chunks"] != chunks:
+            acc = {"total": total, "chunks": chunks,
+                   "buf": bytearray(total), "got": [False] * chunks}
+            dump["img_chunks"][(page, bid)] = acc
+        if acc["got"][idx]:
+            return False                     # 중복 청크 → 무시
+        acc["buf"][off:off + len(chunk)] = chunk
+        acc["got"][idx] = True
+        if all(acc["got"]):
+            dump["images"][(page, bid)] = base64.b64encode(bytes(acc["buf"])).decode("ascii")
+            del dump["img_chunks"][(page, bid)]
+        return True
+    return False
 
 
 def build_config_from_dump(dump: dict):
@@ -776,6 +829,9 @@ class MacroPadGUI:
         self._page_tabs: list = []                 # [page] → Notebook 탭 Frame
         self._img_cache: dict = {}                 # [G] (page,bid,label,color) → JPEG 바이트 (재렌더 방지)
         self._img_pillow_warned = False            # [G] Pillow 미설치 경고 1회만
+        self._drag_tab: str | None = None          # 탭 드래그 재정렬 중인 탭 ID (None=미드래그)
+        self._tab_dragged = False                  # 드래그 중 실제 탭 이동이 있었는지 (클릭↔드래그 구분)
+        self._help_win: "tk.Toplevel | None" = None  # [?] 도움말 창 단일 인스턴스
 
         # [H] 동기화 재설계 상태
         self._pushed_ip: str | None = None         # 이번 세션에서 전체 푸시한 디바이스 IP (1회 푸시 판정)
@@ -928,7 +984,7 @@ class MacroPadGUI:
         page_row = tk.Frame(self.root, bg=self.card_bg, bd=1, relief=tk.SOLID, padx=12, pady=8)
         page_row.pack(fill=tk.X, padx=16, pady=(0, 8))
         ttk.Label(page_row, text="페이지 이름:").pack(side=tk.LEFT)
-        self.page_name_entry = ttk.Entry(page_row, width=18)
+        self.page_name_entry = self._text_entry(page_row, 18)
         self.page_name_entry.pack(side=tk.LEFT, padx=6)
         self.page_name_entry.bind("<KeyRelease>", lambda e: self._page_name_edited())
         # [FIX] +/− 페이지 버튼을 내보내기/가져오기와 동일한 모양(배경/폰트/패딩)으로 통일.
@@ -943,6 +999,9 @@ class MacroPadGUI:
         # 페이지 노트북 (최대 MAX_PAGES × 4×3 버튼) — pack은 하단 바를 먼저 고정한 뒤 진행
         self.notebook = ttk.Notebook(self.root)
         self.notebook.bind("<<NotebookTabChanged>>", self._page_changed)
+        self.notebook.bind("<ButtonPress-1>", self._tab_press)     # 탭 드래그 재정렬
+        self.notebook.bind("<B1-Motion>", self._tab_drag)
+        self.notebook.bind("<ButtonRelease-1>", self._tab_release)
         self._button_widgets = []
         self._page_tabs = []
 
@@ -981,8 +1040,22 @@ class MacroPadGUI:
             self._make_page_tab(page, pages[page].get("name") or "Page %d" % (page + 1))
 
     def _show_help(self) -> None:
-        """[?] 버튼 — 프로그램 사용법 안내 대화상자를 연다."""
+        """[?] 버튼 — 프로그램 사용법 안내 대화상자를 연다.
+
+        [FIX] '?'를 누를 때마다 새 창이 생기지 않도록 단일 창을 재사용한다.
+        이미 열려 있으면 새로 만들지 않고 위로 올려 포커스를 준다.
+        """
+        win = getattr(self, "_help_win", None)
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.lift()
+                    win.focus_force()
+                    return
+            except tk.TclError:
+                pass    # 창이 이미 파괴됨 → 아래에서 새로 생성
         win = tk.Toplevel(self.root)
+        self._help_win = win
         win.title("프로그램 사용법")
         win.configure(bg=self.bg_color)
         win.geometry("640x600")
@@ -1011,6 +1084,8 @@ class MacroPadGUI:
                     "\"디바이스 발견\"이 뜹니다. IP 입력은 필요 없습니다 (자동 발견, UDP 8890).\n"),
             ("",    "2. 페이지 탭(최대 8개)에서 4×3 버튼 12개를 설정한 뒤 [설정 적용]을 누르세요.\n"),
             ("",    "3. 장치에서 버튼을 터치하면 호스트가 등록된 동작을 실행합니다.\n"),
+            ("",    "4. 페이지 탭을 마우스로 끌어 순서를 바꿀 수 있습니다. 순서 변경은 "
+                    "놓는 즉시 자동으로 디바이스에도 반영됩니다.\n"),
             ("sub", "\n[ 버튼 동작 3종 ]\n"),
             ("",    "▪ 단축키 (shortcut) — 키 조합 입력. 예: "), ("code", "cmd+shift+4, cmd+c\n"),
             ("",    "▪ 문구 (text) — 입력할 문자열. 예: "), ("code", "안녕하세요"),
@@ -1026,6 +1101,7 @@ class MacroPadGUI:
             ("code", "  space, enter/return, tab, esc/escape\n"),
             ("code", "  up/down/left/right, backspace, delete, caps_lock\n"),
             ("code", "  home, end, page_up/page_down, fn, insert, print_screen\n"),
+            ("code", "  f1 ~ f20 (기능키, 예: f5, cmd+shift+f3)\n"),
             ("",    "- 조합은 "), ("code", "+"), ("", " 로 연결: "), ("code", "cmd+option+v"),
             ("",    "  등.\n"),
             ("",    "- 영문·숫자 한 글자는 그대로: "), ("code", "cmd+a, cmd+1"),
@@ -1055,17 +1131,31 @@ class MacroPadGUI:
         close.pack(pady=10)
         win.bind("<Escape>", lambda e: win.destroy())
 
+    def _text_entry(self, parent: tk.Widget, width: int = 12) -> tk.Entry:
+        """버튼 설정용 텍스트 박스 (classic tk.Entry).
+
+        [FIX] ttk.Entry는 macOS Tk 8.6.15에서 insertbackground 위젯 옵션을 지원하지 않아
+        입력 캐럿(타이핑 커서)이 안 보인다. classic tk.Entry는 insertbackground로 캐럿 색을
+        직접 지정하고 항상 캐럿을 그린다. 다크 카드(#0f172a)에 맞춰 스타일링.
+        """
+        return tk.Entry(parent, width=width, bg="#0f172a", fg=self.text_color,
+                        insertbackground=self.text_color, relief=tk.FLAT,
+                        highlightthickness=1, highlightbackground="#334155",
+                        highlightcolor="#0ea5e9",
+                        selectbackground="#0ea5e9", selectforeground="#0f172a",
+                        font=("Pretendard", 12))
+
     def _make_button_card(self, parent: tk.Widget, page: int, bid: int) -> dict:
         """버튼 한 개의 편집 카드 (라벨/동작/값/색 + [G] 이미지 업로드 + 힌트)."""
         f = tk.Frame(parent, bg="#1e293b", bd=1, relief=tk.SOLID, padx=5, pady=3)
         tk.Label(f, text="#%d" % bid, bg="#1e293b", fg=self.sub_text,
                  font=("Pretendard", 10)).pack(anchor="w")
-        lbl = ttk.Entry(f, width=12)
+        lbl = self._text_entry(f, 12)
         lbl.pack(fill=tk.X, pady=(2, 2))
         _setup_entry_placeholder(lbl, "이름")     # 빈 칸일 때 힌트 (어느 칸인지 표시)
         act = ttk.Combobox(f, values=list(ATYPE_LABELS.values()), width=10, state="readonly")
         act.pack(fill=tk.X, pady=(0, 2))
-        val = ttk.Entry(f, width=12)
+        val = self._text_entry(f, 12)
         val.pack(fill=tk.X, pady=(0, 2))
         _setup_entry_placeholder(val, "액션")     # 액션 값(단축키/문구/앱·URL) 힌트
         # 색상 선택 (구분용): 스와치 + 팔레트 Combobox
@@ -1325,6 +1415,82 @@ class MacroPadGUI:
             name = pages[i].get("name") if i < len(pages) else "Page %d" % (i + 1)
             self.notebook.tab(tab, text=name or "Page %d" % (i + 1))
 
+    # ------------------------------------------------------------------
+    # 페이지 탭 드래그 재정렬
+    # ------------------------------------------------------------------
+    def _tab_press(self, event) -> None:
+        """탭 스트립 위에서 눌렀을 때만 드래그를 시작한다.
+
+        [FIX] macOS Tk 8.6.15에서 ttk.Notebook.bbox()는 항상 (0,0,0,0)을 반환해 탭
+        영역 판별에 못 쓴다. 대신 clam 테마는 index("@x,y")가 탭 스트립 위에서만 유효
+        인덱스를 돌려주고 콘텐츠/빈 영역에서는 TclError를 던진다 — 이걸로 구분한다.
+        "break"를 반환하지 않는 것은 탭 선택(클래스 바인딩)이 함께 동작하도록 하기 위함.
+        """
+        self._drag_tab = None
+        self._tab_dragged = False
+        try:
+            idx = self.notebook.index("@%d,%d" % (event.x, event.y))
+        except tk.TclError:
+            return
+        self._drag_tab = self.notebook.tabs()[idx]
+
+    def _tab_drag(self, event) -> str:
+        """드래그 중 마우스가 위치한 탭 자리로 현재 탭을 옮긴다 (실시간 미리보기)."""
+        if not self._drag_tab:
+            return "break"
+        try:
+            idx = self.notebook.index("@%d,%d" % (event.x, event.y))
+        except tk.TclError:
+            return "break"     # 스트립 밖(콘텐츠)으로 나가면 이동 중단
+        if idx != self.notebook.index(self._drag_tab):
+            self.notebook.insert(idx, self._drag_tab)
+            self._tab_dragged = True   # 실제 이동이 있었을 때만 릴리스에서 동기화
+        return "break"
+
+    def _tab_release(self, event) -> str:
+        """드래그 종료 — 실제 이동이 있었을 때만 순서를 config/위젯/디바이스에 반영한다.
+
+        [FIX] 단순 클릭(드래그 없음)은 동기화하지 않는다 — 매 클릭마다 재푸시되면
+        탭 선택만으로 디바이스가 리셋/재렌더된다.
+        """
+        if not self._drag_tab:
+            return "break"
+        was_dragged = self._tab_dragged
+        self._drag_tab = None
+        self._tab_dragged = False
+        if was_dragged:
+            self._sync_pages_from_tabs()
+        return "break"
+
+    def _sync_pages_from_tabs(self) -> None:
+        """Notebook 탭의 시각적 순서를 config/_page_tabs/_button_widgets에 반영하고 재푸시.
+
+        드래그 후 호출. 위젯 편집을 먼저 스냅샷(_collect_config)으로 받은 뒤 새 순서로
+        재배치해, Apply를 누르지 않았더라도 최신 편집 상태가 순서와 함께 디바이스에 반영된다.
+        """
+        frames = [self.notebook.nametowidget(t) for t in self.notebook.tabs()]
+        with self._config_lock:
+            if len(frames) != len(self.config["pages"]) or len(frames) != len(self._page_tabs):
+                return
+        # 각 탭 프레임 → 이전 페이지 인덱스 (드래그 전 순서 기준)
+        try:
+            order = [self._page_tabs.index(f) for f in frames]
+        except ValueError:
+            return
+        fresh = self._collect_config()["pages"]     # 위젯 현재 상태 스냅샷 (드래그 전 순서)
+        with self._config_lock:
+            self.config["pages"] = [fresh[i] for i in order]
+        self._button_widgets = [self._button_widgets[i] for i in order]
+        self._page_tabs = frames
+        self._reindex_tab_labels()
+        self._save_config(self.config)
+        self._log("↕ 페이지 순서 변경 — 디바이스 동기화 요청")
+        ip = self.config.get("device_ip", "") or ""
+        if self._listener_running:
+            self._resend_queue.put("resend")
+        elif _is_valid_ip(ip):
+            self._send_config_from_temp_socket(ip, UDP_PORT)
+
     def _collect_config(self) -> dict:
         with self._config_lock:
             cur_pages = self.config["pages"]
@@ -1512,9 +1678,11 @@ class MacroPadGUI:
         """버튼 이미지(MIMG) 전송 (G): 업로드 이미지 / 한글 라벨 / ASCII·빈 라벨(clear).
 
         설정 푸시(MCFG) 직후 같은 소스로 호출된다. 버튼별 의도 3분기:
-          1. 업로드 이미지(base64) → 그대로 MIMG(fmt=0) 전송
-          2. 한글(비-ASCII) 라벨 → 텍스트를 71x61 JPEG로 렌더해 MIMG(fmt=0) 전송
+          1. 업로드 이미지(base64) → 그대로 MIMG 전송
+          2. 한글(비-ASCII) 라벨 → 텍스트를 71x61 JPEG로 렌더해 MIMG 전송
           3. ASCII/빈 라벨 → MIMG(fmt=1, clear) 전송 → 디바이스가 펌웨어 텍스트/색 사각형 폴백
+        이미지는 ≤JPEG_MAX_BYTES(1400B)면 fmt=0 단일, 초과면 fmt=2 청킹
+        (build_image_packets)으로 분할 전송 — 품질 하한 JPEG_MIN_QUALITY(70) 보장.
         렌더 결과는 (page,bid,...) 키로 캐시해 재인코딩을 피한다. 캐시는 리스너 스레드에서만
         접근하므로 단일 스레드 안전. 로그는 Tkinter 직접 접근 금지 → _event_queue로 라우팅.
         """
@@ -1536,12 +1704,17 @@ class MacroPadGUI:
                     jpeg = self._img_cache.get(key)
                     if jpeg is None:
                         try:
+                            # [FIX] 과거 버전/가져오기로 들어온 >JPEG_MAX_BYTES(1400B) JPEG:
+                            #      품질을 낮춰 클램프하는 대신 MIMG fmt=2 청킹
+                            #      (build_image_packets)으로 전송한다. 단일 패킷 초과는
+                            #      IP 단편화 → ESP32 Wi-Fi 수신 실패로 버튼이 안 뜬다.
                             jpeg = base64.b64decode(b64)
                         except Exception:
                             continue           # 잘못된 base64 → 이 버튼은 보내지 않음
                         self._img_cache[key] = jpeg
                     keys.add(key)
-                    sock.sendto(build_image_packet(page, bid, jpeg, 0), (ip, port))
+                    for pkt in build_image_packets(page, bid, jpeg):
+                        sock.sendto(pkt, (ip, port))
                     continue
 
                 # (2) 한글(비-ASCII) 라벨 → 텍스트를 71x61 JPEG로 렌더해 전송
@@ -1569,7 +1742,8 @@ class MacroPadGUI:
                             continue
                         self._img_cache[key] = jpeg
                         rendered += 1
-                    sock.sendto(build_image_packet(page, bid, jpeg, 0), (ip, port))
+                    for pkt in build_image_packets(page, bid, jpeg):
+                        sock.sendto(pkt, (ip, port))
                     continue
 
                 # (3) ASCII/빈 라벨 → clear(fmt=1): 디바이스의 구 이미지를 제거하고 텍스트로 폴백.
@@ -1982,7 +2156,8 @@ if __name__ == "__main__":
         assert clear_pkt[:8] == IMAGE_HEADER.pack(MAGIC_IMAGE, 1, 7, 1, 0)
         cm, cp, cb, cf, _ = IMAGE_HEADER.unpack(clear_pkt[:8])
         assert (cm, cp, cb, cf) == (MAGIC_IMAGE, 1, 7, 1)           # page=1 bid=7 fmt=1
-        # [G] 실제 렌더 크기가 단일 패킷(≤JPEG_MAX_BYTES)에 들어가는지 검증 (Pillow 필요)
+        # [G] 실제 렌더 크기가 총 상한(≤IMG_MAX_BYTES)에 들어가는지 검증 (Pillow 필요).
+        #     MIN_QUALITY=70 보장 → 일부 이미지는 1400B를 넘을 수 있고 fmt=2 청킹으로 전송된다.
         img_ok = True
         try:
             _ensure_pillow()
@@ -1994,20 +2169,22 @@ if __name__ == "__main__":
                             ("멀티라인 긴 버튼 이름 테스트 문구", 4), ("Open Safari", 6)]:
                 jpg = _render_button_image(lbl, ci)
                 assert jpg[:2] == b"\xff\xd8", "JPEG 마커 확인: %r" % lbl
-                assert len(jpg) <= JPEG_MAX_BYTES, \
-                    "JPEG %dB > %dB (단일 UDP 패킷 불가): %r" % (len(jpg), JPEG_MAX_BYTES, lbl)
-            # [PLAN 8] 이모지 라벨도 텍스트/이모지 런 렌더 → 단일 패킷 크기 이내
+                assert len(jpg) <= IMG_MAX_BYTES, \
+                    "JPEG %dB > %dB (fmt=2 청킹 상한 초과): %r" % (len(jpg), IMG_MAX_BYTES, lbl)
+                assert all(len(p) <= 8 + 8 + IMG_CHUNK_DATA for p in build_image_packets(0, 0, jpg)), \
+                    "모든 전송 패킷 ≤1416B (단편화 없음): %r" % lbl
+            # [PLAN 8] 이모지 라벨도 텍스트/이모지 런 렌더 → 총 상한 이내
             for lbl, ci in [("🎉", 6), ("안녕 🎉", 6), ("Copy 🐱 👨‍👩‍👧", 6)]:
                 jpg = _render_button_image(lbl, ci)
                 assert jpg[:2] == b"\xff\xd8", "이모지 JPEG 마커 확인: %r" % lbl
-                assert len(jpg) <= JPEG_MAX_BYTES, \
-                    "이모지 JPEG %dB > %dB (단일 UDP 패킷 불가): %r" % (len(jpg), JPEG_MAX_BYTES, lbl)
+                assert len(jpg) <= IMG_MAX_BYTES, \
+                    "이모지 JPEG %dB > %dB (fmt=2 청킹 상한 초과): %r" % (len(jpg), IMG_MAX_BYTES, lbl)
             # [G] 업로드 이미지 경로: 임의 크기 이미지 → 중앙 크롭 채움 71x61 JPEG → base64 왕복
             src = Image.new("RGB", (200, 100), (200, 30, 30))
             up_jpg = _image_to_button_jpeg(src)
             assert up_jpg[:2] == b"\xff\xd8", "업로드 이미지 JPEG 마커 확인"
-            assert len(up_jpg) <= JPEG_MAX_BYTES, \
-                "업로드 JPEG %dB > %dB (단일 UDP 패킷 불가)" % (len(up_jpg), JPEG_MAX_BYTES)
+            assert len(up_jpg) <= IMG_MAX_BYTES, \
+                "업로드 JPEG %dB > %dB (fmt=2 청킹 상한 초과)" % (len(up_jpg), IMG_MAX_BYTES)
             up_b64 = base64.b64encode(up_jpg).decode("ascii")
             assert base64.b64decode(up_b64) == up_jpg               # config 저장/전송 왕복
             reopened = Image.open(io.BytesIO(up_jpg))
@@ -2065,13 +2242,35 @@ if __name__ == "__main__":
         assert cfg["pages"][0]["buttons"][3]["image"] == \
             base64.b64encode(dump_img[8:]).decode("ascii")  # 이미지가 config에 임베드
         assert cfg["pages"][2]["name"] == "Page 3"          # 이름 없음 → 기본명
+        # [G] MIMG fmt=2 청킹 왕복: >1400B 이미지 → build_image_packets 분할 → apply_mimg_to_dump 재조립
+        big_jpeg = b"\xff\xd8\xff\xe0" + bytes((i * 7) & 0xFF for i in range(JPEG_MAX_BYTES + 100))
+        pkts = build_image_packets(0, 5, big_jpeg)
+        assert len(pkts) == 2, "1500B → 2청크 (chunks=%d)" % len(pkts)
+        for p in pkts:
+            m, pg, bd, f, _ = IMAGE_HEADER.unpack(p[:8])
+            assert (m, pg, bd, f) == (MAGIC_IMAGE, 0, 5, 2), "fmt=2 헤더 검증"
+            assert len(p) <= 8 + 8 + IMG_CHUNK_DATA, "fmt=2 데이터그램 ≤1416B (단편화 없음)"
+        dump3 = {"pages": {}, "images": {}, "num_pages": None, "device_ip": "", "start": 0, "last_pkt": 0}
+        for p in pkts:
+            assert apply_mimg_to_dump(dump3, p), "fmt=2 덤프 청크 적용"
+        assert (0, 5) in dump3["images"], "전체 청크 도착 → images에 완성 저장"
+        assert base64.b64decode(dump3["images"][(0, 5)]) == big_jpeg, "청킹 왕복 바이트 일치"
+        #  비순서 도착 + 중복 청크 무시
+        dump4 = {"pages": {}, "images": {}, "num_pages": None, "device_ip": "", "start": 0, "last_pkt": 0}
+        for p in [pkts[1], pkts[0], pkts[1]]:               # 역순 + 중복
+            assert apply_mimg_to_dump(dump4, p)
+        assert base64.b64decode(dump4["images"][(0, 5)]) == big_jpeg, "비순서/중복 재조립 일치"
+        #  ≤1400B는 fmt=0 단일 유지 (하위호환)
+        small = b"\xff\xd8" + b"\x00" * 20
+        assert build_image_packets(0, 6, small) == [build_image_packet(0, 6, small, 0)], \
+            "≤JPEG_MAX_BYTES는 fmt=0 단일 유지"
         # [H] 불완전 덤프(12버튼 미달) → None
         dump2 = {"pages": {0: {"name": "", "buttons": {}}}, "images": {}, "num_pages": 1,
                  "device_ip": "", "start": 0, "last_pkt": 0}
         for c in chunk_config_packets(0, btns[:3], 1, ""):
             assert apply_mcfg_to_dump(dump2, c)
         assert build_config_from_dump(dump2) is None, "3/12버튼 덤프는 불완전"
-        print("OK: 패킷 구성/파싱 검증 통과 (헤더 8B, magic MCFG/MPAD/MIMG/MREQ, v3 엔트리 >BBBBB+액션, num_pages, ACK count=0, 청크 분할, 라벨 절단, 이벤트 파싱, 이미지 크기 ≤%dB, clear fmt=1, 업로드 변환, 덤프 왕복)" % JPEG_MAX_BYTES)
+        print("OK: 패킷 구성/파싱 검증 통과 (헤더 8B, magic MCFG/MPAD/MIMG/MREQ, v3 엔트리 >BBBBB+액션, num_pages, ACK count=0, 청크 분할, 라벨 절단, 이벤트 파싱, 이미지 크기 ≤%dB, clear fmt=1, fmt=2 청킹 왕복, 업로드 변환, 덤프 왕복)" % IMG_MAX_BYTES)
         sys.exit(0)
     if "--test-action" in sys.argv:
         # 오프라인 액션 검증: 격리 헬퍼로 키보드 입력이 실제 동작하는지 확인 (디바이스 불필요)
