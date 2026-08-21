@@ -67,8 +67,17 @@ PAGE_NAME_MAX = 20           # 페이지 이름 최대 바이트 (UTF-8) — 펌
 
 # 버튼 색상 팔레트 (인덱스 → 펌웨어 BTN_PALETTE와 정확히 일치해야 함)
 # 색상은 index로 전송되므로 표시 이름만 바꿔도 펌웨어/저장 설정과 호환된다.
-COLOR_NAMES = ["gray", "red", "orange", "yellow", "green",
-               "teal", "blue", "purple", "pink", "white"]
+# 표시명은 언어별(dropdown) — index가 와이어 계약이므로 펌웨어와는 항상 index로만 통신.
+COLOR_COUNT = 10
+COLOR_NAMES = {
+    "ko": ["회색", "빨강", "주황", "노랑", "초록", "청록", "파랑", "보라", "분홍", "흰색"],
+    "en": ["Gray", "Red", "Orange", "Yellow", "Green", "Teal", "Blue", "Purple", "Pink", "White"],
+}
+# 표시명(어느 언어든) → index. ATYPE_FROM_LABEL처럼 언어 전환 중 낡은 라벨도 역조회된다.
+COLOR_NAME_TO_IDX = {}
+for _lang_names in COLOR_NAMES.values():
+    for _ci, _cn in enumerate(_lang_names):
+        COLOR_NAME_TO_IDX.setdefault(_cn, _ci)
 COLOR_HEX = ["#64748B", "#EF4444", "#F97316", "#EAB308", "#22C55E",
              "#14B8A6", "#3B82F6", "#A855F7", "#EC4899", "#F8FAFC"]
 
@@ -94,9 +103,16 @@ BTN_BORDER_HEX = "#64748B"    # 비활성 버튼 테두리 (슬레이트 — 펌
 BTN_RADIUS = 10
 
 ACTION_TYPES = ["shortcut", "text", "app"]
-# 드롭다운 표시 라벨 ↔ 내부 값(canonical, 와이어 프로토콜 그대로). "app"은 "app / URL"로 표시.
-ATYPE_LABELS = {"shortcut": "shortcut", "text": "text", "app": "app / URL"}
-ATYPE_FROM_LABEL = {v: k for k, v in ATYPE_LABELS.items()}
+# 드롭다운 표시 라벨(언어별) ↔ 내부 값(canonical, 와이어 프로토콜 그대로).
+# ATYPE_FROM_LABEL은 한/영 라벨을 모두 내부값에 매핑해 어떤 언어로 표시돼도 역조회된다.
+ATYPE_LABELS = {
+    "ko": {"shortcut": "단축키", "text": "문구", "app": "앱 / URL"},
+    "en": {"shortcut": "Shortcut", "text": "Text", "app": "App / URL"},
+}
+ATYPE_FROM_LABEL = {}
+for _lang_map in ATYPE_LABELS.values():
+    for _v, _lbl in _lang_map.items():
+        ATYPE_FROM_LABEL.setdefault(_lbl, _v)
 
 # [H] 프로토콜 v3: 액션/덤프/ACK (펌웨어와 정확히 일치해야 함)
 MAGIC_REQUEST = 0x4D524551    # "MREQ" 설정 덤프 요청 (호스트→디바이스)
@@ -105,6 +121,255 @@ ATYPE_TO_IDX = {"shortcut": 0, "text": 1, "app": 2}   # v3 MCFG 엔트리 action
 ATYPE_FROM_IDX = ["shortcut", "text", "app"]
 REQUEST_HEADER = struct.Struct(">IBBBB")     # MREQ: magic + 4×u8
 CHUNK_MAX = 1200              # MCFG 청크 상한 — 펌웨어 MCFG_CHUNK_MAX와 일치 (UDP 단일 패킷 안전)
+
+# ------------------------------------------------------------------
+# [PLAN] 호스트 UI 한/영 번역. key → {ko, en}. 위젯/로그/도움말/메시지박스는
+#     self._t(key) / self._tf(key, *args)로 조회 (누락 시 ko). 사용자 라벨(버튼 이름,
+#     페이지 이름)은 데이터라 번역 대상이 아니다. %-포맷은 _tf에서 적용한다.
+# ------------------------------------------------------------------
+L10N = {
+    # 헤더
+    "subtitle": {
+        "ko": "ESP32-2432S028 터치 버튼 → UDP 이벤트 → 매크로 실행",
+        "en": "ESP32-2432S028 touch buttons → UDP events → macros",
+    },
+    # 언어 메뉴/버튼
+    "lang_btn": {"ko": "🌐 한국어", "en": "🌐 English"},
+    "log_lang": {"ko": "언어 설정: %s", "en": "Language set to: %s"},
+    # 상태바
+    "status_starting": {"ko": "● 리스너 시작 중...", "en": "● Listener starting..."},
+    "status_running": {"ko": "● 리스너 동작 중 · CYD 자동 검색 대기...",
+                       "en": "● Listener running · waiting for CYD..."},
+    "status_stopped": {"ko": "● 리스너 중지됨", "en": "● Listener stopped"},
+    "status_found": {"ko": "● 리스너 동작 중 · 디바이스 발견: %s:%d",
+                     "en": "● Listener running · device found: %s:%d"},
+    # 페이지 행
+    "label_page_name": {"ko": "페이지 이름:", "en": "Page name:"},
+    "btn_add_page": {"ko": "+ 페이지", "en": "+ Page"},
+    "btn_del_page": {"ko": "− 페이지", "en": "− Page"},
+    # 하단 버튼
+    "btn_apply": {"ko": "💾 설정 적용 (Apply)", "en": "💾 Apply Settings"},
+    "btn_export": {"ko": "⬇ 내보내기", "en": "⬇ Export"},
+    "btn_import": {"ko": "⬆ 가져오기", "en": "⬆ Import"},
+    "btn_device_import": {"ko": "🖥 디바이스에서 불러오기", "en": "🖥 Load from Device"},
+    # 버튼 카드
+    "ph_name": {"ko": "이름", "en": "Name"},
+    "ph_action": {"ko": "액션", "en": "Action"},
+    "preview_label": {"ko": "라벨/색상", "en": "Label/Color"},
+    "hint_shortcut": {"ko": "단축키: cmd+shift+4", "en": "Shortcut: cmd+shift+4"},
+    "hint_text": {"ko": "문구: 한글 가능", "en": "Text: any characters"},
+    "hint_app": {"ko": "영문 앱명(예: Calculator) or URL",
+                 "en": "App name (e.g. Calculator) or URL"},
+    # 파일 다이얼로그
+    "fd_image_files": {"ko": "이미지 파일", "en": "Image files"},
+    "fd_all_files": {"ko": "모든 파일", "en": "All files"},
+    "fd_json_files": {"ko": "JSON 파일", "en": "JSON files"},
+    # 로그
+    "log_ready": {"ko": "준비됨. CYD에 설정을 적용하려면 '설정 적용'을 누르세요.",
+                  "en": "Ready. Press 'Apply Settings' to send config to the CYD."},
+    "log_img_convert_fail": {"ko": "⚠️ 이미지 변환 실패: %s", "en": "⚠️ Image conversion failed: %s"},
+    "log_img_upload": {"ko": "🖼 이미지 업로드: page%d · #%d (%s) — 적용하려면 [설정 적용]",
+                       "en": "🖼 Image uploaded: page%d · #%d (%s) — press [Apply Settings] to send"},
+    "log_img_remove": {"ko": "🗑 이미지 제거: page%d · #%d — 적용하려면 [설정 적용]",
+                       "en": "🗑 Image removed: page%d · #%d — press [Apply Settings] to send"},
+    "log_page_max": {"ko": "⚠️ 페이지는 최대 %d개까지 추가할 수 있습니다",
+                     "en": "⚠️ A maximum of %d pages is allowed"},
+    "log_page_add": {"ko": "+ 페이지 %d 추가", "en": "+ Page %d added"},
+    "log_page_del": {"ko": "− 페이지 %d 삭제", "en": "− Page %d deleted"},
+    "log_page_reorder": {"ko": "↕ 페이지 순서 변경 — 디바이스 동기화 요청",
+                         "en": "↕ Page order changed — device sync requested"},
+    "log_export": {"ko": "⬇ 설정 내보내기: %s (%d페이지)",
+                   "en": "⬇ Config exported: %s (%d pages)"},
+    "log_export_fail": {"ko": "⚠️ 내보내기 실패: %s", "en": "⚠️ Export failed: %s"},
+    "log_import": {"ko": "⬆ 설정 가져오기: %s (%d페이지) — 적용하려면 [설정 적용]",
+                   "en": "⬆ Config imported: %s (%d pages) — press [Apply Settings] to send"},
+    "log_device_import_req": {"ko": "🖥 디바이스에서 불러오기 요청 (%s) — 덤프 수신 대기",
+                              "en": "🖥 Load-from-device requested (%s) — awaiting dump"},
+    "log_device_import_done": {"ko": "🖥 디바이스에서 불러오기 완료: %d페이지, 이미지 %d개 수신 — Apply로 전송하세요",
+                               "en": "🖥 Loaded from device: %d pages, %d images — press Apply to send"},
+    "log_device_import_noimg": {
+        "ko": "⚠️ 이미지가 수신되지 않았습니다 — 디바이스 플래시(/btns)에 저장된 이미지가 "
+              "없거나 전송이 유실됐습니다. (직렬 로그 [IMG] flash=1 / [MREQ] dump 확인)",
+        "en": "⚠️ No images received — the device flash (/btns) has none stored or the "
+              "transfer was lost. (check serial [IMG] flash=1 / [MREQ] dump)"},
+    "log_apply_resend": {"ko": "💾 설정 저장 + 재전송 요청 (%d페이지)",
+                         "en": "💾 Settings saved + resend requested (%d pages)"},
+    "log_apply_sent": {"ko": "💾 설정 저장 + 전송 (%s)",
+                       "en": "💾 Settings saved + sent (%s)"},
+    "log_apply_wait": {"ko": "💾 설정 저장 — 디바이스 발견 시 자동 전송됩니다",
+                       "en": "💾 Settings saved — will auto-send once the device is found"},
+    "log_push_fail": {"ko": "⚠️ 설정 전송 실패: %s", "en": "⚠️ Config send failed: %s"},
+    "log_push": {"ko": "📤 설정+이미지 푸시 (%s) → %s:%d",
+                 "en": "📤 Config+images pushed (%s) → %s:%d"},
+    "log_render_fail": {"ko": "⚠️ 이미지 렌더 실패 page%d·#%d: %s",
+                        "en": "⚠️ Image render failed page%d·#%d: %s"},
+    "log_images_sent": {"ko": "🖼 버튼 이미지 %d개 렌더+전송",
+                        "en": "🖼 %d button images rendered + sent"},
+    "log_pynput_missing": {"ko": "⚠️ pynput 미설치 — 단축키/문구 액션이 동작하지 않습니다 "
+                                 "(pip install -r requirements.txt)",
+                           "en": "⚠️ pynput not installed — shortcut/text actions won't work "
+                                 "(pip install -r requirements.txt)"},
+    "log_listener_start": {"ko": "▶ 리스너 자동 시작: UDP %d (디바이스 자동 검색)",
+                           "en": "▶ Listener auto-started: UDP %d (auto-discovery)"},
+    "log_listener_stop": {"ko": "■ 리스너 중지", "en": "■ Listener stopped"},
+    "log_bind_fail": {"ko": "⚠️ UDP %d 바인드 실패: %s", "en": "⚠️ UDP %d bind failed: %s"},
+    "log_dump_fail": {"ko": "디바이스 응답이 불완전합니다 (일부 페이지/버튼 누락). 다시 시도하세요.",
+                      "en": "Incomplete device response (some pages/buttons missing). Try again."},
+    "log_event_ok": {"ko": "✓ page%d · #%d: %s 실행됨", "en": "✓ page%d · #%d: %s executed"},
+    "log_event_err": {"ko": "✗ page%d · #%d: %s", "en": "✗ page%d · #%d: %s"},
+    "log_device_found": {"ko": "디바이스 발견 (자동 검색): %s — 설정 전송",
+                         "en": "Device found (auto-discovery): %s — sending config"},
+    # 메시지박스
+    "msg_delpage_title": {"ko": "페이지 삭제", "en": "Delete Page"},
+    "msg_min1page": {"ko": "최소 1개 페이지는 필요합니다.", "en": "At least 1 page is required."},
+    "msg_delpage_confirm": {"ko": "페이지 %d의 설정이 삭제됩니다. 계속할까요?",
+                            "en": "Page %d settings will be deleted. Continue?"},
+    "msg_import_fail_title": {"ko": "가져오기 실패", "en": "Import Failed"},
+    "msg_import_fail": {"ko": "설정 파일을 읽지 못했습니다:\n%s",
+                        "en": "Could not read the config file:\n%s"},
+    "msg_devimport_title": {"ko": "디바이스에서 불러오기", "en": "Load from Device"},
+    "msg_noip": {"ko": "디바이스 IP를 알 수 없습니다.\n비콘으로 자동 검색될 때까지 기다린 후 다시 시도하세요.",
+                 "en": "Device IP is unknown.\nWait until auto-discovery finds it, then retry."},
+    "msg_listener_down": {"ko": "리스너가 동작하지 않습니다.", "en": "The listener is not running."},
+    "msg_dumpfail_title": {"ko": "디바이스에서 불러오기 실패", "en": "Load from Device Failed"},
+    # 액션 설명
+    "desc_text": {"ko": "문구 \"%s\"", "en": "text \"%s\""},
+    "desc_app": {"ko": "app / URL %s", "en": "app / URL %s"},
+    "desc_shortcut": {"ko": "단축키 %s", "en": "shortcut %s"},
+    # 오류
+    "err_timeout": {"ko": "입력 실행 시간 초과 (10s)", "en": "Input timed out (10s)"},
+    "err_helper_os": {"ko": "입력 헬퍼 실행 오류: %s", "en": "Input helper error: %s"},
+    "err_helper_signal": {"ko": "입력 헬퍼가 시그널 %d로 종료됨 (pynput 크래시?)",
+                          "en": "Input helper exited with signal %d (pynput crash?)"},
+    "err_input_fail": {"ko": "입력 실행 실패: %s", "en": "Input failed: %s"},
+    "err_unknown": {"ko": "알 수 없는 오류", "en": "unknown error"},
+    "err_pynput_missing": {"ko": "pynput 미설치 — pip install -r requirements.txt",
+                           "en": "pynput not installed — pip install -r requirements.txt"},
+    "err_pillow": {"ko": "Pillow 미설치 — 버튼 이미지 기능에 필요합니다 (pip install -r requirements.txt)",
+                   "en": "Pillow not installed — needed for button images (pip install -r requirements.txt)"},
+    "err_app_timeout": {"ko": "앱 실행 시간 초과 (10s)", "en": "App launch timed out (10s)"},
+    "err_app_os": {"ko": "앱 실행 오류: %s", "en": "App launch error: %s"},
+    "err_app_fail": {"ko": "앱 실행 실패: %s", "en": "App launch failed: %s"},
+    "err_app_open": {"ko": "open이 실패했습니다", "en": "open failed"},
+    # 도움말
+    "help_title": {"ko": "프로그램 사용법", "en": "How to Use"},
+    "help_close": {"ko": "닫기", "en": "Close"},
+    "help_h": {"ko": "⌨️ CYD 무선 매크로 패드 사용법\n",
+               "en": "⌨️ CYD Wireless Macro Pad Guide\n"},
+    "help_start_sub": {"ko": "\n[ 시작하기 ]\n", "en": "\n[ Getting Started ]\n"},
+    "help_start_1": {"ko": "1. CYD 전원 → 같은 Wi-Fi에 자동 연결 → 하단 로그에 "
+                           "\"디바이스 발견\"이 뜹니다. IP 입력은 필요 없습니다 (자동 발견, UDP 8890).\n",
+                     "en": "1. Power the CYD → it auto-connects to the same Wi-Fi → "
+                           "\"device found\" appears in the log below. No IP entry needed (auto-discovery, UDP 8890).\n"},
+    "help_start_2": {"ko": "2. 페이지 탭(최대 8개)에서 4×3 버튼 12개를 설정한 뒤 [설정 적용]을 누르세요.\n",
+                     "en": "2. Configure the 4×3 grid (12 buttons) on a page tab (up to 8), then press [Apply Settings].\n"},
+    "help_start_3": {"ko": "3. 장치에서 버튼을 터치하면 호스트가 등록된 동작을 실행합니다.\n",
+                     "en": "3. Touch a button on the device and the host runs the registered action.\n"},
+    "help_start_4": {"ko": "4. 페이지 탭을 마우스로 끌어 순서를 바꿀 수 있습니다. 순서 변경은 "
+                           "놓는 즉시 자동으로 디바이스에도 반영됩니다.\n",
+                     "en": "4. Drag page tabs with the mouse to reorder. The new order is "
+                           "synced to the device immediately on drop.\n"},
+    "help_act_sub": {"ko": "\n[ 버튼 동작 3종 ]\n", "en": "\n[ 3 Action Types ]\n"},
+    "help_act_shortcut": {"ko": "▪ 단축키 (shortcut) — 키 조합 입력. 예: ",
+                          "en": "▪ Shortcut — key combination input. e.g. "},
+    "help_act_text": {"ko": "▪ 문구 (text) — 입력할 문자열. 예: ",
+                      "en": "▪ Text — the string to type. e.g. "},
+    "help_act_text_ime": {"ko": " (한글 포함 가능).\n", "en": " (Korean included).\n"},
+    "help_act_text_ime_sub": {"ko": "    클립보드(pbcopy) + Cmd+V 방식이라 한/영 입력기(IME)와 무관하게 동작합니다.\n",
+                              "en": "    Uses clipboard (pbcopy) + Cmd+V, so it works regardless of the IME.\n"},
+    "help_act_app": {"ko": "▪ app / URL — \"", "en": "▪ App / URL — \""},
+    "help_act_app_ex": {"ko": "    - 앱 예: Safari, Calculator, Notes   (Finder에 보이는 영문 이름)\n",
+                        "en": "    - App e.g. Safari, Calculator, Notes   (English name as in Finder)\n"},
+    "help_act_url_ex": {"ko": "    - URL 예: https://www.google.com , https://www.youtube.com\n",
+                        "en": "    - URL e.g. https://www.google.com , https://www.youtube.com\n"},
+    "help_keys_sub": {"ko": "\n[ 단축키에 쓸 수 있는 특수키 ]\n",
+                      "en": "\n[ Special keys usable in shortcuts ]\n"},
+    "help_keys_mod": {"ko": "  cmd(⌘)/command, ctrl(⌃)/control, alt(⌥)/option, shift(⇧)\n",
+                      "en": "  cmd(⌘)/command, ctrl(⌃)/control, alt(⌥)/option, shift(⇧)\n"},
+    "help_keys_nav": {"ko": "  space, enter/return, tab, esc/escape\n",
+                      "en": "  space, enter/return, tab, esc/escape\n"},
+    "help_keys_etc": {"ko": "  up/down/left/right, backspace, delete, caps_lock\n",
+                      "en": "  up/down/left/right, backspace, delete, caps_lock\n"},
+    "help_keys_fn": {"ko": "  home, end, page_up/page_down, fn, insert, print_screen\n",
+                     "en": "  home, end, page_up/page_down, fn, insert, print_screen\n"},
+    "help_keys_f": {"ko": "  f1 ~ f20 (기능키, 예: f5, cmd+shift+f3)\n",
+                    "en": "  f1 ~ f20 (function keys, e.g. f5, cmd+shift+f3)\n"},
+    "help_keys_plus": {"ko": "- 조합은 ", "en": "- Combine with "},
+    "help_keys_with": {"ko": " 로 연결: ", "en": " to join: "},
+    "help_keys_more": {"ko": "  등.\n", "en": "  etc.\n"},
+    "help_keys_single": {"ko": "- 영문·숫자 한 글자는 그대로: ",
+                         "en": "- A single letter/digit works as-is: "},
+    "help_keys_shiftnote": {"ko": "  (대소문자 무시).\n", "en": "  (case-insensitive).\n"},
+    "help_special_sub": {"ko": "\n[ 단축키 특수문자 — shift+X 형태 ]\n",
+                         "en": "\n[ Shortcut special characters — shift+X form ]\n"},
+    "help_special_expl": {"ko": "shortcut 동작에서 ! @ # $ % ^ & * ( ) < > : + 같은 특수문자는 ",
+                          "en": "In a shortcut action, special chars like ! @ # $ % ^ & * ( ) < > : + are "},
+    "help_special_sep": {"ko": "가 조합 구분자라 직접 못 쓰고, shift를 함께 써야 합니다:\n",
+                         "en": "is the join separator, so it can't be typed directly — use shift instead:\n"},
+    "help_special_ex_descr": {"ko": " → cmd + ＋(플러스) 키\n",
+                              "en": " → cmd + plus key\n"},
+    "help_special_textnote2": {"ko": " 동작은 shift+X 없이 특수문자를 그대로 입력합니다 (예: ",
+                               "en": " actions type special chars directly without shift+X (e.g. "},
+    "help_special_map": {"ko": "  ! = shift+1    @ = shift+2    # = shift+3    $ = shift+4    % = shift+5\n"
+                               "  ^ = shift+6    & = shift+7    * = shift+8    ( = shift+9    ) = shift+0\n"
+                               "  < = shift+,    > = shift+.    ? = shift+/    : = shift+;    + = shift+=\n",
+                         "en": "  ! = shift+1    @ = shift+2    # = shift+3    $ = shift+4    % = shift+5\n"
+                               "  ^ = shift+6    & = shift+7    * = shift+8    ( = shift+9    ) = shift+0\n"
+                               "  < = shift+,    > = shift+.    ? = shift+/    : = shift+;    + = shift+=\n"},
+    "help_special_ex": {"ko": "  예: ", "en": "  e.g. "},
+    "help_special_textnote": {"ko": "  참고: ", "en": "  Note: "},
+    "help_emoji_sub": {"ko": "\n[ 이모지 ]\n", "en": "\n[ Emoji ]\n"},
+    "help_emoji_expl": {"ko": "버튼 이름·액션 값에 이모지(예: ",
+                        "en": "Put an emoji in a button name or action value (e.g. "},
+    "help_emoji_tail": {"ko": ")를 넣으면 이미지로 렌더링되어 장치에 표시됩니다.\n",
+                        "en": ") and it renders as an image on the device.\n"},
+    "help_ex_shortcut": {"ko": "cmd+shift+4, cmd+c\n", "en": "cmd+shift+4, cmd+c\n"},
+    "help_ex_text": {"ko": "안녕하세요", "en": "Hello"},
+    "help_ex_emoji": {"ko": "📷 촬영", "en": "📷 Camera"},
+    "help_act_url_open": {"ko": "\"가 들어가면 URL로 열고, 아니면 macOS 앱 이름으로 실행합니다.\n",
+                          "en": "\" opens it as a URL; otherwise it runs the macOS app name.\n"},
+    "help_perm_warn": {"ko": "\n[ 필수 macOS 권한 ]\n", "en": "\n[ Required macOS Permission ]\n"},
+    "help_perm_expl": {"ko": "키보드 입력(단축키·문구)은 시스템 설정 → 개인정보 보호 및 보안 → "
+                             "손쉬운 사용에서\n터미널/호스트 프로그램에 권한을 줘야 동작합니다. "
+                             "없으면 조용히 무시됩니다.\n",
+                       "en": "Keyboard input (shortcut/text) needs permission in System Settings → "
+                             "Privacy & Security → Accessibility\nfor the terminal/host program. "
+                             "Without it, actions are silently ignored.\n"},
+    "help_backup_sub": {"ko": "\n[ 백업 / 복원 ]\n", "en": "\n[ Backup / Restore ]\n"},
+    "help_backup_export": {"ko": "▪ 내보내기: 현재 설정을 JSON 파일로 저장\n",
+                           "en": "▪ Export: save the current settings to a JSON file\n"},
+    "help_backup_import": {"ko": "▪ 가져오기: JSON 파일 불러오기\n",
+                           "en": "▪ Import: load a JSON file\n"},
+    "help_backup_device": {"ko": "▪ 디바이스에서 불러오기: 장치 내부 저장 설정을 읽어 편집 화면에 채움 "
+                                 "([설정 적용]으로 동기화).\n",
+                           "en": "▪ Load from device: read the device's stored settings into the "
+                                 "editor (sync with [Apply Settings]).\n"},
+}
+
+# 현재 언어 (모듈 전역). GUI __init__/언어 전환에서 갱신 — 단순 str 참조라 CPython GIL 하
+# 리스너 스레드에서 읽어도 안전. 모듈 함수(run_input_helper 등)도 같은 언어로 번역된다.
+_CUR_LANG = "ko"
+
+
+def _t(key: str) -> str:
+    """key의 현재 언어 문자열. key/언어 누락 시 ko로 폴백 (키 없으면 key 자체 반환)."""
+    entry = L10N.get(key)
+    if entry is None:
+        return key
+    return entry.get(_CUR_LANG) or entry.get("ko", key)
+
+
+def _tf(key: str, *args) -> str:
+    """_t 후 %-포맷 적용 (로그/오류/상태바의 동적 문자열). args 없으면 그대로."""
+    text = _t(key)
+    return text % args if args else text
+
+
+def _set_cur_lang(lang: str) -> None:
+    """모듈 전역 언어 갱신 — GUI __init__/언어 전환 시 호출 (리스너 스레드 번역 포함)."""
+    global _CUR_LANG
+    if lang in ("ko", "en"):
+        _CUR_LANG = lang
 
 
 def _pynput_installed() -> bool:
@@ -129,16 +394,16 @@ def run_input_helper(action_type: str, value: str) -> None:
             input=json.dumps({"type": action_type, "value": value}).encode("utf-8"),
             capture_output=True, timeout=10)
     except subprocess.TimeoutExpired:
-        raise RuntimeError("입력 실행 시간 초과 (10s)")
+        raise RuntimeError(_tf("err_timeout"))
     except OSError as e:
-        raise RuntimeError("입력 헬퍼 실행 오류: %s" % e)
+        raise RuntimeError(_tf("err_helper_os", e))
     if proc.returncode != 0:
         if proc.returncode < 0:
-            raise RuntimeError("입력 헬퍼가 시그널 %d로 종료됨 (pynput 크래시?)" % (-proc.returncode))
+            raise RuntimeError(_tf("err_helper_signal", -proc.returncode))
         err = proc.stderr.decode("utf-8", "replace").strip()
         if err.startswith("ERROR: "):
             err = err[7:]
-        raise RuntimeError("입력 실행 실패: %s" % (err or "알 수 없는 오류"))
+        raise RuntimeError(_tf("err_input_fail", err or _t("err_unknown")))
 
 
 def _trunc_utf8(text: str, max_bytes: int) -> bytes:
@@ -217,6 +482,15 @@ def _set_entry_value(entry: ttk.Entry, value: str) -> None:
         entry._ph_active = True
 
 
+def _set_placeholder_text(entry, new_ph: str) -> None:
+    """placeholder 문자열 교체 (언어 전환용) — 표시 중이면 즉시 반영, 아니면 다음 표시부터."""
+    entry._ph_text = new_ph
+    if getattr(entry, "_ph_active", False):
+        entry.delete(0, tk.END)
+        entry.insert(0, new_ph)
+        entry.config(foreground=_PH_COLOR)
+
+
 def _entry_text(entry: ttk.Entry) -> str:
     """플레이스홀더가 표시 중이면 ""(실제 값 없음)을, 아니면 입력값을 반환."""
     if getattr(entry, "_ph_active", False):
@@ -238,7 +512,7 @@ def _build_config_chunk(page_idx: int, items, num_pages: int, page_name: str = "
     for bid, btn in items:
         label = _trunc_utf8(btn.get("label") or "", LABEL_MAX)
         color = int(btn.get("color", 0) or 0)
-        if not (0 <= color < len(COLOR_NAMES)):
+        if not (0 <= color < COLOR_COUNT):
             color = 0
         atype_idx = ATYPE_TO_IDX.get(btn.get("action_type") or "shortcut", 0)
         aval = _trunc_utf8(btn.get("action_value") or "", ACTION_VAL_MAX)
@@ -327,42 +601,78 @@ def _ensure_pillow():
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError as e:
-        raise RuntimeError(
-            "Pillow 미설치 — 버튼 이미지 기능에 필요합니다 (pip install -r requirements.txt)") from e
+        raise RuntimeError(_t("err_pillow")) from e
     _PIL_READY = True
 
 
 _FONT_CACHE = {}
 
+# macOS AppleSDGothicNeo.ttc는 여러 굵기를 담은 TTC — 볼드 페이스 인덱스를 찾아 쓴다
+# (이 시스템에서 Bold=6, ExtraBold=14). 이름 스캔이라 macOS 버전에 따라 순서가 달라도 동작.
+_APPLE_GOTHIC_TTC = "/System/Library/Fonts/AppleSDGothicNeo.ttc"
 
-def _load_label_font(size: int):
+
+def _ttc_bold_index(path: str) -> int:
+    """TTC에서 정확히 'Bold' 이름을 가진 페이스 인덱스. 못 찾으면 -1 (regular 폴백 유도).
+
+    getname()의 스타일이 'SemiBold'/'ExtraBold'처럼 Bold를 부분 포함해도 골라내지
+    않도록, 스타일 첫 단어가 정확히 'Bold'인 페이스만 선택한다."""
+    _ensure_pillow()   # ImageFont가 모듈에 로드돼 있어야 한다 (지연 import 방어)
+    for i in range(32):
+        try:
+            f = ImageFont.truetype(path, 14, index=i)
+        except Exception:
+            return -1
+        style = f.getname()[1]
+        if style == "Bold" or style.startswith("Bold "):
+            return i
+    return -1
+
+
+def _load_label_font(size: int, bold: bool = False):
     """라벨 렌더용 폰트. macOS/Windows 시스템 폰트를 우선, 없으면 기본 폰트.
-    결과는 크기별로 캐시 (한글 포함 — F에서 같은 경로 사용)."""
-    if size in _FONT_CACHE:
-        return _FONT_CACHE[size]
+
+    bold=True면 한/영 통합 볼드 폰트를 우선한다 — macOS AppleSDGothicNeo Bold(TTC),
+    Windows Malgun/Segoe/Arial Bold. 실제 볼드 페이스가 없으면 regular로 폴백한다.
+    결과는 (size, bold)별로 캐시.
+    """
+    key = (size, bold)
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
     _ensure_pillow()
     font = None
     if sys.platform == "darwin":
-        candidates = ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-                      "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-                      "/System/Library/Fonts/Helvetica.ttc")
+        if bold and os.path.exists(_APPLE_GOTHIC_TTC):
+            idx = _ttc_bold_index(_APPLE_GOTHIC_TTC)
+            if idx >= 0:
+                try:
+                    font = ImageFont.truetype(_APPLE_GOTHIC_TTC, size, index=idx)
+                except Exception:
+                    font = None
+        if font is None:
+            candidates = ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                          "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+                          "/System/Library/Fonts/Helvetica.ttc")
     else:
-        candidates = ("C:/Windows/Fonts/malgun.ttf",
-                      "C:/Windows/Fonts/segoeui.ttf",
-                      "C:/Windows/Fonts/arial.ttf")
-    for p in candidates:
-        if os.path.exists(p):
-            try:
-                font = ImageFont.truetype(p, size)
-                break
-            except Exception:
-                continue
+        candidates = (("C:/Windows/Fonts/malgunbd.ttf", "C:/Windows/Fonts/segoeuib.ttf",
+                       "C:/Windows/Fonts/arialbd.ttf")
+                      if bold else
+                      ("C:/Windows/Fonts/malgun.ttf", "C:/Windows/Fonts/segoeui.ttf",
+                       "C:/Windows/Fonts/arial.ttf"))
+    if font is None:
+        for p in candidates:
+            if os.path.exists(p):
+                try:
+                    font = ImageFont.truetype(p, size)
+                    break
+                except Exception:
+                    continue
     if font is None:
         try:
             font = ImageFont.load_default(size)   # Pillow 10.1+ 크기 지정 가능
         except TypeError:
             font = ImageFont.load_default()
-    _FONT_CACHE[size] = font
+    _FONT_CACHE[key] = font
     return font
 
 
@@ -464,8 +774,20 @@ def _compose_button_image_emoji(label: str, color_idx: int):
     if not tokens:
         return None
 
-    for fs in range(18, 7, -1):
-        text_font = _load_label_font(fs)
+    # [폰트] 순수 이모지 라벨(단일 런)은 버튼을 채우는 큰 이모지로 렌더 (기존 20px → ~49px)
+    if len(tokens) == 1 and len(tokens[0]) == 1 and tokens[0][0][1]:
+        g = _emoji_glyph(tokens[0][0][0], max_h - 2)
+        # 가로로 긴 이모지는 폭 여백(max_w)에도 맞게 다시 축소
+        if g is not None and g.width > max_w:
+            g = _emoji_glyph(tokens[0][0][0], max(1, round((max_h - 2) * max_w / g.width)))
+        if g is not None:
+            x = (BTN_IMG_W - g.width) // 2
+            y = (BTN_IMG_H - g.height) // 2
+            img.paste(g, (int(x), int(y)), g)
+            return img
+
+    for fs in range(20, 7, -1):
+        text_font = _load_label_font(fs, bold=True)
         space_w = d.textlength(" ", font=text_font)
 
         # 런별 (is_emoji, width, glyph|None, run) — 이모지 폭은 실제 축소 글리프 폭
@@ -518,6 +840,7 @@ def _compose_button_image_emoji(label: str, color_idx: int):
                     x += g.width
                 else:
                     bbox = d.textbbox((0, 0), run, font=text_font)
+                    # [폰트] 볼드 페이스 자체가 두꺼우므로 stroke 겹침은 제거 (뭉개짐 방지)
                     d.text((x - bbox[0], y - bbox[1]), run, font=text_font, fill=text_hex)
                     x += d.textlength(run, font=text_font)
         return img
@@ -564,8 +887,8 @@ def _compose_button_image(label: str, color_idx: int):
 
     max_w, max_h = BTN_IMG_W - 10, BTN_IMG_H - 10
     words = label.split()
-    for fs in range(15, 7, -1):
-        font = _load_label_font(fs)
+    for fs in range(20, 7, -1):
+        font = _load_label_font(fs, bold=True)
         lines = _wrap_words(d, words, font, max_w, 2)
         if lines is None:
             continue
@@ -581,7 +904,7 @@ def _compose_button_image(label: str, color_idx: int):
             d.text((x, y), ln, font=font, fill=text_hex)
         return img
     # 최소 폰트에서도 안 들어가면 잘림
-    font = _load_label_font(7)
+    font = _load_label_font(7, bold=True)
     short = label if len(label) <= 7 else label[:6] + "…"
     bbox = d.textbbox((0, 0), short, font=font)
     d.text(((BTN_IMG_W - (bbox[2] - bbox[0])) / 2 - bbox[0],
@@ -818,6 +1141,12 @@ class MacroPadGUI:
         self.config_path = Path(__file__).resolve().parent / "macro_config.json"
         self.config = self._load_config()          # dict (런타임 스냅샷: 메인/리스너가 lock으로 읽음)
 
+        # [PLAN] 언어 설정 (호스트 표시 전용 — config에만 저장, 와이어 프로토콜 무관)
+        self.lang = self.config.get("lang", "ko") or "ko"
+        if self.lang not in ("ko", "en"):
+            self.lang = "ko"
+        _set_cur_lang(self.lang)                   # 모듈 전역 → 모듈 함수(run_input_helper 등)도 동일 언어
+
         # 스레드 동기화
         self._config_lock = threading.Lock()
         self._resend_queue: "queue.Queue[str]" = queue.Queue()  # Apply→리스너 재전송 요청
@@ -832,6 +1161,10 @@ class MacroPadGUI:
         self._drag_tab: str | None = None          # 탭 드래그 재정렬 중인 탭 ID (None=미드래그)
         self._tab_dragged = False                  # 드래그 중 실제 탭 이동이 있었는지 (클릭↔드래그 구분)
         self._help_win: "tk.Toplevel | None" = None  # [?] 도움말 창 단일 인스턴스
+
+        # [PLAN] 언어 전환 리프레시 상태
+        self._i18n_widgets: list = []             # (widget, key) — 정적 위젯, _refresh_lang에서 text 갱신
+        self._listen_status: tuple | None = None  # (key, fg, args) — 상태바 마지막 표시값 (재렌더용)
 
         # [H] 동기화 재설계 상태
         self._pushed_ip: str | None = None         # 이번 세션에서 전체 푸시한 디바이스 IP (1회 푸시 판정)
@@ -866,6 +1199,7 @@ class MacroPadGUI:
             "version": 3,
             "port": UDP_PORT,
             "device_ip": "",
+            "lang": "ko",
             "pages": [{"name": "Page %d" % (i + 1), "buttons": list(empty)}
                       for i in range(DEFAULT_PAGES)],
         }
@@ -886,7 +1220,7 @@ class MacroPadGUI:
             for bid in range(BUTTONS_PER_PAGE):
                 b = btns[bid] if bid < len(btns) and isinstance(btns[bid], dict) else {}
                 color = int(b.get("color", 0) or 0)
-                if not (0 <= color < len(COLOR_NAMES)):
+                if not (0 <= color < COLOR_COUNT):
                     color = 0
                 image = b.get("image")
                 if not isinstance(image, str) or not image:
@@ -899,16 +1233,107 @@ class MacroPadGUI:
                     "image": image,
                 })
             norm.append({"name": (pg.get("name") or "Page %d" % (i + 1)), "buttons": buttons})
+        lang = config.get("lang", "ko")
         return {
             "version": 3,
             "port": int(config.get("port", UDP_PORT) or UDP_PORT),
             "device_ip": str(config.get("device_ip", "") or ""),
+            "lang": lang if lang in ("ko", "en") else "ko",
             "pages": norm,
         }
 
     def _save_config(self, config: dict) -> None:
         self.config_path.write_text(
             json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # [PLAN] 언어 설정: 조회 헬퍼 + 언어 메뉴/전환/리프레시
+    # ------------------------------------------------------------------
+    def _atype_labels(self) -> dict:
+        """현재 언어의 액션 타입 라벨 맵 {내부값: 표시라벨}."""
+        return ATYPE_LABELS.get(self.lang, ATYPE_LABELS["ko"])
+
+    def _atype_label(self, atype: str) -> str:
+        return self._atype_labels().get(atype, atype)
+
+    def _color_names(self) -> list:
+        """현재 언어의 색상 표시명 리스트 (index 계약은 그대로 — 와이어/펌웨어와 무관)."""
+        return COLOR_NAMES.get(self.lang, COLOR_NAMES["ko"])
+
+    def _color_name(self, idx: int) -> str:
+        names = self._color_names()
+        return names[idx] if 0 <= idx < len(names) else names[0]
+
+    def _color_index(self, name: str):
+        """표시명 → index (어느 언어든). 모르는 이름이면 None."""
+        return COLOR_NAME_TO_IDX.get(name)
+
+    def _show_lang_menu(self) -> None:
+        """언어 선택 팝업 — ? 버튼 왼쪽의 🌐 버튼. 선택 즉시 전환 + config 저장."""
+        menu = tk.Menu(self.root, tearoff=0)
+        for code, label in (("ko", "한국어"), ("en", "English")):
+            menu.add_radiobutton(label=label, value=code,
+                                 command=lambda c=code: self._set_lang(c))
+        try:
+            menu.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        finally:
+            menu.grab_release()
+
+    def _set_lang(self, lang: str) -> None:
+        if lang not in ("ko", "en") or lang == self.lang:
+            return
+        self.lang = lang
+        _set_cur_lang(lang)
+        with self._config_lock:
+            self.config["lang"] = lang
+        self._save_config(self.config)
+        # 도움말/메뉴는 재오픈 시 새 언어로 — 열려 있던 창은 닫는다
+        if self._help_win is not None:
+            try:
+                if self._help_win.winfo_exists():
+                    self._help_win.destroy()
+            except tk.TclError:
+                pass
+            self._help_win = None
+        self.lang_btn.config(text=_t("lang_btn"))
+        self._refresh_lang()
+        self._log(_tf("log_lang", "한국어" if lang == "ko" else "English"))
+
+    def _refresh_lang(self) -> None:
+        """언어 전환 시 표시 문자열 일괄 갱신 (카드 상태: color index/action type 보존)."""
+        # 1) 정적 위젯
+        for widget, key in self._i18n_widgets:
+            try:
+                widget.config(text=_t(key))
+            except tk.TclError:
+                pass
+        # 2) 상태바
+        if self._listen_status:
+            key, fg, args = self._listen_status
+            self.listen_status.config(text=_tf(key, *args), fg=fg)
+        # 3) 카드별 동적 위젯 — 현재 선택값(내부 index/타입)을 새 언어 라벨로 재표시
+        atype_labels = self._atype_labels()
+        color_names = self._color_names()
+        for page_widgets in self._button_widgets:
+            for w in page_widgets:
+                w["action"].config(values=list(atype_labels.values()))   # 드롭다운 목록도 새 언어로
+                w["color"].config(values=color_names)
+                atype = ATYPE_FROM_LABEL.get(w["action"].get(), "shortcut")
+                w["action"].set(atype_labels.get(atype, atype))
+                cidx = self._color_index(w["color"].get())   # 어느 언어 라벨이든 index 복원
+                if cidx is not None:
+                    w["color"].set(color_names[cidx])
+                self._update_hint(w["hint"], w["action"])
+                for entry, key in ((w["label"], "ph_name"), (w["value"], "ph_action")):
+                    _set_placeholder_text(entry, _t(key))
+
+    def _set_listen_status(self, key: str, fg: str, *args) -> None:
+        """상태바 갱신 + 재렌더용 (key, fg, args) 저장. 언어 전환 시 _refresh_lang이 복원."""
+        self._listen_status = (key, fg, args)
+        try:
+            self.listen_status.config(text=_tf(key, *args), fg=fg)
+        except tk.TclError:
+            pass    # 창 생성 전/파괴 후 호출되면 무시
 
     # ------------------------------------------------------------------
     # UI 스타일
@@ -970,31 +1395,43 @@ class MacroPadGUI:
         self.help_btn = self._button(title_row, "?", self._show_help, "#334155",
                                      font=("Pretendard", 12), padx=8, pady=6, width=2)
         self.help_btn.pack(side=tk.RIGHT, padx=(8, 0))
-        tk.Label(header_frame, text="ESP32-2432S028 터치 버튼 → UDP 이벤트 → 매크로 실행",
-                 bg=self.bg_color, fg=self.sub_text, font=("Pretendard", 9)).pack(anchor="w")
+        # [PLAN] 언어 선택 버튼 — ? 다음에 pack해 ? 왼쪽에 위치. 선택 즉시 전체 UI 문자열 전환.
+        self.lang_btn = self._button(title_row, _t("lang_btn"), self._show_lang_menu, "#334155",
+                                     font=("Pretendard", 10), padx=8, pady=6)
+        self.lang_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self._subtitle_label = tk.Label(header_frame, text=_t("subtitle"),
+                                        bg=self.bg_color, fg=self.sub_text,
+                                        font=("Pretendard", 9))
+        self._subtitle_label.pack(anchor="w")
+        self._i18n_widgets.append((self._subtitle_label, "subtitle"))
 
         # 리스너 상태 카드 (IP/포트/시작 버튼 없음 — 리스너는 자동 시작)
         status_card = tk.Frame(self.root, bg=self.card_bg, bd=1, relief=tk.SOLID, padx=12, pady=8)
         status_card.pack(fill=tk.X, padx=16, pady=(0, 8))
-        self.listen_status = tk.Label(status_card, text="● 리스너 시작 중...", bg=self.card_bg,
+        self.listen_status = tk.Label(status_card, text=_t("status_starting"), bg=self.card_bg,
                                       fg=self.sub_text, font=("Pretendard", 9), anchor="w")
         self.listen_status.pack(fill=tk.X)
+        self._set_listen_status("status_starting", self.sub_text)   # 언어 전환 재렌더용 상태 기록
 
         # 페이지 관리 행 (이름 편집 + 추가/삭제)
         page_row = tk.Frame(self.root, bg=self.card_bg, bd=1, relief=tk.SOLID, padx=12, pady=8)
         page_row.pack(fill=tk.X, padx=16, pady=(0, 8))
-        ttk.Label(page_row, text="페이지 이름:").pack(side=tk.LEFT)
+        self._page_name_label = ttk.Label(page_row, text=_t("label_page_name"))
+        self._page_name_label.pack(side=tk.LEFT)
+        self._i18n_widgets.append((self._page_name_label, "label_page_name"))
         self.page_name_entry = self._text_entry(page_row, 18)
         self.page_name_entry.pack(side=tk.LEFT, padx=6)
         self.page_name_entry.bind("<KeyRelease>", lambda e: self._page_name_edited())
         # [FIX] +/− 페이지 버튼을 내보내기/가져오기와 동일한 모양(배경/폰트/패딩)으로 통일.
         #       사이 간격도 내보내기↔가져오기와 같은 8px를 둔다.
-        self.del_page_btn = self._button(page_row, "− 페이지", self._del_page, "#334155",
+        self.del_page_btn = self._button(page_row, _t("btn_del_page"), self._del_page, "#334155",
                                          font=("Pretendard", 12), padx=8, pady=6)
         self.del_page_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.add_page_btn = self._button(page_row, "+ 페이지", self._add_page, "#334155",
+        self.add_page_btn = self._button(page_row, _t("btn_add_page"), self._add_page, "#334155",
                                          font=("Pretendard", 12), padx=8, pady=6)
         self.add_page_btn.pack(side=tk.RIGHT, padx=(0, 8))
+        self._i18n_widgets += [(self.del_page_btn, "btn_del_page"),
+                               (self.add_page_btn, "btn_add_page")]
 
         # 페이지 노트북 (최대 MAX_PAGES × 4×3 버튼) — pack은 하단 바를 먼저 고정한 뒤 진행
         self.notebook = ttk.Notebook(self.root)
@@ -1011,19 +1448,22 @@ class MacroPadGUI:
         bot_card.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(0, 8))
         bot_row = tk.Frame(bot_card, bg=self.card_bg)
         bot_row.pack(fill=tk.X)
-        self.apply_btn = self._button(bot_row, "💾 설정 적용 (Apply)", self._apply, "#0ea5e9",
+        self.apply_btn = self._button(bot_row, _t("btn_apply"), self._apply, "#0ea5e9",
                                       font=("Pretendard", 12, "bold"), padx=12, pady=6)
         self.apply_btn.pack(side=tk.LEFT)
-        self.export_btn = self._button(bot_row, "⬇ 내보내기", self._export_config, "#334155",
+        self.export_btn = self._button(bot_row, _t("btn_export"), self._export_config, "#334155",
                                        font=("Pretendard", 12), padx=8, pady=6)
         self.export_btn.pack(side=tk.LEFT, padx=(8, 0))
-        self.import_btn = self._button(bot_row, "⬆ 가져오기", self._import_config, "#334155",
+        self.import_btn = self._button(bot_row, _t("btn_import"), self._import_config, "#334155",
                                        font=("Pretendard", 12), padx=8, pady=6)
         self.import_btn.pack(side=tk.LEFT, padx=(8, 0))
-        self.device_import_btn = self._button(bot_row, "🖥 디바이스에서 불러오기",
+        self.device_import_btn = self._button(bot_row, _t("btn_device_import"),
                                               self._import_from_device, "#334155",
                                               font=("Pretendard", 12), padx=8, pady=6)
         self.device_import_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._i18n_widgets += [(self.apply_btn, "btn_apply"), (self.export_btn, "btn_export"),
+                               (self.import_btn, "btn_import"),
+                               (self.device_import_btn, "btn_device_import")]
         log_frame = tk.Frame(bot_card, bg=self.card_bg)
         log_frame.pack(fill=tk.BOTH, pady=(8, 0))
         self.log_text = tk.Text(log_frame, height=6, bg="#020617", fg=self.text_color,
@@ -1031,7 +1471,7 @@ class MacroPadGUI:
                                 font=("Pretendard", 12), relief=tk.FLAT, padx=6, pady=4)
         self.log_text.pack(fill=tk.BOTH)
         self.log_text.tag_configure("error", foreground="#ef4444")
-        self._log("준비됨. CYD에 설정을 적용하려면 '설정 적용'을 누르세요.")
+        self._log(_t("log_ready"))
 
         # 노트북 pack (하단 바 위 남은 공간 전체) 후 페이지 탭 구성
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
@@ -1056,7 +1496,7 @@ class MacroPadGUI:
                 pass    # 창이 이미 파괴됨 → 아래에서 새로 생성
         win = tk.Toplevel(self.root)
         self._help_win = win
-        win.title("프로그램 사용법")
+        win.title(_t("help_title"))
         win.configure(bg=self.bg_color)
         win.geometry("640x600")
         win.transient(self.root)
@@ -1077,63 +1517,58 @@ class MacroPadGUI:
         txt.tag_configure("warn", foreground="#fbbf24", font=("Pretendard", 14, "bold"))
 
         # (태그, 본문) — 실제 동작 정의(_exec_shortcut/_exec_text/_exec_app)와 일치시킬 것
+        # [PLAN] 전부 _t() 기반 — 언어 전환 시 재오픈하면 새 언어로 표시된다.
         guide = [
-            ("h",   "⌨️ CYD 무선 매크로 패드 사용법\n"),
-            ("sub", "\n[ 시작하기 ]\n"),
-            ("",    "1. CYD 전원 → 같은 Wi-Fi에 자동 연결 → 하단 로그에 "
-                    "\"디바이스 발견\"이 뜹니다. IP 입력은 필요 없습니다 (자동 발견, UDP 8890).\n"),
-            ("",    "2. 페이지 탭(최대 8개)에서 4×3 버튼 12개를 설정한 뒤 [설정 적용]을 누르세요.\n"),
-            ("",    "3. 장치에서 버튼을 터치하면 호스트가 등록된 동작을 실행합니다.\n"),
-            ("",    "4. 페이지 탭을 마우스로 끌어 순서를 바꿀 수 있습니다. 순서 변경은 "
-                    "놓는 즉시 자동으로 디바이스에도 반영됩니다.\n"),
-            ("sub", "\n[ 버튼 동작 3종 ]\n"),
-            ("",    "▪ 단축키 (shortcut) — 키 조합 입력. 예: "), ("code", "cmd+shift+4, cmd+c\n"),
-            ("",    "▪ 문구 (text) — 입력할 문자열. 예: "), ("code", "안녕하세요"),
-            ("",    " (한글 포함 가능).\n"),
-            ("sub", "    클립보드(pbcopy) + Cmd+V 방식이라 한/영 입력기(IME)와 무관하게 동작합니다.\n"),
-            ("",    "▪ app / URL — \""),
+            ("h",   _t("help_h")),
+            ("sub", _t("help_start_sub")),
+            ("",    _t("help_start_1")),
+            ("",    _t("help_start_2")),
+            ("",    _t("help_start_3")),
+            ("",    _t("help_start_4")),
+            ("sub", _t("help_act_sub")),
+            ("",    _t("help_act_shortcut")), ("code", _t("help_ex_shortcut")),
+            ("",    _t("help_act_text")), ("code", _t("help_ex_text")),
+            ("",    _t("help_act_text_ime")),
+            ("sub", _t("help_act_text_ime_sub")),
+            ("",    _t("help_act_app")),
             ("code", "://"),
-            ("",    "\"가 들어가면 URL로 열고, 아니면 macOS 앱 이름으로 실행합니다.\n"),
-            ("code", "    - 앱 예: Safari, Calculator, Notes   (Finder에 보이는 영문 이름)\n"),
-            ("code", "    - URL 예: https://www.google.com , https://www.youtube.com\n"),
-            ("sub", "\n[ 단축키에 쓸 수 있는 특수키 ]\n"),
-            ("code", "  cmd(⌘)/command, ctrl(⌃)/control, alt(⌥)/option, shift(⇧)\n"),
-            ("code", "  space, enter/return, tab, esc/escape\n"),
-            ("code", "  up/down/left/right, backspace, delete, caps_lock\n"),
-            ("code", "  home, end, page_up/page_down, fn, insert, print_screen\n"),
-            ("code", "  f1 ~ f20 (기능키, 예: f5, cmd+shift+f3)\n"),
-            ("",    "- 조합은 "), ("code", "+"), ("", " 로 연결: "), ("code", "cmd+option+v"),
-            ("",    "  등.\n"),
-            ("",    "- 영문·숫자 한 글자는 그대로: "), ("code", "cmd+a, cmd+1"),
-            ("",    "  (대소문자 무시).\n"),
-            ("sub", "\n[ 단축키 특수문자 — shift+X 형태 ]\n"),
-            ("",    "shortcut 동작에서 ! @ # $ % ^ & * ( ) < > : + 같은 특수문자는 "),
-            ("code", "+"), ("", "가 조합 구분자라 직접 못 쓰고, shift를 함께 써야 합니다:\n"),
-            ("code", "  ! = shift+1    @ = shift+2    # = shift+3    $ = shift+4    % = shift+5\n"),
-            ("code", "  ^ = shift+6    & = shift+7    * = shift+8    ( = shift+9    ) = shift+0\n"),
-            ("code", "  < = shift+,    > = shift+.    ? = shift+/    : = shift+;    + = shift+=\n"),
-            ("",    "  예: "), ("code", "cmd+shift+="), ("", " → cmd + ＋(플러스) 키\n"),
-            ("",    "  참고: "), ("code", "text"), ("", " 동작은 shift+X 없이 특수문자를 "
-                    "그대로 입력합니다 (예: "), ("code", "Hello! <3"), ("", ").\n"),
-            ("sub", "\n[ 이모지 ]\n"),
-            ("",    "버튼 이름·액션 값에 이모지(예: "),
-            ("code", "📷 촬영"),
-            ("",    ")를 넣으면 이미지로 렌더링되어 장치에 표시됩니다.\n"),
-            ("warn", "\n[ 필수 macOS 권한 ]\n"),
-            ("",    "키보드 입력(단축키·문구)은 시스템 설정 → 개인정보 보호 및 보안 → "
-                    "손쉬운 사용에서\n터미널/호스트 프로그램에 권한을 줘야 동작합니다. "
-                    "없으면 조용히 무시됩니다.\n"),
-            ("sub", "\n[ 백업 / 복원 ]\n"),
-            ("",    "▪ 내보내기: 현재 설정을 JSON 파일로 저장\n"),
-            ("",    "▪ 가져오기: JSON 파일 불러오기\n"),
-            ("",    "▪ 디바이스에서 불러오기: 장치 내부 저장 설정을 읽어 편집 화면에 채움 "
-                    "([설정 적용]으로 동기화).\n"),
+            ("",    _t("help_act_url_open")),
+            ("code", _t("help_act_app_ex")),
+            ("code", _t("help_act_url_ex")),
+            ("sub", _t("help_keys_sub")),
+            ("code", _t("help_keys_mod")),
+            ("code", _t("help_keys_nav")),
+            ("code", _t("help_keys_etc")),
+            ("code", _t("help_keys_fn")),
+            ("code", _t("help_keys_f")),
+            ("",    _t("help_keys_plus")), ("code", "+"), ("", _t("help_keys_with")),
+            ("code", "cmd+option+v"), ("", _t("help_keys_more")),
+            ("",    _t("help_keys_single")), ("code", "cmd+a, cmd+1"),
+            ("",    _t("help_keys_shiftnote")),
+            ("sub", _t("help_special_sub")),
+            ("",    _t("help_special_expl")),
+            ("code", "+"), ("", _t("help_special_sep")),
+            ("code", _t("help_special_map")),
+            ("",    _t("help_special_ex")), ("code", "cmd+shift+="),
+            ("",    _t("help_special_ex_descr")),
+            ("",    _t("help_special_textnote")), ("code", "text"),
+            ("",    _t("help_special_textnote2")), ("code", "Hello! <3"), ("", ").\n"),
+            ("sub", _t("help_emoji_sub")),
+            ("",    _t("help_emoji_expl")),
+            ("code", _t("help_ex_emoji")),
+            ("",    _t("help_emoji_tail")),
+            ("warn", _t("help_perm_warn")),
+            ("",    _t("help_perm_expl")),
+            ("sub", _t("help_backup_sub")),
+            ("",    _t("help_backup_export")),
+            ("",    _t("help_backup_import")),
+            ("",    _t("help_backup_device")),
         ]
         for tag, text in guide:
             txt.insert(tk.END, text, tag)
         txt.config(state=tk.DISABLED)
 
-        close = tk.Button(win, text="닫기", command=win.destroy, width=8,
+        close = tk.Button(win, text=_t("help_close"), command=win.destroy, width=8,
                           bg="#334155", fg=self.text_color, activebackground="#475569",
                           activeforeground=self.text_color, relief=tk.FLAT, bd=0, cursor="hand2",
                           font=("Pretendard", 14))
@@ -1161,18 +1596,19 @@ class MacroPadGUI:
                  font=("Pretendard", 10)).pack(anchor="w")
         lbl = self._text_entry(f, 12)
         lbl.pack(fill=tk.X, pady=(2, 2))
-        _setup_entry_placeholder(lbl, "이름")     # 빈 칸일 때 힌트 (어느 칸인지 표시)
-        act = ttk.Combobox(f, values=list(ATYPE_LABELS.values()), width=10, state="readonly")
+        _setup_entry_placeholder(lbl, _t("ph_name"))    # 빈 칸일 때 힌트 (어느 칸인지 표시)
+        act = ttk.Combobox(f, values=list(self._atype_labels().values()),
+                           width=10, state="readonly")
         act.pack(fill=tk.X, pady=(0, 2))
         val = self._text_entry(f, 12)
         val.pack(fill=tk.X, pady=(0, 2))
-        _setup_entry_placeholder(val, "액션")     # 액션 값(단축키/문구/앱·URL) 힌트
+        _setup_entry_placeholder(val, _t("ph_action"))  # 액션 값(단축키/문구/앱·URL) 힌트
         # 색상 선택 (구분용): 스와치 + 팔레트 Combobox
         color_row = tk.Frame(f, bg="#1e293b")
         color_row.pack(fill=tk.X, pady=(0, 2))
         swatch = tk.Label(color_row, text="  ", bg=COLOR_HEX[0], width=2)
         swatch.pack(side=tk.LEFT)
-        col = ttk.Combobox(color_row, values=COLOR_NAMES, width=9, state="readonly")
+        col = ttk.Combobox(color_row, values=self._color_names(), width=9, state="readonly")
         col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
         col.bind("<<ComboboxSelected>>",
                  lambda e, s=swatch, c=col: self._color_selected(s, c))
@@ -1184,7 +1620,7 @@ class MacroPadGUI:
         img_btn = self._button(img_row, "🖼", lambda: self._pick_image(page, bid), "#334155",
                                font=("Pretendard", 10), padx=2, pady=1, width=3)
         img_btn.pack(side=tk.LEFT)
-        img_preview = tk.Label(img_row, text="라벨/색상", bg="#0f172a", fg=self.sub_text,
+        img_preview = tk.Label(img_row, text=_t("preview_label"), bg="#0f172a", fg=self.sub_text,
                                font=("Pretendard", 9), padx=4, pady=2, width=7)
         img_preview.pack(side=tk.LEFT, padx=4)
         img_clear = self._button(img_row, "✕", lambda: self._clear_image(page, bid), "#334155",
@@ -1200,11 +1636,10 @@ class MacroPadGUI:
                 "img_preview": img_preview, "img_clear": img_clear,
                 "img_photo": None, "hint": hint}
 
-    @staticmethod
-    def _color_selected(swatch: tk.Label, col: ttk.Combobox) -> None:
-        name = col.get()
-        if name in COLOR_NAMES:
-            swatch.config(bg=COLOR_HEX[COLOR_NAMES.index(name)])
+    def _color_selected(self, swatch: tk.Label, col: ttk.Combobox) -> None:
+        idx = self._color_index(col.get())
+        if idx is not None:
+            swatch.config(bg=COLOR_HEX[idx])
 
     # ------------------------------------------------------------------
     # [G] 버튼 이미지 업로드/제거/미리보기
@@ -1215,14 +1650,14 @@ class MacroPadGUI:
         [H] 즉시 푸시하지 않는다 — 디바이스 반영은 [설정 적용]을 눌렀을 때만.
         """
         path = filedialog.askopenfilename(
-            filetypes=[("이미지 파일", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"),
-                       ("모든 파일", "*.*")])
+            filetypes=[(_tf("fd_image_files"), "*.png *.jpg *.jpeg *.bmp *.gif *.webp"),
+                       (_tf("fd_all_files"), "*.*")])
         if not path:
             return
         try:
             b64 = _image_file_to_b64(path)
         except Exception as e:
-            self._log("⚠️ 이미지 변환 실패: %s" % e, error=True)
+            self._log(_tf("log_img_convert_fail", e), error=True)
             return
         with self._config_lock:
             pages = self.config["pages"]
@@ -1231,8 +1666,7 @@ class MacroPadGUI:
                 if bid < len(btns):
                     btns[bid]["image"] = b64
         self._update_card_image_preview(page, bid)
-        self._log("🖼 이미지 업로드: page%d · #%d (%s) — 적용하려면 [설정 적용]"
-                  % (page + 1, bid, os.path.basename(path)))
+        self._log(_tf("log_img_upload", page + 1, bid, os.path.basename(path)))
 
     def _clear_image(self, page: int, bid: int) -> None:
         """버튼 이미지 제거 → 디바이스는 라벨 텍스트/색 사각형으로 폴백 (MIMG fmt=1).
@@ -1246,7 +1680,7 @@ class MacroPadGUI:
                 if bid < len(btns):
                     btns[bid]["image"] = None
         self._update_card_image_preview(page, bid)
-        self._log("🗑 이미지 제거: page%d · #%d — 적용하려면 [설정 적용]" % (page + 1, bid))
+        self._log(_tf("log_img_remove", page + 1, bid))
 
     def _update_card_image_preview(self, page: int, bid: int) -> None:
         """카드 썸네일을 config의 base64 이미지로 갱신 (없으면 '라벨/색상' 표시)."""
@@ -1274,7 +1708,7 @@ class MacroPadGUI:
                 return
             except Exception:
                 w["img_photo"] = None
-        w["img_preview"].config(image="", text="라벨/색상")
+        w["img_preview"].config(image="", text=_t("preview_label"))
 
     def _make_page_tab(self, idx: int, name: str) -> None:
         """페이지 탭 하나를 만들어 _button_widgets/_page_tabs에 추가한다."""
@@ -1310,11 +1744,10 @@ class MacroPadGUI:
         self._button_widgets.append(page_widgets)
         self._page_tabs.append(tab)
 
-    @staticmethod
-    def _update_hint(hint: tk.Label, act: ttk.Combobox) -> None:
-        hints = {"shortcut": "단축키: cmd+shift+4",
-                 "text": "문구: 한글 가능",
-                 "app": "영문 앱명(예: Calculator) or URL"}
+    def _update_hint(self, hint: tk.Label, act: ttk.Combobox) -> None:
+        hints = {"shortcut": _t("hint_shortcut"),
+                 "text": _t("hint_text"),
+                 "app": _t("hint_app")}
         label = act.get()
         hint.config(text=hints.get(ATYPE_FROM_LABEL.get(label, label), ""))
 
@@ -1332,12 +1765,12 @@ class MacroPadGUI:
                     if bid < len(btns):
                         btn = btns[bid]
                 _set_entry_value(w["label"], btn.get("label") or "")
-                w["action"].set(ATYPE_LABELS.get(btn.get("action_type") or "shortcut", "shortcut"))
+                w["action"].set(self._atype_label(btn.get("action_type") or "shortcut"))
                 _set_entry_value(w["value"], btn.get("action_value") or "")
                 color = int(btn.get("color", 0) or 0)
-                if not (0 <= color < len(COLOR_NAMES)):
+                if not (0 <= color < COLOR_COUNT):
                     color = 0
-                w["color"].set(COLOR_NAMES[color])
+                w["color"].set(self._color_name(color))
                 w["swatch"].config(bg=COLOR_HEX[color])
                 self._update_hint(w["hint"], w["action"])
         # [G] 각 카드 이미지 미리보기 갱신 (업로드된 base64 이미지 표시)
@@ -1379,7 +1812,7 @@ class MacroPadGUI:
     def _add_page(self) -> None:
         with self._config_lock:
             if len(self.config["pages"]) >= MAX_PAGES:
-                self._log("⚠️ 페이지는 최대 %d개까지 추가할 수 있습니다" % MAX_PAGES, error=True)
+                self._log(_tf("log_page_max", MAX_PAGES), error=True)
                 return
         idx = len(self._page_tabs)
         self._make_page_tab(idx, "Page %d" % (idx + 1))
@@ -1391,12 +1824,12 @@ class MacroPadGUI:
             })
         self.notebook.select(self._page_tabs[idx])
         self._load_page_name(idx)
-        self._log("+ 페이지 %d 추가" % (idx + 1))
+        self._log(_tf("log_page_add", idx + 1))
 
     def _del_page(self) -> None:
         with self._config_lock:
             if len(self.config["pages"]) <= 1:
-                messagebox.showwarning("페이지 삭제", "최소 1개 페이지는 필요합니다.")
+                messagebox.showwarning(_t("msg_delpage_title"), _t("msg_min1page"))
                 return
         idx = self._current_page_idx()
         if not (0 <= idx < len(self._button_widgets)):
@@ -1405,7 +1838,7 @@ class MacroPadGUI:
             _entry_text(w["label"]).strip() or _entry_text(w["value"]).strip()
             for w in self._button_widgets[idx])
         if has_content and not messagebox.askyesno(
-                "페이지 삭제", "페이지 %d의 설정이 삭제됩니다. 계속할까요?" % (idx + 1)):
+                _t("msg_delpage_title"), _tf("msg_delpage_confirm", idx + 1)):
             return
         self.notebook.forget(idx)
         tab = self._page_tabs.pop(idx)
@@ -1415,7 +1848,7 @@ class MacroPadGUI:
             self.config["pages"].pop(idx)
         self._reindex_tab_labels()
         self._page_changed()
-        self._log("− 페이지 %d 삭제" % (idx + 1))
+        self._log(_tf("log_page_del", idx + 1))
 
     def _reindex_tab_labels(self) -> None:
         with self._config_lock:
@@ -1493,7 +1926,7 @@ class MacroPadGUI:
         self._page_tabs = frames
         self._reindex_tab_labels()
         self._save_config(self.config)
-        self._log("↕ 페이지 순서 변경 — 디바이스 동기화 요청")
+        self._log(_t("log_page_reorder"))
         ip = self.config.get("device_ip", "") or ""
         if self._listener_running:
             self._resend_queue.put("resend")
@@ -1509,7 +1942,9 @@ class MacroPadGUI:
             for bid in range(BUTTONS_PER_PAGE):
                 w = self._button_widgets[page][bid]
                 cname = w["color"].get()
-                color = COLOR_NAMES.index(cname) if cname in COLOR_NAMES else 0
+                color = self._color_index(cname)
+                if color is None:                     # 과거 언어 라벨이 남아 있으면 0으로 폴백
+                    color = 0
                 # 업로드 이미지는 위젯이 아니라 config 스냅샷(cur_pages)에서 가져온다 (base64 보존)
                 image = None
                 if page < len(cur_pages):
@@ -1528,6 +1963,7 @@ class MacroPadGUI:
             pages.append({"name": name, "buttons": buttons})
         return {"version": 3, "port": UDP_PORT,
                 "device_ip": self.config.get("device_ip", "") or "",
+                "lang": self.lang,
                 "pages": pages}
 
     # ------------------------------------------------------------------
@@ -1537,33 +1973,34 @@ class MacroPadGUI:
         config = self._collect_config()
         path = filedialog.asksaveasfilename(
             defaultextension=".json", initialfile="macro_config.json",
-            filetypes=[("JSON 파일", "*.json")])
+            filetypes=[(_tf("fd_json_files"), "*.json")])
         if not path:
             return
         try:
             Path(path).write_text(json.dumps(config, ensure_ascii=False, indent=2),
                                   encoding="utf-8")
-            self._log("⬇ 설정 내보내기: %s (%d페이지)" % (path, len(config["pages"])))
+            self._log(_tf("log_export", path, len(config["pages"])))
         except OSError as e:
-            self._log("⚠️ 내보내기 실패: %s" % e, error=True)
+            self._log(_tf("log_export_fail", e), error=True)
 
     def _import_config(self) -> None:
         path = filedialog.askopenfilename(
-            filetypes=[("JSON 파일", "*.json"), ("모든 파일", "*.*")])
+            filetypes=[(_tf("fd_json_files"), "*.json"), (_tf("fd_all_files"), "*.*")])
         if not path:
             return
         try:
             raw = json.loads(Path(path).read_text(encoding="utf-8"))
         except Exception as e:
-            messagebox.showerror("가져오기 실패", "설정 파일을 읽지 못했습니다:\n%s" % e)
+            messagebox.showerror(_t("msg_import_fail_title"),
+                                 _tf("msg_import_fail", e))
             return
         new_config = self._normalize_config(raw)
+        new_config["lang"] = self.lang          # 언어는 호스트 표시 설정 — 가져온 파일이 덮지 않게 보존
         with self._config_lock:
             self.config = new_config
         self._rebuild_all_tabs()
         self._save_config(new_config)
-        self._log("⬆ 설정 가져오기: %s (%d페이지) — 적용하려면 [설정 적용]"
-                  % (path, len(new_config["pages"])))
+        self._log(_tf("log_import", path, len(new_config["pages"])))
 
     def _import_from_device(self) -> None:
         """[H] "디바이스에서 불러오기": MREQ 전송 + 덤프 수집 시작 (리스너가 큐를 드레인).
@@ -1574,18 +2011,18 @@ class MacroPadGUI:
         with self._config_lock:
             ip = self.config.get("device_ip", "") or ""
         if not _is_valid_ip(ip):
-            messagebox.showerror("디바이스에서 불러오기",
-                                 "디바이스 IP를 알 수 없습니다.\n비콘으로 자동 검색될 때까지 기다린 후 다시 시도하세요.")
+            messagebox.showerror(_t("msg_devimport_title"), _t("msg_noip"))
             return
         if not self._listener_running:
-            messagebox.showerror("디바이스에서 불러오기", "리스너가 동작하지 않습니다.")
+            messagebox.showerror(_t("msg_devimport_title"), _t("msg_listener_down"))
             return
         self._dump_queue.put(("dump_start", ip))
-        self._log("🖥 디바이스에서 불러오기 요청 (%s) — 덤프 수신 대기" % ip)
+        self._log(_tf("log_device_import_req", ip))
 
     def _apply_dump_config(self, config: dict, n_img_recv: int = 0) -> None:
         """[H] 덤프 완료: GUI를 디바이스 설정으로 채운다 (검토 후 수동 Apply)."""
         new_config = self._normalize_config(config)
+        new_config["lang"] = self.lang          # 언어는 호스트 표시 설정 — 덤프가 덮지 않게 보존
         n_pages = len(new_config["pages"])
         n_images = sum(1 for pg in new_config["pages"] for b in pg.get("buttons", [])
                        if b.get("image"))
@@ -1593,11 +2030,9 @@ class MacroPadGUI:
             self.config = new_config
         self._rebuild_all_tabs()
         self._save_config(new_config)
-        self._log("🖥 디바이스에서 불러오기 완료: %d페이지, 이미지 %d개 수신 — Apply로 전송하세요"
-                  % (n_pages, n_img_recv))
+        self._log(_tf("log_device_import_done", n_pages, n_img_recv))
         if n_images == 0:
-            self._log("⚠️ 이미지가 수신되지 않았습니다 — 디바이스 플래시(/btns)에 저장된 이미지가 "
-                      "없거나 전송이 유실됐습니다. (직렬 로그 [IMG] flash=1 / [MREQ] dump 확인)", error=True)
+            self._log(_t("log_device_import_noimg"), error=True)
 
     def _rebuild_all_tabs(self) -> None:
         """가져오기 후 페이지 탭을 전부 다시 만든다 (페이지 수/이름이 바뀔 수 있음)."""
@@ -1624,12 +2059,12 @@ class MacroPadGUI:
         ip = self.config.get("device_ip", "") or ""
         if self._listener_running:
             self._resend_queue.put("resend")
-            self._log("💾 설정 저장 + 재전송 요청 (%d페이지)" % len(config["pages"]))
+            self._log(_tf("log_apply_resend", len(config["pages"])))
         elif _is_valid_ip(ip):
             self._send_config_from_temp_socket(ip, UDP_PORT)
-            self._log("💾 설정 저장 + 전송 (%s)" % ip)
+            self._log(_tf("log_apply_sent", ip))
         else:
-            self._log("💾 설정 저장 — 디바이스 발견 시 자동 전송됩니다")
+            self._log(_t("log_apply_wait"))
 
     def _send_config_from_temp_socket(self, ip: str, port: int) -> None:
         """리스너 미실행 시 임시 소켓으로 설정 전송.
@@ -1650,7 +2085,7 @@ class MacroPadGUI:
             finally:
                 sock.close()
         except OSError as e:
-            self._log("⚠️ 설정 전송 실패: %s" % e, error=True)
+            self._log(_tf("log_push_fail", e), error=True)
 
     def _send_all_pages(self, sock: socket.socket, ip: str, port: int) -> None:
         with self._config_lock:
@@ -1675,8 +2110,7 @@ class MacroPadGUI:
         리스너 스레드에서 실행되므로 로그는 _event_queue로 라우팅 (Tkinter 직접 접근 금지).
         reason은 트리거 진단용 — "적용 안 눌렀는데 표시"는 호스트 시작/첫 비콘 푸시로 확인된다.
         """
-        self._event_queue.put(("log",
-                               "📤 설정+이미지 푸시 (%s) → %s:%d" % (reason, ip, port), False))
+        self._event_queue.put(("log", _tf("log_push", reason, ip, port), False))
         for attempt in range(retries + 1):
             if attempt:
                 time.sleep(0.25)
@@ -1728,7 +2162,7 @@ class MacroPadGUI:
 
                 # (2) 한글(비-ASCII) 라벨 → 텍스트를 71x61 JPEG로 렌더해 전송
                 if label and not label.isascii():
-                    if not (0 <= color < len(COLOR_NAMES)):
+                    if not (0 <= color < COLOR_COUNT):
                         color = 0
                     key = (page, bid, label, color)
                     keys.add(key)
@@ -1737,17 +2171,18 @@ class MacroPadGUI:
                         try:
                             jpeg = _render_button_image(label, color)
                         except RuntimeError as e:
-                            # Pillow 미설치 같은 시스템적 실패는 1회만 경고 (3초 비콘마다 스팸 방지)
-                            if "Pillow 미설치" in str(e) and not self._img_pillow_warned:
+                            # Pillow 미설치 같은 시스템적 실패는 1회만 경고 (3초 비콘마다 스팸 방지).
+                            # 판정은 번역과 무관하게 __cause__(ImportError)로 구분한다.
+                            if isinstance(e.__cause__, ImportError) and not self._img_pillow_warned:
                                 self._img_pillow_warned = True
                                 self._event_queue.put(("log", str(e), True))
                             else:
                                 self._event_queue.put(
-                                    ("log", "⚠️ 이미지 렌더 실패 page%d·#%d: %s" % (page + 1, bid, e), True))
+                                    ("log", _tf("log_render_fail", page + 1, bid, e), True))
                             continue
                         except Exception as e:
                             self._event_queue.put(
-                                ("log", "⚠️ 이미지 렌더 실패 page%d·#%d: %s" % (page + 1, bid, e), True))
+                                ("log", _tf("log_render_fail", page + 1, bid, e), True))
                             continue
                         self._img_cache[key] = jpeg
                         rendered += 1
@@ -1766,7 +2201,7 @@ class MacroPadGUI:
                 del self._img_cache[k]
         # 3초 비콘 재푸시(캐시 히트)는 조용히 — 새로 렌더된 게 있을 때만 로그
         if rendered:
-            self._event_queue.put(("log", "🖼 버튼 이미지 %d개 렌더+전송" % rendered, False))
+            self._event_queue.put(("log", _tf("log_images_sent", rendered), False))
 
     # ------------------------------------------------------------------
     # 리스너 스레드 (UDP 수신 + 액션 실행)
@@ -1779,22 +2214,21 @@ class MacroPadGUI:
         with self._config_lock:
             self.config["port"] = port
         if not _pynput_installed():
-            self._log("⚠️ pynput 미설치 — 단축키/문구 액션이 동작하지 않습니다 (pip install -r requirements.txt)",
-                      error=True)
+            self._log(_t("log_pynput_missing"), error=True)
         self._listener_running = True
         self._listener_thread = threading.Thread(target=self._listener_worker, args=(port,),
                                                  daemon=True)
         self._listener_thread.start()
-        self.listen_status.config(text="● 리스너 동작 중 · CYD 자동 검색 대기...", fg="#22c55e")
-        self._log("▶ 리스너 자동 시작: UDP %d (디바이스 자동 검색)" % port)
+        self._set_listen_status("status_running", "#22c55e")
+        self._log(_tf("log_listener_start", port))
 
     def _stop_listener(self) -> None:
         self._listener_running = False
         if self._listener_thread is not None:
             self._listener_thread.join(timeout=3.0)
             self._listener_thread = None
-        self.listen_status.config(text="● 리스너 중지됨", fg=self.sub_text)
-        self._log("■ 리스너 중지")
+        self._set_listen_status("status_stopped", self.sub_text)
+        self._log(_t("log_listener_stop"))
 
     def _listener_worker(self, port: int) -> None:
         """UDP 수신 리스너: 소켓 수명 전체를 이 스레드가 소유한다.
@@ -1807,7 +2241,7 @@ class MacroPadGUI:
             sock.bind(("0.0.0.0", port))
         except OSError as e:
             self._listener_running = False
-            self._event_queue.put(("log", "⚠️ UDP %d 바인드 실패: %s" % (port, e), True))
+            self._event_queue.put(("log", _tf("log_bind_fail", port, e), True))
             try:
                 sock.close()
             except OSError:
@@ -1907,8 +2341,7 @@ class MacroPadGUI:
             n_img = len(d.get("images") or {})
             config = build_config_from_dump(d)
             if config is None:
-                self._event_queue.put(("dump_fail",
-                                       "디바이스 응답이 불완전합니다 (일부 페이지/버튼 누락). 다시 시도하세요."))
+                self._event_queue.put(("dump_fail", _t("log_dump_fail")))
             else:
                 self._event_queue.put(("dump_ready", (config, n_img)))
 
@@ -1928,12 +2361,12 @@ class MacroPadGUI:
         try:
             self._exec_action(btn)
             desc = self._action_desc(btn)
-            self._event_queue.put((page, button, "✓ page%d · #%d: %s 실행됨" % (page + 1, button, desc),
-                                   False))
+            self._event_queue.put((page, button,
+                                   _tf("log_event_ok", page + 1, button, desc), False))
             self._send_feedback(sock, addr, page, button, True)    # [B] MPOK
         except Exception as e:
-            self._event_queue.put((page, button, "✗ page%d · #%d: %s" % (page + 1, button, e),
-                                   True))
+            self._event_queue.put((page, button,
+                                   _tf("log_event_err", page + 1, button, e), True))
             self._send_feedback(sock, addr, page, button, False)   # [B] MPER
 
     def _send_feedback(self, sock: socket.socket, addr, page: int, button: int, ok: bool) -> None:
@@ -1967,7 +2400,7 @@ class MacroPadGUI:
                 self.config["port"] = port
         if is_new:
             self._event_queue.put(("ip", device_ip,
-                                   "디바이스 발견 (자동 검색): %s — 설정 전송" % device_ip))
+                                   _tf("log_device_found", device_ip)))
         # (a) ACK: 디바이스가 소스 IP/포트만 학습 (count=0 → 상태 변화 없음)
         with self._config_lock:
             num_pages = len(self.config.get("pages") or [])
@@ -1981,18 +2414,16 @@ class MacroPadGUI:
         """자동 검색된 디바이스를 상태바에 반영 (메인 스레드)."""
         self._log(msg)
         port = int(self.config.get("port", UDP_PORT) or UDP_PORT)
-        self.listen_status.config(
-            text="● 리스너 동작 중 · 디바이스 발견: %s:%d" % (ip, port), fg="#22c55e")
+        self._set_listen_status("status_found", "#22c55e", ip, port)
 
-    @staticmethod
-    def _action_desc(btn: dict) -> str:
+    def _action_desc(self, btn: dict) -> str:
         atype = btn.get("action_type", "shortcut")
         aval = btn.get("action_value", "")
         if atype == "text":
-            return "문구 \"%s\"" % aval[:20]
+            return _tf("desc_text", aval[:20])
         if atype == "app":
-            return "app / URL %s" % aval
-        return "단축키 %s" % aval
+            return _tf("desc_app", aval)
+        return _tf("desc_shortcut", aval)
 
     # ------------------------------------------------------------------
     # 액션 실행기
@@ -2011,19 +2442,18 @@ class MacroPadGUI:
         if not s.strip():
             return
         if not _pynput_installed():
-            raise RuntimeError("pynput 미설치 — pip install -r requirements.txt")
+            raise RuntimeError(_t("err_pynput_missing"))
         run_input_helper("shortcut", s)   # 격리된 서브프로세스에서 실행
 
     def _exec_text(self, text: str) -> None:
         if not text:
             return
         if not _pynput_installed():
-            raise RuntimeError("pynput 미설치 — pip install -r requirements.txt")
+            raise RuntimeError(_t("err_pynput_missing"))
         # pbcopy + Cmd+V: IME 상태와 무관하게 한글 포함 텍스트 입력 (macOS)
         run_input_helper("text", text)    # 격리된 서브프로세스에서 실행
 
-    @staticmethod
-    def _exec_app(value: str) -> None:
+    def _exec_app(self, value: str) -> None:
         value = value.strip()
         if not value:
             return
@@ -2034,12 +2464,12 @@ class MacroPadGUI:
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         except subprocess.TimeoutExpired:
-            raise RuntimeError("앱 실행 시간 초과 (10s)")
+            raise RuntimeError(_t("err_app_timeout"))
         except OSError as e:
-            raise RuntimeError("앱 실행 오류: %s" % e)
+            raise RuntimeError(_tf("err_app_os", e))
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "").strip()
-            raise RuntimeError("앱 실행 실패: %s" % (err or "open이 실패했습니다"))
+            raise RuntimeError(_tf("err_app_fail", err or _t("err_app_open")))
 
     # ------------------------------------------------------------------
     # UI 로그 + 이벤트 폴링
@@ -2074,7 +2504,7 @@ class MacroPadGUI:
                 elif item[0] == "dump_fail":    # [H] 덤프 수집 실패/타임아웃
                     _, msg = item
                     self._log(msg, error=True)
-                    messagebox.showerror("디바이스에서 불러오기 실패", msg)
+                    messagebox.showerror(_t("msg_dumpfail_title"), msg)
                 else:
                     page, button, msg, is_error = item
                     self._log(msg, error=is_error)

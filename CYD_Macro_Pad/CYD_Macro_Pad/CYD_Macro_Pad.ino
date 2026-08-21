@@ -1442,6 +1442,113 @@ bool hitButton(uint16_t tx, uint16_t ty, int* col, int* row) {
   return true;
 }
 
+// ============================================================
+// [폰트] 버튼 ASCII 라벨을 크고 읽기 좋게 렌더 (DejaVu + 자동 줄바꿈/축소)
+//   호스트가 한글/이미지 버튼은 71×61 JPEG로 보내고, ASCII/빈 라벨만 디바이스가 직접
+//   그린다 (MIMG fmt=1 clear → 여기 폴백). 이 폴백 텍스트를 기본 5×7 대신 부드러운
+//   산세리프(DejaVu)로, 버튼(71×61)에 맞는 가장 큰 크기로 그린다.
+//   폭 기준 단어 단위 줄바꿈(단어가 너무 길면 문자 분할) + 세로 중앙 정렬.
+//   그리기 후 기본 폰트(Font0)를 복원해 상태바/Wi-Fi 셋업 화면이 영향받지 않게 한다.
+// ============================================================
+
+// [폰트] 라벨을 폭 maxW에 맞춰 단어 단위로 줄바꿈 (단어가 maxW보다 길면 문자 단위 분할).
+//         반환: 줄 수. lines[] 각 줄은 NUL 종료, 최대 LABEL_MAX줄.
+static int wrapButtonLabel(char lines[][LABEL_MAX + 1], const char* label, int maxW) {
+  int n = 0;
+  lines[0][0] = '\0';
+  int curLen = 0;                       // 현재 줄의 바이트 수
+
+  const char* p = label;
+  while (true) {
+    // 다음 단어(공백까지) 추출
+    char word[LABEL_MAX + 1];
+    int wi = 0;
+    while (*p && *p != ' ' && wi < LABEL_MAX) word[wi++] = *p++;
+    word[wi] = '\0';
+
+    if (wi > 0) {
+      int wordW = lcd.textWidth(word);
+      if (wordW > maxW) {
+        // 단어가 한 줄 폭을 넘으면 문자 단위 분할해 여러 줄에 채운다
+        if (curLen > 0) {
+          if (n >= LABEL_MAX - 1) break;
+          n++;
+          lines[n][0] = '\0';
+          curLen = 0;
+        }
+        for (int j = 0; j < wi; ++j) {
+          char wch[2] = { word[j], '\0' };
+          if (curLen > 0 && lcd.textWidth(lines[n]) + lcd.textWidth(wch) > maxW) {
+            if (n >= LABEL_MAX - 1) break;
+            n++;
+            lines[n][0] = '\0';
+            curLen = 0;
+          }
+          strcat(lines[n], wch);
+          curLen++;
+        }
+      } else if (curLen > 0 && lcd.textWidth(lines[n]) + lcd.textWidth(" ") + wordW > maxW) {
+        // 현재 줄에 못 들어가면 새 줄로
+        if (n >= LABEL_MAX - 1) break;
+        n++;
+        lines[n][0] = '\0';
+        strcat(lines[n], word);
+        curLen = wi;
+      } else {
+        if (curLen > 0) { strcat(lines[n], " "); curLen++; }
+        strcat(lines[n], word);
+        curLen += wi;
+      }
+    }
+
+    if (*p == '\0') break;
+    p++;                                // 공백 하나 건너뜀 (연속 공백은 빈 단어 → 무시)
+  }
+  return n + 1;
+}
+
+// [폰트] 라벨을 버튼 중앙(cx, cy)에 크고 굵게 그린다. 후보 폰트 중 버튼(71×61)에
+//         들어가는 가장 큰 것을 골라 단어 단위 줄바꿈 후 세로 중앙 정렬한다.
+//         전부 못 들어가면 가장 작은 폰트로 잘라낸다.
+static void drawFittedButtonLabel(int cx, int cy, const char* label, uint16_t color) {
+  static const lgfx::IFont* candidates[] = {
+    &lgfx::fonts::DejaVu24,
+    &lgfx::fonts::DejaVu18,
+    &lgfx::fonts::DejaVu12,
+    &lgfx::fonts::DejaVu9,
+  };
+  const int availW = BTN_W - 6;         // 좌우 여백 3px
+  const int availH = BTN_H - 2;         // 상하 여백 1px
+
+  const size_t nCands = sizeof(candidates) / sizeof(candidates[0]);
+  for (size_t f = 0; f < nCands; ++f) {
+    lcd.setFont(candidates[f]);
+    lcd.setTextSize(1);
+    int lineH = lcd.fontHeight();
+    if (lineH < 1) lineH = 1;
+    int maxLines = availH / lineH;
+    if (maxLines < 1) maxLines = 1;
+
+    char lines[LABEL_MAX][LABEL_MAX + 1];
+    int n = wrapButtonLabel(lines, label, availW);
+
+    if (n > maxLines) {
+      if (f + 1 < nCands) continue;     // 더 작은 폰트로
+      n = maxLines;                     // 최소 폰트도 넘치면 잘라냄
+    }
+
+    lcd.setTextColor(color);
+    lcd.setTextDatum(MC_DATUM);
+    int y0 = cy - ((n - 1) * lineH) / 2;
+    for (int i = 0; i < n; ++i) {
+      lcd.drawString(lines[i], cx, y0 + i * lineH);
+    }
+    lcd.setFont(&lgfx::fonts::Font0);   // 기본 폰트 복원 (상태바 등 영향 방지)
+    lcd.setTextSize(1);
+    return;
+  }
+}
+
 void drawButton(uint8_t page, uint8_t idx, bool pressed) {
   int col = idx % GRID_COLS;
   int row = idx / GRID_COLS;
@@ -1472,10 +1579,9 @@ void drawButtonText(uint8_t page, uint8_t idx, int x, int y, bool pressed) {
   lcd.fillRoundRect(x, y, BTN_W, BTN_H, BTN_RADIUS, fill);
   lcd.drawRoundRect(x, y, BTN_W, BTN_H, BTN_RADIUS, border);
 
-  lcd.setTextColor(c.textWhite ? TFT_WHITE : TFT_BLACK);
-  lcd.setTextSize(1);
-  lcd.setTextDatum(MC_DATUM);
-  lcd.drawString(labels[page][idx], x + BTN_W / 2, y + BTN_H / 2);
+  // [폰트] ASCII 라벨을 크고 읽기 좋게 (DejaVu, 버튼 크기에 자동 맞춤)
+  drawFittedButtonLabel(x + BTN_W / 2, y + BTN_H / 2, labels[page][idx],
+                        c.textWhite ? TFT_WHITE : TFT_BLACK);
 }
 
 // [G] 버튼 눌림 상태를 JPEG 디코드 콜백이 참조. 디코드는 loop()에서 동기식이므로
@@ -1582,10 +1688,8 @@ void drawButtonFlash(uint8_t page, uint8_t idx, uint16_t fill) {
 
   lcd.fillRoundRect(x, y, BTN_W, BTN_H, BTN_RADIUS, fill);
   lcd.drawRoundRect(x, y, BTN_W, BTN_H, BTN_RADIUS, TFT_WHITE);
-  lcd.setTextColor(TFT_WHITE);
-  lcd.setTextSize(1);
-  lcd.setTextDatum(MC_DATUM);
-  lcd.drawString(labels[page][idx], x + BTN_W / 2, y + BTN_H / 2);
+  // [폰트] ASCII 라벨을 크고 읽기 좋게 (텍스트 버튼과 동일 렌더)
+  drawFittedButtonLabel(x + BTN_W / 2, y + BTN_H / 2, labels[page][idx], TFT_WHITE);
 }
 
 // [C] 백라이트 밝기 갱신: 무터치 시 디밍, 그 외엔 주변 조도(CDS)에 맞춰 자동 조절.
