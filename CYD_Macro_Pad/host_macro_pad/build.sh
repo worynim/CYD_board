@@ -3,8 +3,12 @@
 # CYD 무선 매크로 패드 호스트 — macOS .app 빌드 스크립트
 #
 # 두 스펙을 순서대로 빌드한다 (헬퍼를 먼저, 앱이 그걸 내장하므로):
-#   1) macro_input_helper.spec → dist/macro_input_helper        (입력 헬퍼 단독 바이너리)
-#   2) CYD Macro Pad.spec      → dist/CYD Macro Pad.app         (헬퍼를 번들 안에 내장)
+#   1) macro_input_helper.spec → dist/macro_input_helper/       (입력 헬퍼 단독 onedir — 바이너리+_internal)
+#   2) CYD Macro Pad.spec      → dist/CYD Macro Pad.app         (헬퍼 디렉터리를 번들 안에 내장)
+#
+# 참고: macOS에서 헬퍼를 onefile→onedir로 바꿨다. onefile은 실행마다 _MEI 추출 후
+#   macOS가 PyObjC dylib을 매번 재검증해 헬퍼 시작 ~9초(→GUI 10초 타임아웃 초과).
+#   onedir은 웜 ~0.2초. onedir로 되돌리지 말 것 (macro_input_helper.spec 주석 참고).
 #
 # 사용법:
 #   ./build.sh                 클린 빌드 (build/ dist/ 삭제 후 재빌드, 권장)
@@ -20,7 +24,7 @@ cd "$(dirname "$0")"          # spec의 상대경로(macro_pad_gui.py, dist/...)
 HELPER_SPEC="macro_input_helper.spec"
 APP_SPEC="CYD Macro Pad.spec"
 APP_BUNDLE="dist/CYD Macro Pad.app"
-HELPER_EMBEDDED="$APP_BUNDLE/Contents/Frameworks/helper/macro_input_helper"
+HELPER_EMBEDDED="$APP_BUNDLE/Contents/Frameworks/helper/macro_input_helper/macro_input_helper"
 
 # 0) 전제조건: PyInstaller 가용 확인
 if ! python3 -m PyInstaller --version >/dev/null 2>&1; then

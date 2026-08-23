@@ -202,7 +202,24 @@ def exec_text(text: str) -> None:
     kb.release(paste)
 
 
+def check_accessibility() -> bool:
+    """macOS: 현재 프로세스 트리가 손쉬운 사용(Accessibility) 권한을 가졌는지.
+
+    헬퍼는 호스트 GUI(.app 또는 파이썬)가 spawn하므로, 이 값은 곧 호출자의 권한
+    상태다. 권한이 없으면 pynput의 키 이벤트(CGEventPost)가 예외 없이 조용히
+    버려져 단축키/텍스트가 아무 오류 로그 없이 '동작하지 않는' 것처럼 보인다.
+    """
+    try:
+        from HIServices import AXIsProcessTrusted
+        return bool(AXIsProcessTrusted())
+    except Exception:
+        return False
+
+
 def main() -> None:
+    if "--trust" in sys.argv:
+        # 진단 모드: stdin JSON이 아닌 권한 확인. exit 0=권한 있음, 3=없음/확인 불가.
+        sys.exit(0 if check_accessibility() else 3)
     raw = sys.stdin.buffer.read().decode("utf-8")
     payload = json.loads(raw)                # 잘못된 입력은 아래 except에서 exit 1
     atype = payload.get("type")

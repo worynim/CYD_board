@@ -258,7 +258,7 @@ L10N = {
     "desc_app": {"ko": "app / URL %s", "en": "app / URL %s"},
     "desc_shortcut": {"ko": "단축키 %s", "en": "shortcut %s"},
     # 오류
-    "err_timeout": {"ko": "입력 실행 시간 초과 (10s)", "en": "Input timed out (10s)"},
+    "err_timeout": {"ko": "입력 실행 시간 초과 (30s)", "en": "Input timed out (30s)"},
     "err_helper_os": {"ko": "입력 헬퍼 실행 오류: %s", "en": "Input helper error: %s"},
     "err_helper_signal": {"ko": "입력 헬퍼가 시그널 %d로 종료됨 (pynput 크래시?)",
                           "en": "Input helper exited with signal %d (pynput crash?)"},
@@ -272,6 +272,16 @@ L10N = {
     "err_app_os": {"ko": "앱 실행 오류: %s", "en": "App launch error: %s"},
     "err_app_fail": {"ko": "앱 실행 실패: %s", "en": "App launch failed: %s"},
     "err_app_open": {"ko": "open이 실패했습니다", "en": "open failed"},
+    # 손쉬운 사용(Accessibility) 경고 — 재빌드 때 권한이 초기화되는 PyInstaller 앱의 고질병.
+    # 없으면 pynput 키 이벤트가 예외 없이 버려져 단축키/텍스트가 조용히 동작하지 않는다.
+    "warn_accessibility": {
+        "ko": "⚠ 손쉬운 사용(Accessibility) 권한이 없어 단축키/텍스트 입력이 동작하지 않을 수 "
+              "있습니다.\n시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용 에서 "
+              "'CYD Macro Pad'를 추가한 뒤 앱을 다시 실행하세요.",
+        "en": "⚠ Missing Accessibility permission — shortcuts/text input may not work.\n"
+              "Add 'CYD Macro Pad' in System Settings → Privacy & Security → "
+              "Accessibility, then relaunch the app.",
+    },
     # 도움말
     "help_title": {"ko": "프로그램 사용법", "en": "How to Use"},
     "help_close": {"ko": "닫기", "en": "Close"},
@@ -398,14 +408,20 @@ def _helper_executable() -> Path:
 
     PyInstaller .app 번들 안에서는 sys.executable이 앱 바이너리라 .py를 실행할
     수 없고 __file__도 읽기 전용 번들 안을 가리킨다. 따라서 빌드 시 함께 묶은
-    컴파일된 헬퍼 바이너리를 직접 실행한다 (--add-data "dist/macro_input_helper:helper").
-    개발 모드(스크립트)에서는 소스 _input_helper.py를 그대로 쓴다.
+    컴파일된 헬퍼 바이너리를 직접 실행한다. 개발 모드(스크립트)에서는 소스
+    _input_helper.py를 그대로 쓴다.
+
+    번들 내 헬퍼 경로는 플랫폼별로 다르다 (spec 참고):
+      macOS  : onefile→onedir 전환 (onefile은 실행마다 _MEI 추출+재검증으로 ~9초,
+               onedir은 웜 ~0.2초) → Contents/Frameworks/helper/macro_input_helper/macro_input_helper
+      Windows: onefile → _MEIPASS/helper/macro_input_helper.exe
     """
     if getattr(sys, "frozen", False):
-        # onefile 실행 시 sys._MEIPASS는 추출용 임시 디렉터리(번들 데이터 위치)
+        # .app(onedir) 실행 시 sys._MEIPASS는 Contents/Frameworks (번들 데이터 위치)
         base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-        name = "macro_input_helper" + (".exe" if sys.platform == "win32" else "")
-        return base / "helper" / name
+        if sys.platform == "win32":
+            return base / "helper" / "macro_input_helper.exe"
+        return base / "helper" / "macro_input_helper" / "macro_input_helper"
     return Path(__file__).resolve().parent / "_input_helper.py"
 
 
@@ -435,10 +451,14 @@ def run_input_helper(action_type: str, value: str) -> None:
     #           개발 모드에서는 sys.executable로 소스 헬퍼를 실행한다.
     argv = [str(helper), "--input"] if getattr(sys, "frozen", False) else [sys.executable, str(helper), "--input"]
     try:
+        # [FIX] 헬퍼 onefile→onedir 전환 후에도 새 머신 최초 1회는 macOS 검증(~9초)이
+        # 남아 있어 30초 여유를 준다 (웜 상태는 ~0.2초). subprocess.run은 타임아웃 시
+        # 자식을 죽이지 않으므로, 헬퍼가 나중에 완료되어도 액션이 지연 실행되지 않도록
+        # timeout은 오직 실패 판정 경계로만 쓴다.
         proc = subprocess.run(
             argv,
             input=json.dumps({"type": action_type, "value": value}).encode("utf-8"),
-            capture_output=True, timeout=10)
+            capture_output=True, timeout=30)
     except subprocess.TimeoutExpired:
         raise RuntimeError(_tf("err_timeout"))
     except OSError as e:
@@ -1255,6 +1275,8 @@ class MacroPadGUI:
         self._populate_from_config()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._start_listener()                     # 리스너 자동 시작 (고정 포트 8890)
+        self._warmup_helper()                      # [FIX] 헬퍼 최초 콜드 시작(~9초)을 백그라운드로
+        self._check_accessibility()                # [FIX] 손쉬운 사용 권한 없으면 경고
         self._poll_event_queue()
 
     # ------------------------------------------------------------------
@@ -2345,7 +2367,9 @@ class MacroPadGUI:
             sock.sendto(data, addr)
             return True
         except OSError as e:
-            self._debug_log("sendto %s → %s: %s" % (addr, e))
+            # [FIX] 포맷 인자 수 버그: 이 줄이 TypeError로 크래시하면 리스너 스레드가
+            # 죽어 디바이스 이벤트를 못 받는다 (sendto ICMP/라우팅 오류 시 방아쇠).
+            self._debug_log("sendto %d bytes → %s: %s" % (len(data), addr, e))
             return False
 
     def _start_listener(self) -> None:
@@ -2363,6 +2387,74 @@ class MacroPadGUI:
         self._listener_thread.start()
         self._set_listen_status("status_running", "#22c55e")
         self._log(_tf("log_listener_start", port))
+
+    def _warmup_helper(self) -> None:
+        """[FIX] 헬퍼 최초 콜드 시작 비용을 앱 시작 시점으로 옮긴다 (frozen 전용).
+
+        onedir 헬퍼도 새 머신 최초 1회는 macOS 검증(~9초)이 필요하다. 이를 첫
+        액션에서 지불하지 않도록, 시작 직후 백그라운드 데몬 스레드로 헬퍼를 한 번
+        실행해 pynput/PyObjC import + macOS 검증을 미리 끝내 둔다. 실패는 조용히
+        무시한다 (best-effort — 프리워밍이 실패해도 실제 액션 시 그대로 시도된다).
+        """
+        if not getattr(sys, "frozen", False):
+            return   # 개발 모드: 헬퍼가 이미 빠르므로 불필요
+        def _run():
+            try:
+                run_input_helper("shortcut", "")   # Controller 생성 + import만, 키 입력 없음
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _check_accessibility(self) -> None:
+        """시작 시 macOS 손쉬운 사용(Accessibility) 권한 확인 (best-effort, 비동기).
+
+        권한이 없으면 pynput 키 이벤트(CGEventPost)가 예외 없이 조용히 버려져
+        단축키/텍스트가 아무 오류 없이 '동작하지 않는' 것처럼 보인다. 파이썬 실행은
+        터미널 권한으로 동작하지만, .app은 고유 권한이 필요하고 PyInstaller 재빌드
+        때마다 초기화될 수 있어 시작 시 확인해 경고로 띄워준다. 헬퍼 --trust 모드
+        (exit 0=권한 있음, 3=없음)를 사용하고, 실패는 조용히 무시한다.
+
+        [DIAG] 'self' = GUI 메인 프로세스(.app) 자신의 권한, 'helper' = 헬퍼
+        서브프로세스의 권한. self=True & helper=False 면 헬퍼가 .app 권한을
+        상속하지 못하는 구조 문제(H2)이고, 둘 다 False면 .app 자체가 미등록(H1,
+        등록 경로/서명 불일치)이다. PyObjC(HIServices)를 GUI에 내장하지 않기 위해
+        ctypes로 프레임워크를 직접 로드한다 (read-only 확인 — 크래시 격리 유지).
+        """
+        def _ax_self_trusted():
+            """메인 프로세스 자신의 AXIsProcessTrusted (ctypes, PyObjC 불필요)."""
+            if sys.platform != "darwin":
+                return None
+            try:
+                import ctypes
+                _h = ctypes.cdll.LoadLibrary(
+                    "/System/Library/Frameworks/ApplicationServices.framework/"
+                    "Frameworks/HIServices.framework/HIServices")
+                _fn = _h.AXIsProcessTrusted
+                _fn.restype = ctypes.c_bool
+                _fn.argtypes = []
+                return bool(_fn())
+            except Exception:
+                return None
+
+        def _run():
+            try:
+                self_trusted = _ax_self_trusted()
+                helper = _helper_executable()
+                if not helper.exists():
+                    self._debug_log("[accessibility] self=%s helper=missing" % self_trusted)
+                    return
+                argv = ([str(helper), "--trust"]
+                        if getattr(sys, "frozen", False)
+                        else [sys.executable, str(helper), "--trust"])
+                proc = subprocess.run(argv, capture_output=True, timeout=30)
+                helper_trusted = (proc.returncode == 0)
+                self._debug_log("[accessibility] self=%s helper=%s rc=%s" %
+                                (self_trusted, helper_trusted, proc.returncode))
+                if not (self_trusted or helper_trusted):
+                    self._event_queue.put(("log", _tf("warn_accessibility"), True))
+            except Exception as e:
+                self._debug_log("[accessibility] check failed: %s" % e)
+        threading.Thread(target=_run, daemon=True).start()
 
     def _stop_listener(self) -> None:
         self._listener_running = False
