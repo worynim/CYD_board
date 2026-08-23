@@ -1477,8 +1477,7 @@ class MacroPadGUI:
                   background=[("active", _shade_hex(bg, 24)),
                               ("pressed", _shade_hex(bg, -16))],
                   foreground=[("active", fg), ("pressed", fg)])
-        return ttk.Button(parent, text=text, command=command, style=tag,
-                          cursor="hand2", **kw)
+        return ttk.Button(parent, text=text, command=command, style=tag, **kw)
 
     # ------------------------------------------------------------------
     # 위젯 구성
@@ -1671,7 +1670,7 @@ class MacroPadGUI:
 
         close = tk.Button(win, text=_t("help_close"), command=win.destroy, width=8,
                           bg="#334155", fg=self.text_color, activebackground="#475569",
-                          activeforeground=self.text_color, relief=tk.FLAT, bd=0, cursor="hand2",
+                          activeforeground=self.text_color, relief=tk.FLAT, bd=0,
                           font=("Pretendard", 14))
         close.pack(pady=10)
         win.bind("<Escape>", lambda e: win.destroy())
