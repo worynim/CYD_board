@@ -113,14 +113,19 @@ public:
 static LGFX lcd;
 static JPEGDEC jpeg;   // 고속 JPEG 디코더 인스턴스 (Larry Bank JPEGDEC 라이브러리)
 
-// ---- 오프스크린 렌더 버퍼 (티어링 방지) ----
+// ---- [TEARSYNC] 밴드(블록) 체이스 저장소 ----
 // JPEGDEC는 MCU 블록 단위로 LCD에 직접 푸시 → 한 프레임이 블록으로 조립돼 보이고,
-// 패널 스캔과 경합하면 가로 이분선(티어링)이 생긴다.
-// 디코드 결과를 RGB565 스프라이트(RAM)에 먼저 채우고 pushSprite()로 한 번에 blit하면
-// 각 프레임이 원자적으로 교체된다. 힙 할당 실패 시 직접 디코드 모드로 자동 폴백.
-// (스프라이트 ~150KB + 기존 JPEG 버퍼 ~50KB. 메모리 여유가 없으면 폴백이 안전망 역할)
-static LGFX_Sprite renderSprite(&lcd);
-static bool spriteReady = false;               // 스프라이트 버퍼 할당 성공 여부
+// 패널 스캔과 경합하면 이분선(티어링)이 생긴다. 완성 프레임을 RAM에 저장하는 체이스는
+// 이 보드에서 불가능이 실측 확정됐다(풀프레임 150KB: 힙 최대연속 107KB 세그먼트 벽 +
+// Wi-Fi 접속 후 총량 149<154KB, 2026-08-24 — 슬롯 풀 320×480B도 총량에서 실패).
+// → **밴드 체이스**: 디코더가 주는 MCU 블록(16×16, 512B)을 소규모 풀(~72KB)에 쌓고,
+//   래스터 헤드(getScanLine)가 그 블록의 축 좌표를 **지나간 뒤에만** LCD로 방출한다.
+//   가로 회전은 래스터가 논리 x축을 훑으므로 열 끝(x+16) 기준, 세로는 행 끝(y+16) 기준.
+//   [2026-08-24 실측 실패] 풀 활성·lag=0으로 기구는 설계대로 동작했지만 MAP_FLIP 0/1
+//   양쪽 모두 티어링 심함 → GSCAN 위상/원점이 논리 좌표와 불일치(또는 비동기).
+//   RENDER_TEAR_SYNC 0으로 롤백 — 코드는 재검증용 보존, 상세는 위 스위치 주석.
+static bool chaseReady = false;        // 블록 풀 확보 완료 (밴드 체이스 경로 사용 가능)
+static bool chaseAllocTried = false;   // 최초 1회만 할당 시도 → 재시도/스팸 방지
 AsyncUDP udp;
 Preferences prefs;
 
@@ -141,8 +146,26 @@ const uint16_t UDP_PORT = 8888;
 // 필요하지만 버스 공유 위험 대비 이득이 낮아 보류. 재제안 전에 이 실측 기억할 것.
 #define RENDER_INTERLEAVE 0
 
-static uint8_t rxBuffer[MAX_JPEG_SIZE];
-static uint8_t renderBuffer[MAX_JPEG_SIZE];
+// [TEARSYNC] 래스터 헤드 동기 블록 체이스 — **실측 실패로 기본 꺼짐 (2026-08-24)**.
+// 구상: ST7789엔 scan-out 버퍼가 없어 GRAM을 컨트롤러가 상시 스캔한다. JPEGDEC 콜백의 MCU
+// 블록(16×16)을 풀(~72KB)에 쌓고 getScanLine(0x45) 헤드가 그 축 좌표를 지나간 뒤에만
+// pushImage하면 읽기-쓰기 경합(티어링)이 사라질 것이라 기대했다.
+// 결과 (실기, 블록 풀 144슬롯 정상 활성 + lag=0 — 게이트 기구 자체는 설계대로 동작):
+//   - TEAR_SYNC_MAP_FLIP 0/1 **양쪽 모두** 티어링 심함 (직접 모드 대비 개선 없음).
+//   - 캘리브레이션([SCAN] 범위 0..257, 랩 ~20ms)은 항상 통과 → 주기는 맞지만 원점/위상이
+//     논리 좌표와 어긋나 있거나(오프셋 미상), GSCAN이 가시 스캔과 근본적으로 비동기일 수 있다.
+//   - 부수 실측: push 17.3→19.7ms (풀 복사+재푸시 오버헤드), rt·rend_fps 열화 없음.
+// 결론: 공개 API(getScanLine)로 화면 스캔 위상을 맞추는 길은 이 보드+LGFX 조합에서 닫힘.
+// 재제안 금지 — GSCAN 원점/위상을 확정하는 별도 진단 증거가 먼저다.
+#define RENDER_TEAR_SYNC 0
+#define TEAR_SYNC_GAP 24       // 헤드보다 뒤로 유지하는 안전 간격(표시축 단위)
+#define TEAR_SYNC_MAP_FLIP 0   // GSCAN→논리축 방향 반전 (양방향 실패 실측 — 유효 보정값 없음)
+
+// JPEG 수신/렌더 버퍼 — 힙 할당(ensureJpegBuffers). 정적(.bss) 대신 힙에 두는 이유:
+// .bss 48KB를 비워 힙 여유 총량을 늘린다 (2026-08-24). 최대 연속 블록엔 영향이 없었지만
+// (세그먼트 벽 107KB 불변 실측) BSS 헤드룸 확보로 그대로 유지한다.
+static uint8_t* rxBuffer = nullptr;
+static uint8_t* renderBuffer = nullptr;
 // renderBufferSize는 Core0(콜백)에서 쓰고 Core1(loop 렌더)에서 읽는 크로스코어 값 → volatile.
 // (hasNewFrame=true 직후에 쓰이므로 실질적으로는 순서상 안전하지만, 컴파일러 재정렬 방지 차원에서 명시)
 static volatile size_t renderBufferSize = 0;
@@ -152,6 +175,12 @@ volatile bool hasNewFrame = false;
 // rxBuffer에는 완성된 프레임이 남아 있고, loop()가 이를 renderBuffer로 옮겨 바로 렌더한다.
 // 이러면 디바이스가 자기 속도(≈16.7fps)로 항상 최신 프레임을 그려 "수초 지연"이 사라진다.
 volatile bool pendingCommit = false;
+
+// ---- [TEARSYNC] 스캔 동기화 상태 ----
+#if RENDER_TEAR_SYNC
+static bool tearSyncOk = false;        // 부팅 캘리브레이션 통과 (getScanLine 신뢰 가능)
+static uint32_t statChaseLag = 0;      // 프레임 끝 강제 플러시로 밀린 잔여 블록 수 ([STAT] lag=)
+#endif
 
 static uint16_t expectedChunks = 0;
 static uint16_t receivedChunks = 0;
@@ -205,7 +234,11 @@ void drawBootScreen(const char* statusMsg);
 void drawReadyScreen(String ipAddr);
 void drawErrorScreen(const char* errMsg);
 void onUdpPacketReceived(AsyncUDPPacket packet);
-void ensureRenderSprite();
+void ensureChasePool();
+void ensureJpegBuffers();
+#if RENDER_TEAR_SYNC
+void calibrateScan();
+#endif
 
 // ==========================================
 // 2. Setup 함수
@@ -218,7 +251,13 @@ void setup() {
   lcd.init();
   lcd.setRotation(currentRotation);
   lcd.setBrightness(200);
-  ensureRenderSprite();  // 오프스크린 렌더 버퍼 생성 (티어링 방지). 실패 시 직접 디코드 모드로 폴백
+#if RENDER_TEAR_SYNC
+  calibrateScan();       // [TEARSYNC] getScanLine(0x45) 동작 검증 — 체이스 풀 확보 여부를 정하므로 먼저
+#endif
+  // rx/render JPEG 버퍼(48KB)만 여기서 받는다. 프레임 저장소(154KB)는 절대 부팅 직후에
+  // 받지 않는다 — Wi-Fi 스택보다 먼저 154KB를 쓰면 접속이 실패한다 (2026-08-24 실측:
+  // 잔여 98KB로도 IDF5 Wi-Fi가 연결 못함). 확보는 udp.listen 직후로 미룬다.
+  ensureJpegBuffers();
 
   // [TEST] SPI 클럭 검증: fillScreen(320x240 전체 픽셀 푸시) 시간으로 클럭 효과 확인.
   //   80MHz → 약 15ms, 40MHz → 약 30ms. (클럭 상향이 실제 적용되는지 판별)
@@ -263,6 +302,11 @@ void setup() {
     if (udp.listen(UDP_PORT)) {
       Serial.printf("[AsyncUDP] Listening on port %d\n", UDP_PORT);
       udp.onPacket(onUdpPacketReceived);
+      // 밴드 체이스 블록 풀(~75KB)은 Wi-Fi 스택이 자리 잡은 '뒤에' 확보한다.
+      // 부팅 직후 대량 할당을 먼저 받으면 잔여 ~98KB로는 Wi-Fi 접속 자체가 실패한다 (실측).
+      // 여기서도 잔여 heap < 48KB 안전선 검사가 동반되므로, 메모리가 부족한 부팅에선
+      // 자동으로 직접 디코드 모드(풀 없음)로 떨어진다 — 스트리밍은 계속된다.
+      ensureChasePool();
       drawReadyScreen(WiFi.localIP().toString());
     } else {
       drawErrorScreen("AsyncUDP Bind Failed!");
@@ -844,24 +888,124 @@ static unsigned long pushTimeSum = 0;
 // jpegDbg: 처음 몇 프레임만 진단 출력 (통과 후엔 조용)
 static int jpegDbg = 0;
 
-static void* spriteBuf = nullptr;   // 오프스크린 버퍼 원시 포인터 (직접 heap_caps_free로 정리)
-static bool spriteAllocTried = false;  // 최초 1회만 할당 시도 → 실패 시 재시도/스팸 방지
+// ---- [TEARSYNC] 밴드 체이스: MCU 블록 풀 + 헤드 게이트 ----
+// 블록 1개 = 16×16 RGB565 = 512B. 화면은 (W/16)×(H/16) = 300블록/프레임 (양 회전 공통).
+// 디코더가 MCU 순서대로 주므로 각 셀은 프레임당 정확히 1번 기입된다(MCU 패딩은 클립으로 절단,
+// W/H가 16의 배수라 셀 경계와 일치 — 320×240/240×320 모두 성립).
+#define CHASE_BLOCK_PX    16
+#define CHASE_BLOCK_BYTES (CHASE_BLOCK_PX * CHASE_BLOCK_PX * 2)          // 512B
+// 풀 크기: 최악 백로그 ~136블록(헤드 랩 직후 전체 미방출) + 여유 → 144슬롯.
+// 하나의 연속 할당(≈75KB)이라 힙 최대연속(107KB 실측) 안에 들어오고, Wi-Fi 후 잔여
+// ~149KB에서 받으면 ~75KB 남아 48KB 안전선을 통과한다.
+#define CHASE_POOL_BLOCKS 144
+struct ChaseBlock {
+  uint16_t px[CHASE_BLOCK_PX * CHASE_BLOCK_PX];  // RGB565_BIG_ENDIAN 픽셀 (콜백 산출 그대로)
+  int16_t x, y;                                  // 화면 셀 좌표 (좌상단, 16의 배수)
+  uint8_t used;
+};
+static ChaseBlock* chasePool = nullptr;  // udp.listen 직후 1회 힙 할당
+
+#if RENDER_TEAR_SYNC
+static inline int tearSyncHeadPos(int axisLen);   // 정의는 §5.6 캘리브레이션 아래
+
+// 확장 좌표 헤드 추적: raw GSCAN 랩마다 axisLen을 누적해 단조 증가값으로 만든다.
+// 프레임 경계를 넘어 계속 유지된다(헤드는 쉬지 않고 도니까). 폴링은 400µs 스로틀 —
+// 매 블록마다 SPI read하면 300회/프레임이 병목이 된다.
+static int chaseBase = 0, chasePrevRaw = -1, chaseCachedExt = 0;
+static uint32_t chaseLastPollUs = 0;
+
+static int chaseHeadExt(int axisLen) {
+  uint32_t now = micros();
+  if (chaseLastPollUs != 0 && now - chaseLastPollUs < 400) return chaseCachedExt;
+  chaseLastPollUs = now;
+  int raw = tearSyncHeadPos(axisLen);
+  if (chasePrevRaw >= 0 && raw < chasePrevRaw - 64) chaseBase += axisLen;  // 랩 감지
+  chasePrevRaw = raw;
+  chaseCachedExt = chaseBase + raw;
+  return chaseCachedExt;
+}
+
+// 안전해진 블록을 LCD로 방출한다. force=false: 헤드 게이트 통과분만. force=true: 전부(프레임 끝).
+// 게이트를 우회하는 강제 방출분만 [STAT] lag=으로 센다 (티어 가능성이 있는 유일한 분량).
+static void chaseDrain(bool force) {
+  if (!chaseReady) return;
+  const bool landscape = lcd.width() > lcd.height();
+  const int axisLen = landscape ? lcd.width() : lcd.height();   // 항상 320 (양 회전 공통)
+  int ext = force ? INT32_MAX : chaseHeadExt(axisLen);
+  for (int i = 0; i < CHASE_POOL_BLOCKS; i++) {
+    ChaseBlock& b = chasePool[i];
+    if (!b.used) continue;
+    if (!force) {
+      // 가로 회전: 래스터가 x축을 훑으므로 열 끝 기준. 세로: 행 끝 기준.
+      const int endCoord = (landscape ? b.x : b.y) + CHASE_BLOCK_PX;
+      if (ext < endCoord + TEAR_SYNC_GAP) continue;   // 헤드가 아직 안 지남 → 대기
+    } else {
+      statChaseLag++;
+    }
+    unsigned long t0 = micros();
+    lcd.pushImage(b.x, b.y, CHASE_BLOCK_PX, CHASE_BLOCK_PX, b.px);
+    pushTimeSum += (micros() - t0);
+    b.used = 0;
+  }
+}
+
+// 콜백에서 온 MCU 블록을 셀 단위로 풀에 적재하고 안전분을 즉시 방출한다.
+static void chaseAccept(JPEGDRAW* pDraw) {
+  const int W = lcd.width(), H = lcd.height();
+  int x = pDraw->x, y = pDraw->y;
+  int vw = pDraw->iWidth, vh = pDraw->iHeight;
+  if (x + vw > W) vw = W - x;
+  if (y + vh > H) vh = H - y;
+  const uint16_t* src = (const uint16_t*)pDraw->pPixels;
+
+  for (int cy = (y & ~(CHASE_BLOCK_PX - 1)); cy < y + vh; cy += CHASE_BLOCK_PX) {
+    for (int cx = (x & ~(CHASE_BLOCK_PX - 1)); cx < x + vw; cx += CHASE_BLOCK_PX) {
+      ChaseBlock* b = nullptr;
+      for (int i = 0; i < CHASE_POOL_BLOCKS; i++) {
+        if (!chasePool[i].used) { b = &chasePool[i]; break; }
+      }
+      if (b == nullptr) {
+        // 풀 포화 (설계상 나오지 않음 — 최악 백로그 136 < 144): 게이트 우회 즉시 푸시.
+        // 프레임 무결성을 티어보다 우선하는 안전망.
+        unsigned long tf = micros();
+        for (int r = 0; r < CHASE_BLOCK_PX && cy + r < y + vh; r++) {
+          lcd.pushImage(cx, cy + r, CHASE_BLOCK_PX, 1,
+                        src + (size_t)r * pDraw->iWidth + (cx - x));
+        }
+        pushTimeSum += (micros() - tf);
+        statChaseLag++;
+        continue;
+      }
+      b->x = (int16_t)cx;
+      b->y = (int16_t)cy;
+      for (int r = 0; r < CHASE_BLOCK_PX; r++) {
+        memcpy(&b->px[(size_t)r * CHASE_BLOCK_PX],
+               src + (size_t)r * pDraw->iWidth + (cx - x),
+               CHASE_BLOCK_BYTES / CHASE_BLOCK_PX);
+      }
+      b->used = 1;
+    }
+  }
+  chaseDrain(false);   // 새 블록으로 안전해진 것들이 있으면 곧바로 방출
+}
+#endif  // RENDER_TEAR_SYNC
+
 #if RENDER_INTERLEAVE
 static uint8_t* stripBuf = nullptr; // [INTERLEAVE] 줄 버퍼 (320x16 RGB565 = 10KB, 힙 할당).
                                     // 인터리브는 실측 실패(위 RENDER_INTERLEAVE 주석)로 0 고정 → 이 선언도 함께 꺼짐
 #endif
 
-// 현재 화면 크기(회전 반영)에 맞는 오프스크린 스프라이트를 생성/재생성.
-// 회전이 바뀌면 lcd.width()/height()가 달라져 다음 렌더에서 자동 재생성된다.
-// 할당 실패 시 spriteReady=false로 고정 → renderJpegFast가 직접 디코드 모드로 동작.
-// 실패 후에는 재시도하지 않는다: 150KB 할당을 매 프레임 시도하면 heap 스캔 + 시리얼 출력이
-// Core1 렌더를 지연시켜 오히려 성능이 떨어진다 (직렬 핫 경로 무제한 출력 금지 규칙과 동일).
-void ensureRenderSprite() {
+// 밴드 체이스 블록 풀 확보 — udp.listen 직후 딱 1회 호출 (호출자가 위치를 책임진다).
+// **Wi-Fi 접속 전에 호출 금지**: 부팅 직후 대량 할당은 Wi-Fi 스택을 굶긴다 (2026-08-24 실측:
+// 슬롯 풀 154KB 선점 시 잔여 ~98KB로 접속 실패). 프레임마다 재시도도 금지 — heap 스캔+
+// 시리얼 출력이 Core1 렌더를 지연시킨다.
+// 하나의 연속 할당(≈75KB)이라 힙 최대연속(107KB 실측 벽) 안에 들어오고, 잔여 heap이
+// 48KB 미만이 되면 Wi-Fi/lwIP가 불안정해지므로 그 경우 반납하고 직접 디코드 모드를 유지한다.
+void ensureChasePool() {
 #if RENDER_INTERLEAVE
-  // 인터리브 모드: 풀스크린 버퍼 대신 줄 버퍼(10KB)를 최초 1회 힙 할당 → heap ~140KB 절약.
-  // 실패 시 재시도 없이 콜백이 블록 단위 직접 푸시로 폴백 (기존 직접 모드 안전망과 동일).
+  // 인터리브 모드: 줄 버퍼(10KB)만 최초 1회 힙 할당 → heap 절약.
   if (stripBuf == nullptr) {
-    spriteAllocTried = true;
+    chaseAllocTried = true;
     stripBuf = (uint8_t*)heap_caps_malloc((size_t)320 * 16 * 2, MALLOC_CAP_8BIT);
     if (stripBuf == nullptr) {
       Serial.printf("[STRIP] 줄 버퍼 할당 실패 (free heap=%uKB) → 블록 직접 푸시 고정 (재시도 없음)\n",
@@ -870,41 +1014,49 @@ void ensureRenderSprite() {
       Serial.println("[STRIP] 줄 버퍼 활성 (320x16, 인터리브 푸시)");
     }
   }
-  spriteReady = false;   // 풀스크린 스프라이트 미사용
+  chaseReady = false;   // 체이스 미사용
   return;
 #else
-  if (spriteAllocTried && !spriteReady) return;  // 1회 실패 → 직접 모드 고정 (재시도 없음)
-  int w = lcd.width();
-  int h = lcd.height();
-  if (spriteReady && renderSprite.width() == w && renderSprite.height() == h) return;
-  if (spriteBuf != nullptr) {  // 이전 버퍼 해제 (어느 할당 경로든 heap_caps_free로 정리)
-    heap_caps_free(spriteBuf);
-    spriteBuf = nullptr;
-    spriteReady = false;
+  if (chaseAllocTried || chaseReady) return;   // 래치: 1회만 시도
+  chaseAllocTried = true;
+#if RENDER_TEAR_SYNC
+  if (!tearSyncOk) return;                     // 캘리브레이션 실패 → 직접 디코드 모드 유지
+#endif
+
+  chasePool = (ChaseBlock*)heap_caps_malloc(sizeof(ChaseBlock) * CHASE_POOL_BLOCKS, MALLOC_CAP_8BIT);
+  if (chasePool != nullptr && ESP.getFreeHeap() < 48 * 1024) {
+    heap_caps_free(chasePool);   // 안전선 미달 → 반납
+    chasePool = nullptr;
   }
-  spriteAllocTried = true;
-  size_t need = (size_t)w * h * 2;  // RGB565 바이트 수
-  // PSRAM 우선: 내부 DRAM ~150KB를 잡으면 WiFi 스택(~50-70KB)이 메모리 부족으로 죽을 수 있다.
-  // PSRAM 모델(ESP32-2432S028R 등)은 Arduino IDE → Tools → PSRAM → Enabled로 활성화해야 함.
-  spriteBuf = heap_caps_malloc(need, MALLOC_CAP_SPIRAM);
-  if (spriteBuf != nullptr) {
-    Serial.printf("[SPRITE] PSRAM 버퍼 %uKB 확보\n", (unsigned)(need / 1024));
-  } else {
-    spriteBuf = heap_caps_malloc(need, MALLOC_CAP_8BIT);  // 내부 DRAM 폴백 (이 보드에선 실패 예상)
-    if (spriteBuf != nullptr) {
-      Serial.printf("[SPRITE] 내부 DRAM 버퍼 %uKB 확보\n", (unsigned)(need / 1024));
-    }
-  }
-  if (spriteBuf == nullptr) {
-    Serial.printf("[SPRITE] 버퍼 할당 실패 (free heap=%uKB) → 직접 디코드 모드 고정 (재시도 없음)\n",
-                  (unsigned)(ESP.getFreeHeap() / 1024));
+  if (chasePool == nullptr) {
+    Serial.printf("[CHASE] 블록 풀 확보 실패 (free=%uKB, 최대연속=%uKB, 필요=%uKB) → 직접 디코드 모드\n",
+                  (unsigned)(ESP.getFreeHeap() / 1024),
+                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024),
+                  (unsigned)(sizeof(ChaseBlock) * CHASE_POOL_BLOCKS / 1024));
     return;
   }
-  renderSprite.setColorDepth(16);
-  renderSprite.setBuffer(spriteBuf, w, h);
-  spriteReady = true;
-  Serial.printf("[SPRITE] 오프스크린 버퍼 활성 (%dx%d)\n", w, h);
+  for (int i = 0; i < CHASE_POOL_BLOCKS; i++) chasePool[i].used = 0;
+  chaseReady = true;
+  Serial.printf("[CHASE] 블록 풀 활성 (%d×512B=%uKB, 잔여 heap=%uKB)\n",
+                CHASE_POOL_BLOCKS,
+                (unsigned)(sizeof(ChaseBlock) * CHASE_POOL_BLOCKS / 1024),
+                (unsigned)(ESP.getFreeHeap() / 1024));
 #endif
+}
+
+// rx/render JPEG 버퍼(각 MAX_JPEG_SIZE)를 힙에서 확보. 부팅 직후(Wi-Fi 접속 전) 호출 —
+// 이 버퍼 없이는 스트리밍 자체가 불가하므로 실패 시 재부팅으로 안전 정지한다.
+// (체이스 블록 풀은 이보다 크고 Wi-Fi 스택을 굶길 수 있어 ensureChasePool로 udp.listen 직후 미룸)
+void ensureJpegBuffers() {
+  if (rxBuffer != nullptr) return;
+  rxBuffer = (uint8_t*)heap_caps_malloc(MAX_JPEG_SIZE, MALLOC_CAP_8BIT);
+  renderBuffer = (uint8_t*)heap_caps_malloc(MAX_JPEG_SIZE, MALLOC_CAP_8BIT);
+  if (rxBuffer == nullptr || renderBuffer == nullptr) {
+    Serial.printf("[JPEGBUF] 버퍼 할당 실패 (free=%uKB) → 재부팅\n",
+                  (unsigned)(ESP.getFreeHeap() / 1024));
+    delay(2000);
+    ESP.restart();
+  }
 }
 
 #if RENDER_INTERLEAVE
@@ -912,7 +1064,7 @@ void ensureRenderSprite() {
 // JPEGDEC는 위→아래로 MCU(16×16) 블록을 콜백한다. 가로 한 줄(전폭)이 모이면 곧바로 LCD로
 // 푸시한다 — renderJpegFast가 startWrite/endWrite 트랜잭션으로 감싸므로 줄 푸시들이 하나의
 // SPI DMA 흐름으로 큐잉되고, 다음 줄의 IDCT 디코드(CPU)와 겹친다.
-// 줄 버퍼(stripBuf)는 ensureRenderSprite에서 최초 1회 힙 할당; 실패 시 블록 직접 푸시 폴백.
+// 줄 버퍼(stripBuf)는 ensureChasePool에서 최초 1회 힙 할당; 실패 시 블록 직접 푸시 폴백.
 static int16_t stripY = -1;      // 누적 중인 줄의 화면 y (-1 = 진행 없음)
 static int16_t stripFillW = 0;   // 현재 줄에 누적된 가로 폭(px)
 static int16_t stripH = 0;       // 이 줄 묶음의 높이(px, MCU별 8 또는 16)
@@ -961,19 +1113,70 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
     pushTimeSum += (micros() - t0);
   }
 #else
-  if (spriteReady) {
-    // 스프라이트 모드: RAM 복사만 (SPI 미사용) → 블록이 화면에 조립돼 보이지 않음.
-    // RGB565_BIG_ENDIAN이 직접 푸시와 동일하게 그대로 복사되어 색 순서가 유지된다.
-    renderSprite.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
-  } else {
-    // 직접 모드 폴백: MCU 블록을 즉시 LCD로 푸시 (원래 방식).
-    unsigned long t0 = micros();
-    lcd.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
-    pushTimeSum += (micros() - t0);
+#if RENDER_TEAR_SYNC
+  if (chaseReady) {
+    // [TEARSYNC] 밴드 체이스 경로: MCU를 16×16 셀로 풀에 적재하고 헤드가 지나간 셀부터 방출.
+    chaseAccept(pDraw);
+    return 1;
   }
+#endif
+  // 직접 모드 폴백: 블록 풀이 없으면 MCU 블록을 즉시 LCD로 푸시 (원래 방식).
+  unsigned long t0 = micros();
+  lcd.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
+  pushTimeSum += (micros() - t0);
+  return 1;
 #endif
   return 1;
 }
+
+// ==========================================
+// 5.6 [TEARSYNC] 스캔 동기화 표시 (래스터 체이스)
+// ==========================================
+#if RENDER_TEAR_SYNC
+
+// 부팅 직후 1회 getScanLine() 동작 검증. ST7789의 0x45는 패널 구현 의존이라
+// (a) 값이 유효 범위 내에서 (b) 래스터 주기(~16.7ms)마다 랩하며 (c) 충분한 폭을 순회하는지
+// 40ms 샘플로 확인한다. 실패 시 tearSyncOk=false 고정 → 통상 원자 blit 경로로 동작.
+void calibrateScan() {
+  const uint32_t WIN_MS = 40;
+  int last = -1, mn = 32767, mx = -1;
+  uint32_t wraps = 0;
+  uint32_t t0 = millis();
+  while (millis() - t0 < WIN_MS) {
+    int sl = lcd.getScanLine();
+    if (sl < 0 || sl > 1023) {
+      Serial.printf("[SCAN] 비정상 값 %d → 티어싱크 비활성 (원자 blit 유지)\n", sl);
+      return;
+    }
+    if (last >= 0 && sl < last - 64) wraps++;
+    if (sl < mn) mn = sl;
+    if (sl > mx) mx = sl;
+    last = sl;
+    delayMicroseconds(150);
+  }
+  if (wraps >= 1 && (mx - mn) >= 200) {
+    tearSyncOk = true;
+    Serial.printf("[SCAN] 캘리브레이션 OK: 범위 %d..%d, 랩 %u회/40ms → 티어싱크 활성\n", mn, mx, (unsigned)wraps);
+  } else {
+    Serial.printf("[SCAN] 캘리브레이션 실패(범위 %d..%d, 랩 %u) → 원자 blit 유지\n", mn, mx, (unsigned)wraps);
+  }
+}
+
+// GSCAN(네이티브 게이트선 위치) → 현재 회전의 표시축 논리 좌표.
+// 가로/세로 모두 표시축 길이가 게이트선 수(320)와 1:1이라 스케일 변환은 없고 방향만 패널 의존.
+// 체이스가 동작하는데 티어링이 그대로면 TEAR_SYNC_MAP_FLIP을 1로 전환한다.
+static inline int tearSyncHeadPos(int axisLen) {
+  int sl = lcd.getScanLine();
+  if (sl < 0) sl = 0;
+  if (sl > axisLen - 1) sl = axisLen - 1;
+#if TEAR_SYNC_MAP_FLIP
+  return (axisLen - 1) - sl;
+#else
+  return sl;
+#endif
+}
+
+#endif  // RENDER_TEAR_SYNC
 
 // renderBuffer의 JPEG을 JPEGDEC로 고속 디코드 후 화면에 그립니다.
 // (호스트는 항상 풀해상도 320x240/240x320을 보냄 — 반해상도 모드 제거됨)
@@ -1003,13 +1206,17 @@ void renderJpegFast() {
 #else
   jpeg.decode(0, 0, 0);
   jpeg.close();
-  if (spriteReady) {
-    // 원자적 blit: 완성된 프레임 전체를 한 번에 LCD로 푸시 (블록 조립·패널 스캔 경합 제거).
-    // pushSprite는 내부적으로 startWrite/endWrite로 처리하며 한 번의 SPI 버스트로 전송.
-    unsigned long t0 = micros();
-    renderSprite.pushSprite(0, 0);
-    pushTimeSum += (micros() - t0);
+#if RENDER_TEAR_SYNC
+  if (chaseReady) {
+    // 프레임 말미 강제 플러시: 헤드가 아직 안 지난 잔여 블록도 전부 방출해 프레임을 완결한다.
+    // 게이트 우회분만큼 그 경계에서 티어 가능([STAT] lag=이 그 분량) — 미표시 영역을 다음
+    // 프레임까지 남겨두는 것보단 낫다. 디코드 생산(~6.5줄/ms)이 스캔(~19줄/ms)보다 느려
+    // 정상 프레임에선 대부분 콜백 중 이미 방출됐을 것 → lag≈0 기대.
+    unsigned long tc = micros();
+    chaseDrain(true);
+    pushTimeSum += (micros() - tc);
   }
+#endif
 #endif
 }
 
@@ -1028,8 +1235,6 @@ void loop() {
   if (hasNewFrame) {
     isRendering = true;
     hasNewFrame = false;
-
-    ensureRenderSprite();  // 회전이 바뀌었으면 오프스크린 스프라이트 재생성 (통상 no-op)
 
     int w = lcd.width();
     int h = lcd.height();
@@ -1086,9 +1291,15 @@ void loop() {
   if (statNow - lastStatTime >= 1000) {
     float rtAvg = (renderCount > 0) ? (float)renderTimeSum / (float)renderCount : 0.0f;
     float pushAvg = (renderCount > 0) ? (float)pushTimeSum / 1000.0f / (float)renderCount : 0.0f;
+#if RENDER_TEAR_SYNC
+    Serial.printf("[STAT] recv=%u rend=%u drop=%u fec=%u miss=%u rt=%.1fms push=%.1fms rend_fps=%.1f lag=%u\n",
+                  statRecvFrames, statRendFrames, statDropFrames, statReconstructs, statMissChunks,
+                  rtAvg, pushAvg, currentFps, (unsigned)statChaseLag);
+#else
     Serial.printf("[STAT] recv=%u rend=%u drop=%u fec=%u miss=%u rt=%.1fms push=%.1fms rend_fps=%.1f\n",
                   statRecvFrames, statRendFrames, statDropFrames, statReconstructs, statMissChunks,
                   rtAvg, pushAvg, currentFps);
+#endif
     renderTimeSum = 0;
     renderCount = 0;
     pushTimeSum = 0;
@@ -1097,6 +1308,9 @@ void loop() {
     statDropFrames = 0;
     statReconstructs = 0;
     statMissChunks = 0;
+#if RENDER_TEAR_SYNC
+    statChaseLag = 0;
+#endif
     lastStatTime = statNow;
   }
 
