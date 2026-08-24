@@ -132,6 +132,15 @@ const uint16_t UDP_PORT = 8888;
 #define MAX_JPEG_SIZE 24576
 #define PACKET_PAYLOAD_SIZE 1400
 
+// [INTERLEAVE] 디코드 중 MCU 줄 단위 즉시 푸시 — **실측 실패로 기본 꺼짐(2026-08-24)**.
+// 가설: JPEGDEC 콜백에서 완성 줄을 곧바로 pushImage하면 SPI DMA가 다음 줄 IDCT와 겹쳐
+// rt 54.5→~40ms. 결과: **rt 불변(품질 따라 50~65ms), 티어링은 오히려 악화**.
+// 원인: LovyanGFX pushImage는 startWrite/endWrite 트랜잭션 안에서도 매 호출 DMA 완료를
+// busy-wait → CPU·SPI 오버랩 불가. 공개 API로는 이 구조의 겹침을 만들 수 없음.
+// 진짜 비동기가 필요하면 LGFX 쓰기를 우회한 spi_device_queue_trans 이중버퍼 직접 구동이
+// 필요하지만 버스 공유 위험 대비 이득이 낮아 보류. 재제안 전에 이 실측 기억할 것.
+#define RENDER_INTERLEAVE 0
+
 static uint8_t rxBuffer[MAX_JPEG_SIZE];
 static uint8_t renderBuffer[MAX_JPEG_SIZE];
 // renderBufferSize는 Core0(콜백)에서 쓰고 Core1(loop 렌더)에서 읽는 크로스코어 값 → volatile.
@@ -666,7 +675,6 @@ void onUdpPacketReceived(AsyncUDPPacket packet) {
   //   2. 각 청크를 rxBuffer에 저장 (FEC 모드면 마지막 청크는 parityBuffer로 분리)
   //   3. 판정: dataMissing==0 → 즉시 커밋 · 데이터 1개 유실+패리티 → XOR 복원 후 커밋 · 그 외 → 대기
   // 커밋(commitFrame)은 렌더(Core1) 중이면 pendingCommit만 세우고, loop()가 렌더 종료 후 스테이징한다.
-  // ---- 데이터 패킷 ----
   // [FIX#R2] pendingCommit 동안 rxBuffer에는 "스테이징 대기 중인 완성 프레임"이 있다.
   // 새 프레임이 rxBuffer를 덮어쓰면 대기 프레임이 파괴되므로, loop()가 스테이징할 때까지
   // 데이터 패킷을 무시한다. (렌더 종료 후 loop()가 µs 안에 스테이징 → 손실은 수 프레임 한정)
@@ -838,6 +846,10 @@ static int jpegDbg = 0;
 
 static void* spriteBuf = nullptr;   // 오프스크린 버퍼 원시 포인터 (직접 heap_caps_free로 정리)
 static bool spriteAllocTried = false;  // 최초 1회만 할당 시도 → 실패 시 재시도/스팸 방지
+#if RENDER_INTERLEAVE
+static uint8_t* stripBuf = nullptr; // [INTERLEAVE] 줄 버퍼 (320x16 RGB565 = 10KB, 힙 할당).
+                                    // 인터리브는 실측 실패(위 RENDER_INTERLEAVE 주석)로 0 고정 → 이 선언도 함께 꺼짐
+#endif
 
 // 현재 화면 크기(회전 반영)에 맞는 오프스크린 스프라이트를 생성/재생성.
 // 회전이 바뀌면 lcd.width()/height()가 달라져 다음 렌더에서 자동 재생성된다.
@@ -845,6 +857,22 @@ static bool spriteAllocTried = false;  // 최초 1회만 할당 시도 → 실�
 // 실패 후에는 재시도하지 않는다: 150KB 할당을 매 프레임 시도하면 heap 스캔 + 시리얼 출력이
 // Core1 렌더를 지연시켜 오히려 성능이 떨어진다 (직렬 핫 경로 무제한 출력 금지 규칙과 동일).
 void ensureRenderSprite() {
+#if RENDER_INTERLEAVE
+  // 인터리브 모드: 풀스크린 버퍼 대신 줄 버퍼(10KB)를 최초 1회 힙 할당 → heap ~140KB 절약.
+  // 실패 시 재시도 없이 콜백이 블록 단위 직접 푸시로 폴백 (기존 직접 모드 안전망과 동일).
+  if (stripBuf == nullptr) {
+    spriteAllocTried = true;
+    stripBuf = (uint8_t*)heap_caps_malloc((size_t)320 * 16 * 2, MALLOC_CAP_8BIT);
+    if (stripBuf == nullptr) {
+      Serial.printf("[STRIP] 줄 버퍼 할당 실패 (free heap=%uKB) → 블록 직접 푸시 고정 (재시도 없음)\n",
+                    (unsigned)(ESP.getFreeHeap() / 1024));
+    } else {
+      Serial.println("[STRIP] 줄 버퍼 활성 (320x16, 인터리브 푸시)");
+    }
+  }
+  spriteReady = false;   // 풀스크린 스프라이트 미사용
+  return;
+#else
   if (spriteAllocTried && !spriteReady) return;  // 1회 실패 → 직접 모드 고정 (재시도 없음)
   int w = lcd.width();
   int h = lcd.height();
@@ -876,11 +904,63 @@ void ensureRenderSprite() {
   renderSprite.setBuffer(spriteBuf, w, h);
   spriteReady = true;
   Serial.printf("[SPRITE] 오프스크린 버퍼 활성 (%dx%d)\n", w, h);
+#endif
 }
 
-// JPEGDEC 디코드 콜백: 디코드된 RGB565 블록을 스프라이트(RAM) 또는 LCD로 복사.
+#if RENDER_INTERLEAVE
+// ---- 인터리브 푸시용 줄 어셈블러 ----
+// JPEGDEC는 위→아래로 MCU(16×16) 블록을 콜백한다. 가로 한 줄(전폭)이 모이면 곧바로 LCD로
+// 푸시한다 — renderJpegFast가 startWrite/endWrite 트랜잭션으로 감싸므로 줄 푸시들이 하나의
+// SPI DMA 흐름으로 큐잉되고, 다음 줄의 IDCT 디코드(CPU)와 겹친다.
+// 줄 버퍼(stripBuf)는 ensureRenderSprite에서 최초 1회 힙 할당; 실패 시 블록 직접 푸시 폴백.
+static int16_t stripY = -1;      // 누적 중인 줄의 화면 y (-1 = 진행 없음)
+static int16_t stripFillW = 0;   // 현재 줄에 누적된 가로 폭(px)
+static int16_t stripH = 0;       // 이 줄 묶음의 높이(px, MCU별 8 또는 16)
+
+static void stripReset() { stripY = -1; stripFillW = 0; stripH = 0; }
+
+static void stripFlush() {
+  if (stripBuf == nullptr || stripFillW <= 0 || stripY < 0) return;
+  unsigned long t0 = micros();
+  lcd.pushImage(0, stripY, stripFillW, stripH, (const uint16_t*)stripBuf);
+  pushTimeSum += (micros() - t0);
+  stripFillW = 0;
+}
+
+static void stripAccumulate(JPEGDRAW* pDraw) {
+  const int pw = lcd.width();   // 회전 반영 패널 폭 (가로 320 / 세로 모드 240)
+  if (pDraw->y != stripY) {     // 새 줄 시작 → 이전 줄 플러시
+    stripFlush();
+    stripY = pDraw->y;
+    stripFillW = 0;
+    stripH = pDraw->iHeight;
+  }
+  int cw = pDraw->iWidth;
+  if (cw > pw - stripFillW) cw = pw - stripFillW;   // MCU 패딩 클립 (iWidth가 초과분 포함 가능)
+  if (cw <= 0) return;
+  uint16_t* dst = (uint16_t*)stripBuf;
+  const uint16_t* src = (const uint16_t*)pDraw->pPixels;
+  for (int r = 0; r < pDraw->iHeight; r++) {
+    memcpy(dst + (size_t)r * pw + stripFillW, src + (size_t)r * pDraw->iWidth, (size_t)cw * 2);
+  }
+  stripFillW += cw;
+  if (stripFillW >= pw) stripFlush();
+}
+#endif
+
+// JPEGDEC 디코드 콜백: 디코드된 RGB565 블록을 줄 단위 LCD(인터리브)/스프라이트(RAM)/LCD(직접)로.
 // JPEGDEC 디코드는 동기식이라 이 콜백은 loop() 스레드에서 실행됨 → 렌더 경합 없음.
 int jpegDrawCallback(JPEGDRAW* pDraw) {
+#if RENDER_INTERLEAVE
+  if (stripBuf != nullptr) {
+    stripAccumulate(pDraw);
+  } else {
+    // 줄 버퍼 할당 실패 폴백: MCU 블록을 즉시 LCD로 푸시 (원래 직접 모드).
+    unsigned long t0 = micros();
+    lcd.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
+    pushTimeSum += (micros() - t0);
+  }
+#else
   if (spriteReady) {
     // 스프라이트 모드: RAM 복사만 (SPI 미사용) → 블록이 화면에 조립돼 보이지 않음.
     // RGB565_BIG_ENDIAN이 직접 푸시와 동일하게 그대로 복사되어 색 순서가 유지된다.
@@ -891,6 +971,7 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
     lcd.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
     pushTimeSum += (micros() - t0);
   }
+#endif
   return 1;
 }
 
@@ -908,6 +989,18 @@ void renderJpegFast() {
     return;
   }
   jpeg.setPixelType(RGB565_BIG_ENDIAN);
+#if RENDER_INTERLEAVE
+  // 인터리브: 트랜잭션 안에서 decode → 콜백의 줄 단위 pushImage가 하나의 SPI DMA 흐름으로
+  // 큐잉돼 다음 줄 IDCT와 겹친다. endWrite에서 마지막 flush 대기 후 잔여 시간을 push로 계상.
+  stripReset();
+  lcd.startWrite();
+  jpeg.decode(0, 0, 0);
+  jpeg.close();
+  stripFlush();              // 마지막 줄이 전폭 미달이면 여기서 플러시
+  unsigned long tf = micros();
+  lcd.endWrite();
+  pushTimeSum += (micros() - tf);
+#else
   jpeg.decode(0, 0, 0);
   jpeg.close();
   if (spriteReady) {
@@ -917,6 +1010,7 @@ void renderJpegFast() {
     renderSprite.pushSprite(0, 0);
     pushTimeSum += (micros() - t0);
   }
+#endif
 }
 
 // ==========================================
@@ -1007,19 +1101,27 @@ void loop() {
   }
 
   // ---- 스트리밍 중 3초 long-touch → Wi-Fi 재설정 모드 ----
-  // lcd.getTouch()는 소프트웨어 SPI(XPT2046) 폴링이라 매 루프마다 Core1 시간을 소모한다.
-  // 렌더와 경합하므로 스트리밍 중 폴링 스로틀이 필요 — OPTIMIZATION_PLAN.md P1-2 적용 후보 지점.
+  // lcd.getTouch()는 소프트웨어 SPI(XPT2046) 폴링이라 매 루프마다 Core1 시간을 소모하고
+  // 렌더와 경합한다. [OPT P1-2] 스트리밍 중에는 50ms 간격으로 스로틀한다 — 3초 long-touch
+  // 판정은 millis 기준이라 폴링 주기와 무관(실제 3.0~3.05s에 발화). 폴링을 건너뛴 구간에서는
+  // touchStart를 건드리지 않아 길게 누른 채 스로틀을 지나쳐도 카운트가 유지된다.
+  // 비스트리밍(idle) 중엔 기존대로 매 루프 폴링 → 설정 UI 반응성 무변화.
   static unsigned long touchStart = 0;
-  uint16_t tx, ty;
-  if (lcd.getTouch(&tx, &ty)) {
-    if (touchStart == 0) touchStart = millis();
-    if (millis() - touchStart > 3000) {
+  static unsigned long lastTouchPoll = 0;
+  unsigned long touchNow = millis();
+  if (!streamActive || (touchNow - lastTouchPoll) >= 50) {
+    lastTouchPoll = touchNow;
+    uint16_t tx, ty;
+    if (lcd.getTouch(&tx, &ty)) {
+      if (touchStart == 0) touchStart = touchNow;
+      if (touchNow - touchStart > 3000) {
+        touchStart = 0;
+        runTouchWifiSetup();
+        ESP.restart();
+      }
+    } else {
       touchStart = 0;
-      runTouchWifiSetup();
-      ESP.restart();
     }
-  } else {
-    touchStart = 0;
   }
 
   if (WiFi.status() != WL_CONNECTED) {

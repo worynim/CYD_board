@@ -21,7 +21,7 @@ from typing import List, Dict
 
 try:
     import mss
-    from PIL import Image, ImageOps
+    from PIL import Image
 except ImportError:
     print("[-] 필수 라이브러리가 설치되지 않았습니다: pip install mss Pillow")
     sys.exit(1)
@@ -38,10 +38,13 @@ logging.basicConfig(
 # 다르면 청크 경계가 어긋나 화면이 깨지므로, 한쪽을 바꿀 때는 반드시 함께 바꿀 것.
 PAYLOAD_CHUNK_SIZE = 1400
 
-# [FIX #12] 디바이스 렌더 상한. rt≈54ms(픽셀 푸시 17ms + 디코드 37ms) → 최대 ~18fps.
-# 이보다 빠르게 전송하면 commitFrame()의 isRendering 가드에 걸려 프레임이 폐기됨
-# (호스트 전송 FPS만 높고 CYD는 recv≈0·drop 폭증). 안전 마진을 두고 20fps로 클램프.
-DEVICE_RENDER_FPS_CAP = 20
+# [FIX #12 → 실험 상한] 디바이스 물리 한계는 rt≈54ms(SPI 푸시 17ms + 디코드 37ms) ≈ ~18fps.
+# 과거엔 발신 초과 시 recv≈0·drop 폭증(누적 백로그) 때문에 16~20으로 하향했으나,
+# [LATEST-WINS]+[FIX#R2 pendingCommit] 도입으로 호스트·디바이스 측 낡은 프레임 누적은 사라졌으므로
+# 디바이스 한계 실험을 위해 슬라이더 최대(30)까지 허용한다. 장기 안정치는 [STAT] drop/miss/rend_fps로 판단.
+# 단 최종 병목은 AP 다운링크 큐다: 발신 바이트가 무선 배출률을 넘으면 공유기에 수초 백로그가 쌓이며
+# 이 지연은 어느 쪽 코드 버퍼에도 없는 것이라 회수 불가하다(ping RTT 단조 증가로 확인, 2026-08-24).
+DEVICE_RENDER_FPS_CAP = 30
 
 
 @dataclass
@@ -232,24 +235,24 @@ class CYDStreamerGUI:
         q_frame = tk.Frame(card, bg=self.card_bg)
         q_frame.pack(fill=tk.X, pady=4)
 
-        self.q_label = ttk.Label(q_frame, text="JPEG 품질 (45):")
+        self.q_label = ttk.Label(q_frame, text="JPEG 품질 (60):")
         self.q_label.pack(anchor="w")
 
         self.q_scale = ttk.Scale(q_frame, from_=20, to=85, orient=tk.HORIZONTAL, command=self.on_quality_change)
-        self.q_scale.set(45)
+        self.q_scale.set(60)
         self.q_scale.pack(fill=tk.X, pady=2)
 
         # 7. 목표 FPS
         fps_frame = tk.Frame(card, bg=self.card_bg)
         fps_frame.pack(fill=tk.X, pady=4)
 
-        self.fps_label = ttk.Label(fps_frame, text="목표 FPS (16 FPS):")
+        self.fps_label = ttk.Label(fps_frame, text="목표 FPS (18 FPS):")
         self.fps_label.pack(anchor="w")
 
-        # [FIX #12] 디바이스 렌더가 54ms/frame(≈18fps 상한)이므로 기본 16으로 설정.
-        # 위로 올려도 안전 상한 16에서 전송량이 클램프됨(아래 _capture_worker 참조).
+        # [FIX #12 → 실험 상한] 기본 18(디바이스 렌더 한계 ~18fps 부근). 슬라이더 최대 30까지
+        # DEVICE_RENDER_FPS_CAP로 클램프되며, 클램프는 호스트 발신율 제어일 뿐 AP 큐 적체까지는 못 막음.
         self.fps_scale = ttk.Scale(fps_frame, from_=10, to=30, orient=tk.HORIZONTAL, command=self.on_fps_change)
-        self.fps_scale.set(16)
+        self.fps_scale.set(18)
         self.fps_scale.pack(fill=tk.X, pady=2)
 
         # 8. 통계 패널
@@ -337,7 +340,7 @@ class CYDStreamerGUI:
 
     def on_fps_change(self, val: str) -> None:
         f = int(float(val))
-        # [FIX #12] 디바이스 렌더 상한(≈16fps) 반영해 실제 전송 FPS를 표시
+        # [FIX #12] 전송 상한(DEVICE_RENDER_FPS_CAP=30) 적용 결과를 표시
         eff = min(f, DEVICE_RENDER_FPS_CAP)
         self.fps_label.config(text=f"목표 FPS ({f} FPS){'' if eff == f else f' → {eff} 적용'}:")
         self._update_stream_config()
@@ -523,6 +526,25 @@ class CYDStreamerGUI:
                 if jpeg_bytes is None:
                     loop_exit_reason = "캡처(생산자) 스레드 종료"
                     break
+
+                # [LATEST-WINS] 큐에 더 새 프레임이 남아 있으면 낡은 것은 폐기하고 최신으로 덮어쓴다.
+                # 호스트 측(앱 큐 이전 단계)에는 낡은 프레임이 쌓이지 않는다. 목표 FPS와 무관하게 동작.
+                # 주의(2026-08-24 ping 진단): 이미 sendto를 지난 데이터그램은 회수 불가 — 발신 바이트량이
+                # AP 다운링크 배출률을 넘으면 공유기 큐에 수초 백로그가 생기며, latest-wins로는 못 막는다.
+                # "정지 후 수초 재생" 지연이 재현되면 코드보다 전송량(품질/FPS)↓ 또는 무선 환경 개선이 처방.
+                eof_seen = False
+                while True:
+                    try:
+                        newer = my_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if newer is None:
+                        eof_seen = True  # 생산자 종료 시그널 — 유실 방지 위해 되돌려 놓는다
+                        break
+                    jpeg_bytes = newer
+                if eof_seen:
+                    my_queue.put(None)
+
                 if not self.is_streaming:
                     break
 
@@ -563,6 +585,11 @@ class CYDStreamerGUI:
                     # 프레임 주기에서 10ms를 뺀 구간에 (데이터+패리티)를 균등 분산 → 프레임 간 10ms 여유.
                     # inter_chunk 하한 1.5ms를 보장해 패킷이 몰리는 것을 방지한다.
                     inter_chunk = max(1.5e-3, (frame_period - 0.010) / total_packets)
+                    # [PERF C/P0-2] 상대 sleep(time.sleep(inter_chunk))은 macOS 오버슈트(요청 3.3ms →
+                    # 실측 5~10ms)가 누적돼 프레임 전송이 예산(예: 52ms)을 초과하고 뭉치게 된다.
+                    # monotonic 절대 deadline 슬롯으로 바꿔 sendto 소요 시간까지 슬롯에 포함하고
+                    # 누적 오차를 제거한다. [FIX #13/#14]의 분산·프레임 간 여유 원칙은 그대로 유지.
+                    next_slot = time.monotonic() + inter_chunk
 
                     for chunk_idx in range(total_packets):  # 마지막 인덱스 = 패리티
                         if not self.is_streaming:
@@ -572,7 +599,12 @@ class CYDStreamerGUI:
                         payload = (parity_bytes if chunk_idx == data_chunks
                                    else padded[start_offset:start_offset + PAYLOAD_CHUNK_SIZE])
                         sock.sendto(header + payload, dest_addr)
-                        time.sleep(inter_chunk)  # [FIX #13/#14] 전체 패킷 균등 분산 + 프레임 간 여유
+                        # 절대 슬롯까지 남은 시간만 잔다(음수 금지). 뒤처진 프레임은 밀린 만큼 몰아보내지만
+                        # 슬롯 기준이 프레임 시작 고정이라 다음 프레임부터 자동 정상화된다.
+                        delay = next_slot - time.monotonic()
+                        if delay > 0:
+                            time.sleep(delay)
+                        next_slot += inter_chunk
 
                     frame_count += 1
 
@@ -647,24 +679,29 @@ class CYDStreamerGUI:
 
                     is_portrait = cfg.rot_code in (0, 2)
                     target_w, target_h = (240, 320) if is_portrait else (320, 240)
-                    # [FIX #12] 디바이스 렌더(rt≈54ms → ~18fps)를 넘는 전송은 커밋이 렌더 중
-                    # 차단돼 프레임이 폐기됨. 안전 상한(16fps)으로 전송률을 클램프.
+                    # [FIX #12 → 실험 상한] 발신률 클램프. 디바이스 렌더 한계는 rt≈54ms(~18fps)지만,
+                    # [LATEST-WINS]+pendingCommit으로 초과분은 폐기가 아니라 최신 프레임 교체가 되므로
+                    # 실험을 위해 CAP=30까지 허용. 단 AP 다운링크 큐 적체(수초 지연)는 이 클램프로도 못 막음.
                     frame_interval = 1.0 / min(cfg.target_fps, DEVICE_RENDER_FPS_CAP)
 
                     try:
                         t0 = time.time()
                         sct_img = sct.grab(monitor)
-                        img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                        # [PERF B1] BGRA 원본을 RGB로 미리 변환하지 않는다. 기존 frombytes("RGB", …,
+                        # "BGRX")는 3MP 전체를 매 프레임 변환+복사(~9MB)했지만, frombuffer RGBA 뷰는
+                        # 복사 없이 원본 바이트를 공유하고, RGB 변환을 축소 후 소형(320x240)에서 한 번만
+                        # 수행해 변환 픽셀을 1/40 수준으로 줄인다.
+                        img = Image.frombuffer("RGBA", sct_img.size, sct_img.bgra, "raw", "BGRA", 0, 1)
                         t1 = time.time()
 
-                        # [FIX #10] 대형 소스(최대 3.7MP) 다운스케일은 BOX 리샘플 사용.
-                        # 소스 전체에 BILINEAR를 직접 걸면 세로 모니터(1296x2304) 기준 ~25ms → 호스트 15fps 벽.
-                        # BOX(C 타일 필터, 대형 축소 전용) + 목표 비율 선크롭으로 절반 이하로 단축.
+                        # [FIX #10]+[PERF B2] BOX 리샘플 + 목표 비율 선크롭 + 정수배 reduce 2단 고속 축소.
                         img_final = self._fast_resize_for_display(img, target_w, target_h, cfg.aspect_mode)
                         t2 = time.time()
 
                         buffer = io.BytesIO()
-                        img_final.save(buffer, format="JPEG", quality=cfg.jpeg_quality)
+                        # [PERF D] optimize=True: 최적화 허프만 테이블로 바이트 5~10% 절감 → 청크 수 감소 +
+                        # 디바이스 디코드(엔트로피 비례) 가속. 인코딩 CPU는 늘지만 B1/B2로 확보한 여유 안이다.
+                        img_final.save(buffer, format="JPEG", quality=cfg.jpeg_quality, optimize=True)
                         jpeg_bytes = buffer.getvalue()
                         t3 = time.time()
 
@@ -705,20 +742,33 @@ class CYDStreamerGUI:
             logging.debug("[CAP:%d] 생산자 종료.", my_thread_id)
 
     @staticmethod
-    def _fast_resize_for_display(img, tw: int, th: int, aspect_mode: int):
-        """대형 스크린샷 → 표시용(tw x th) 다운스케일. BILINEAR 대신 BOX 리샘플 사용.
+    def _downscale_box(img, cw: int, ch: int):
+        """[PERF B2] img를 (cw x ch)로 축소 — 정수배 reduce 선축소 + BOX resize 마무리.
 
-        소스 전체에 BILINEAR를 걸면 픽셀 2D 필터가 3.7MP 전체를 훑어 느림.
-        BOX(C 타일 박스 필터, 대형 축소 전용)로 한 번에 줄이고, 크롭 모드는
-        목표 비율로 먼저 자른 뒤 축소해 낭비 픽셀을 없앱니다.
+        BOX 필터 커널은 축소 배율에 비례해 넓어져 3MP→320x240 직접 축소가 비싸다.
+        정수 배수만큼 reduce()(정박스 평균 전용 고속 경로)로 먼저 크게 줄이면
+        남은 배율이 소수 수준이 돼 최종 BOX resize가 저렴해진다.
+        """
+        iw, ih = img.size
+        k = min(iw // cw, ih // ch)
+        if k > 1:
+            img = img.reduce(k)
+        return img.resize((cw, ch), Image.Resampling.BOX)
+
+    @staticmethod
+    def _fast_resize_for_display(img, tw: int, th: int, aspect_mode: int):
+        """대형 스크린샷 → 표시용(tw x th) 다운스케일. 반환은 항상 RGB(JPEG 인코딩 요건).
+
+        입력은 캡처 원본의 RGBA 뷰([PERF B1] BGRA 바이트 공유, 복사 없음)여도 무방하다 —
+        RGB 변환은 축소 후 소형 이미지에서 한 번만 수행해 전체 해상도 변환(~9MB/프레임)을 제거했다.
         aspect_mode: 0=letterbox(여백) · 1=stretch(비율 무시) · 2=crop(중앙 크롭)
         """
         iw, ih = img.size
         if aspect_mode == 1:
-            return img.resize((tw, th), Image.Resampling.BOX)
+            return CYDStreamerGUI._downscale_box(img, tw, th).convert("RGB")
 
         if aspect_mode == 2:
-            # cover: 소스를 목표 비율(tw:th)로 중앙 크롭한 뒤 BOX 축소
+            # cover: 소스를 목표 비율(tw:th)로 중앙 크롭한 뒤 축소 (낭비 픽셀 제거)
             tar = tw / th
             if iw / ih > tar:
                 nw = int(ih * tar)
@@ -728,14 +778,17 @@ class CYDStreamerGUI:
                 nh = int(iw / tar)
                 y0 = (ih - nh) // 2
                 img = img.crop((0, y0, iw, y0 + nh))
-            return img.resize((tw, th), Image.Resampling.BOX)
+            return CYDStreamerGUI._downscale_box(img, tw, th).convert("RGB")
 
-        # contain(letterbox): 내용 크기(원본 비율 유지)로 BOX 축소 후 검은 여백만 pad
+        # contain(letterbox): 내용 크기(원본 비율 유지)로 축소 후 검은 여백 paste.
+        # [P3-1] ImageOps.pad는 반올림 1px 차이로 내부 재축소를 유발할 수 있어 검은 캔버스+paste로 대체.
         scale = min(tw / iw, th / ih)
         cw = max(1, round(iw * scale))
         ch = max(1, round(ih * scale))
-        small = img.resize((cw, ch), Image.Resampling.BOX)
-        return ImageOps.pad(small, (tw, th), method=Image.Resampling.BILINEAR, color=(0, 0, 0))
+        small = CYDStreamerGUI._downscale_box(img, cw, ch).convert("RGB")
+        canvas = Image.new("RGB", (tw, th), (0, 0, 0))
+        canvas.paste(small, ((tw - cw) // 2, (th - ch) // 2))
+        return canvas
 
     def _accum_stage(self, name: str, dt: float) -> None:
         """[Phase 1] 스테이지별 소요 시간을 누적하고 2초마다 로그로 출력합니다."""
