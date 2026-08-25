@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 CYD Portable Monitor - Stable High-Speed GUI Streamer
-- 캡처 화면: 개별 모니터 선택 (0번 전체 영역 제외)
+- 캡처 소스: 개별 모니터 선택 또는 특정 창(window) 캡처 (macOS, [WINCAP])
 - 화면 비율 모드: Letterbox(원본 비율 유지), Stretch(채우기), Crop(크롭 맞춤)
 - 안정적인 청크 송신 제어로 패킷 유실 방지 및 깔끔한 화면 전송
 """
 
+import os
 import sys
 import time
 import io
@@ -17,7 +18,7 @@ import logging
 from dataclasses import dataclass
 import tkinter as tk
 from tkinter import ttk, messagebox
-from typing import List, Dict
+from typing import Dict, List, Optional
 
 try:
     import mss
@@ -25,6 +26,29 @@ try:
 except ImportError:
     print("[-] 필수 라이브러리가 설치되지 않았습니다: pip install mss Pillow")
     sys.exit(1)
+
+# [WINCAP] 창(window) 캡처 — macOS에서만 지원. Quartz(CGWindowList)로 보이는 앱 창의
+# 위치/크기를 얻어 mss grab 영역으로 넘긴다. pyobjc-framework-Quartz 미설치·비-macOS여도
+# 기존 모니터 캡처는 그대로 동작해야 하므로 ImportError를 삼켜 기능만 비활성화한다.
+IS_MACOS = sys.platform == "darwin"
+HAS_WINDOW_SOURCE = False
+if IS_MACOS:
+    try:
+        from Quartz import (
+            CGWindowListCopyWindowInfo,
+            kCGWindowListOptionOnScreenOnly,
+            kCGNullWindowID,
+            kCGWindowName,
+            kCGWindowOwnerName,
+            kCGWindowOwnerPID,
+            kCGWindowNumber,
+            kCGWindowLayer,
+            kCGWindowBounds,
+        )
+        HAS_WINDOW_SOURCE = True
+    except ImportError:
+        logging.warning("[WINCAP] pyobjc-framework-Quartz 없음 — 창 캡처 비활성 "
+                        "(pip install pyobjc-framework-Quartz)")
 
 
 logging.basicConfig(
@@ -61,6 +85,21 @@ class StreamConfig:
     show_fps: int      # CYD FPS 오버레이 표시 여부 (0/1)
 
 
+@dataclass
+class CaptureSource:
+    """[WINCAP] 캡처 소스 스냅샷.
+
+    스트리밍 시작 시 메인 스레드에서 만들어 _capture_worker에 인자로 전달된다.
+    워커는 이 객체만 읽으므로 UI 위젯 접근 없이 스레드 안전이다(재시작 시에도
+    새 스냅샷을 받는 기존 monitor_idx 패턴과 동일한 계약).
+    """
+
+    kind: str            # "monitor" | "window"
+    mon_idx: int = 0     # kind="monitor": monitors_info 인덱스
+    window_id: int = -1  # kind="window": CGWindowNumber
+    label: str = ""      # 로그용 표시 ("앱 — 제목" / 모니터 라벨)
+
+
 class CYDStreamerGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -93,6 +132,19 @@ class CYDStreamerGUI:
 
         self.monitors_info = self.get_individual_monitors()
 
+        # [WINCAP] 창 캡처 상태 (아래 create_widgets → _build_capture_options가 채움)
+        # _windows: 콤보에 표시할 창 항목 [{desc, window_id, w, h, ...}] — 메인 스레드 전용.
+        # _mon_count: 콤보에서 모니터 구간 크기. 그 뒤 인덱스는 구분선(더미) 1개 + 창 목록.
+        # _last_src_idx: 구분선 더미 선택을 되돌리기 위한 마지막 유효 선택.
+        # _sel_win_size: 선택 시점 창의 논리 크기 — 회전 자동 감지용 캐시.
+        # _last_window_region: 창이 닫혔을 때 쓰는 마지막 grab 영역 폴백 — 캡처 스레드 전용 필드
+        #   (워커만 읽고 쓴다. 메인은 start_streaming에서 초기화).
+        self._windows: List[Dict] = []
+        self._mon_count = len(self.monitors_info)
+        self._last_src_idx = 0
+        self._sel_win_size: tuple = (0, 0)
+        self._last_window_region: Optional[Dict] = None
+
         self.setup_ui_style()
         self.create_widgets()
         # [FIX #9] 창 닫기 이벤트 핸들러 등록: 스트리밍 중단 후 안전하게 종료
@@ -108,6 +160,173 @@ class CYDStreamerGUI:
         with mss.mss() as sct:
             individuals = list(sct.monitors[1:])
             return individuals if individuals else list(sct.monitors[:1])
+
+    # ------------------------------------------------------------------
+    # [WINCAP] 창(window) 캡처
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def list_app_windows() -> List[Dict]:
+        """화면에 보이는 앱 창 목록을 수집합니다 (macOS 전용, [WINCAP]).
+
+        CGWindowListCopyWindowInfo(OnScreenOnly)의 결과를 UI 표시 항목으로 정리한다.
+        - kCGWindowLayer != 0 : 메뉴바·Dock 등 오버레이 → 제외
+        - 자기 프로세스(PID 일치) : 이 GUI의 Tkinter 창 → 제외
+        - 제목(kCGWindowName)이 없는 보조 창(툴팁·오버레이) → 제외
+          ※ macOS 10.15+ 에서는 화면 기록(Screen Recording) 권한이 있어야 타 앱 창의
+           제목이 채워진다. 모니터 캡처(mss)에 이미 필요한 권한이라 추가 허용은 불필요.
+        - 64x64 미만 미니 창 → 제외
+
+        mss 좌표계와의 정합성: mss는 macOS에서 모니터 좌표를 CGDisplayBounds
+        (논리 포인트)로 잡으므(darwin.py _monitors_impl), kCGWindowBounds의 포인트 값과
+        같은 좌표계다 — grab 영역으로 그대로 넘길 수 있어 Retina 배율 변환이 불필요하다.
+        단 grab 결과 이미지는 네이티브(Retina 2x) 해상도로 돌아올 수 있으나 기존 파이프라인은
+        sct_img.size(실제 픽셀)를 읽으므로 자동 처리된다.
+        """
+        if not HAS_WINDOW_SOURCE:
+            return []
+        own_pid = os.getpid()
+        wins: List[Dict] = []
+        try:
+            infos = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)
+        except Exception as e:
+            logging.warning("[WINCAP] 창 목록 조회 실패: %s", e)
+            return []
+        for info in infos or []:
+            try:
+                if int(info.get(kCGWindowLayer, 0)) != 0:
+                    continue
+                if int(info.get(kCGWindowOwnerPID, -1)) == own_pid:
+                    continue
+                owner = str(info.get(kCGWindowOwnerName) or "")
+                title = str(info.get(kCGWindowName) or "")
+                if not title:
+                    continue
+                b = info.get(kCGWindowBounds) or {}
+                w, h = int(b.get("Width", 0)), int(b.get("Height", 0))
+                if w < 64 or h < 64:
+                    continue
+                wins.append({
+                    "desc": f"{owner} — {title}" if owner and owner != title else title,
+                    "window_id": int(info.get(kCGWindowNumber, -1)),
+                    "w": w, "h": h,
+                    "owner": owner, "title": title,
+                })
+            except Exception:
+                continue  # 개별 항목 파싱 실패는 무시하고 다음 창 계속
+        return wins
+
+    def _get_window_region(self, window_id: int) -> Optional[Dict]:
+        """[WINCAP] 창의 현재 위치/크기를 mss grab 영역({left,top,width,height})으로 반환.
+
+        매 프레임 재조회해 창 이동·리사이즈를 실시간 추적한다. 조회 비용(CGWindowList
+        전체 열거)은 프레임당 수 ms 수준으로 기존 grab(~30ms) 대비 작지만, 정확한
+        오버헤드는 [TIMING] grab 스테이지에 자연히 반영된다.
+
+        반환 None 의미:
+        - 창을 찾지 못함(닫힘) 또는 크기가 사실상 0 → 호출자가 폴백/스킵 판단.
+        - 완전히 화면 밖(모든 개별 모니터와 교집합 0) → grab이 검은 이미지를 내놓는
+          것을 막기 위해 스킵.
+
+        스레드 계약: _capture_worker(캡처 스레드)에서만 호출. 메인 스레드는 시작
+        전 유효성 확인(start_streaming)에서만 호출한다.
+        """
+        if not HAS_WINDOW_SOURCE:
+            return None
+        try:
+            infos = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)
+        except Exception:
+            return None
+        for info in infos or []:
+            try:
+                if int(info.get(kCGWindowNumber, -2)) != window_id:
+                    continue
+                b = info.get(kCGWindowBounds) or {}
+                left, top = int(b.get("X", 0)), int(b.get("Y", 0))
+                width, height = int(b.get("Width", 0)), int(b.get("Height", 0))
+                if width < 8 or height < 8:
+                    return None
+                region = {"left": left, "top": top, "width": width, "height": height}
+                for mon in self.monitors_info:
+                    ox = max(region["left"], mon["left"])
+                    oy = max(region["top"], mon["top"])
+                    ix = min(region["left"] + region["width"],
+                             mon["left"] + mon["width"]) - ox
+                    iy = min(region["top"] + region["height"],
+                             mon["top"] + mon["height"]) - oy
+                    if ix > 0 and iy > 0:
+                        return region  # 어느 모니터든 걸치면 유효
+                return None  # 완전히 화면 밖
+            except Exception:
+                continue
+        return None
+
+    def _build_capture_options(self) -> List[str]:
+        """[WINCAP] 캡처 소스 콤보의 표시 항목을 만듭니다 (메인 스레드 전용).
+
+        구성: 모니터 항목들 → 구분선 더미 1개 → 창 항목들.
+        부작용으로 self._windows / self._mon_count를 갱신한다. 인덱스 ↔ 소스 매핑은
+        _current_capture_source가 동일한 규칙으로 해석하므로 두 함수는 함께 수정할 것.
+        """
+        opts = []
+        for idx, m in enumerate(self.monitors_info):
+            orient = "세로" if m["height"] > m["width"] else "가로"
+            opts.append(f"모니터 #{idx + 1} [{orient}] ({m['width']}x{m['height']})")
+        self._mon_count = len(opts)
+
+        if HAS_WINDOW_SOURCE:
+            self._windows = self.list_app_windows()
+            if self._windows:
+                opts.append("─── 창(window) ───")  # 더미 항목(선택 시 이전 선택으로 되돌림)
+                opts.extend(f"🪟 {w['desc']}" for w in self._windows)
+        return opts
+
+    def _current_capture_source(self) -> CaptureSource:
+        """현재 콤보 선택을 CaptureSource 스냅샷으로 변환합니다 (메인 스레드 전용)."""
+        sel = self.mon_combo.current()
+        if sel < 0 or sel < self._mon_count:
+            idx = max(0, sel)
+            return CaptureSource(kind="monitor", mon_idx=idx, label=f"모니터 #{idx + 1}")
+        # 창 구간: [모니터들][구분선][창들] — 창 인덱스 = sel - 모니터수 - 1
+        widx = sel - self._mon_count - 1
+        if 0 <= widx < len(self._windows):
+            w = self._windows[widx]
+            return CaptureSource(kind="window", window_id=w["window_id"], label=w["desc"])
+        return CaptureSource(kind="monitor", mon_idx=0, label="모니터 #1")
+
+    def _on_capture_source_changed(self, event=None) -> None:
+        """캡처 소스 변경 콜백 — 구분선 더미 선택 되돌림 + 설정 갱신 ([WINCAP])."""
+        sel = self.mon_combo.current()
+        if sel == self._mon_count:  # 구분선 더미 → 이전 유효 선택으로 복원
+            self.mon_combo.current(self._last_src_idx)
+            return
+        src = self._current_capture_source()
+        if src.kind == "window":
+            w = next((w for w in self._windows if w["window_id"] == src.window_id), None)
+            if w is not None:
+                self._sel_win_size = (w["w"], w["h"])  # 회전 자동 감지용 캐시
+        self._last_src_idx = sel
+        self._update_stream_config()
+
+    def refresh_window_list(self) -> None:
+        """🔄 윈도우 목록 재조회 — 콤보를 다시 만들고 이전 선택을 복원합니다.
+
+        창 목록은 수시로 바뀌므로(창 열기/닫기/제목 변경) 시작 전에 눌러 최신화한다.
+        이전 선택이 window였는데 그 창이 사라졌으면 모니터 #1로 폴백한다.
+        """
+        prev = self._current_capture_source()
+        self.mon_combo.config(values=self._build_capture_options())
+        restore = 0
+        if prev.kind == "monitor" and prev.mon_idx < self._mon_count:
+            restore = prev.mon_idx
+        elif prev.kind == "window":
+            for i, w in enumerate(self._windows):
+                if w["window_id"] == prev.window_id:
+                    restore = self._mon_count + 1 + i
+                    break
+        self.mon_combo.current(restore)
+        self._last_src_idx = restore
+        logging.debug("[WINCAP] 창 목록 새로고침: %d개", len(self._windows))
 
     def setup_ui_style(self) -> None:
         style = ttk.Style()
@@ -157,19 +376,32 @@ class CYDStreamerGUI:
         self.port_entry.insert(0, "8888")
         self.port_entry.pack(side=tk.LEFT)
 
-        # 2. 모니터 선택
+        # 2. 캡처 소스 선택 — [WINCAP] 개별 모니터 + 보이는 창을 한 콤보에 통합
+        #    (모니터 항목들 → 구분선 더미 → 🪟 창 항목들)
         mon_frame = tk.Frame(card, bg=self.card_bg)
         mon_frame.pack(fill=tk.X, pady=4)
 
         ttk.Label(mon_frame, text="캡처 화면:").pack(side=tk.LEFT)
-        monitor_options = []
-        for idx, m in enumerate(self.monitors_info):
-            orient = "세로" if m["height"] > m["width"] else "가로"
-            monitor_options.append(f"모니터 #{idx + 1} [{orient}] ({m['width']}x{m['height']})")
-
-        self.mon_combo = ttk.Combobox(mon_frame, values=monitor_options, state="readonly", width=28)
+        self.mon_combo = ttk.Combobox(mon_frame, values=self._build_capture_options(),
+                                      state="readonly", width=30)
         self.mon_combo.current(0)
+        self._last_src_idx = 0
         self.mon_combo.pack(side=tk.LEFT, padx=6)
+        self.mon_combo.bind("<<ComboboxSelected>>", self._on_capture_source_changed)
+
+        self.win_refresh_btn = tk.Button(
+            mon_frame,
+            text="🔄",
+            command=self.refresh_window_list,
+            relief=tk.FLAT,
+            bg=self.card_bg,
+            fg=self.text_color,
+            font=("Pretendard", 10),
+            cursor="pointinghand",
+        )
+        self.win_refresh_btn.pack(side=tk.LEFT)
+        if not HAS_WINDOW_SOURCE:
+            self.win_refresh_btn.config(state=tk.DISABLED)
 
         # 3. 화면 비율 설정
         aspect_frame = tk.Frame(card, bg=self.card_bg)
@@ -295,7 +527,7 @@ class CYDStreamerGUI:
         반드시 메인 스레드(tkinter 루프)에서 호출해야 합니다.
         워커 스레드는 이 메서드를 직접 호출하지 않고 _config_lock으로 읽습니다.
         """
-        rot_code = self.get_target_rotation_code(self.mon_combo.current())
+        rot_code = self.get_target_rotation_code(self._current_capture_source())
         return StreamConfig(
             aspect_mode=self.aspect_combo.current(),
             target_fps=max(5, int(self.fps_scale.get())),
@@ -364,23 +596,31 @@ class CYDStreamerGUI:
     # 회전 코드 매핑 — 펌웨어/CLAUDE.md의 프로토콜 표와 반드시 동기 유지할 것:
     #   0 = portrait(240x320) · 1 = landscape 180°(reversed) · 2 = portrait 180°(reversed) · 3 = landscape(320x240, 기본)
     # UI 콤보 인덱스: 0 자동감지 · 1 가로 정방향 · 2 가로 180° · 3 세로 · 4 세로 180°
-    def get_target_rotation_code(self, monitor_idx: int) -> int:
+    def get_target_rotation_code(self, src: CaptureSource) -> int:
+        """자동 감지는 캡처 소스의 가로/세로 비율을 따른다 ([WINCAP] 창 소스 지원).
+
+        창 소스일 때는 선택 시점에 캐시한 논리 크기(_sel_win_size)를 사용한다.
+        매 프레임 추적은 grab 영역만 갱신하고, 회전 코드는 제어 패킷([FIX #11] 중복
+        전송 방지)을 유발하므로 실시간으로 뒤집지 않는다 — 창을 극단적으로 리사이즈해
+        방향이 바뀌면 다음 파라미터 변경 시점에 반영된다.
+        """
         idx = self.rot_combo.current()
-        if idx == 0:
-            monitor = self.monitors_info[monitor_idx]
-            if monitor["height"] > monitor["width"]:
-                return 0
-            else:
-                return 3
-        elif idx == 1:
+        if idx == 1:
             return 3
-        elif idx == 2:
+        if idx == 2:
             return 1
-        elif idx == 3:
+        if idx == 3:
             return 0
-        elif idx == 4:
+        if idx == 4:
             return 2
-        return 3
+
+        # 자동 감지 (idx == 0)
+        if src.kind == "window":
+            w, h = self._sel_win_size
+            return 0 if h > w else 3
+        mon_idx = min(src.mon_idx, len(self.monitors_info) - 1)
+        monitor = self.monitors_info[max(0, mon_idx)]
+        return 0 if monitor["height"] > monitor["width"] else 3
 
     # ------------------------------------------------------------------
     # 스트리밍 제어
@@ -404,9 +644,22 @@ class CYDStreamerGUI:
             messagebox.showerror("오류", "유효한 포트 번호를 입력해주세요.")
             return
 
-        sel_mon = self.mon_combo.current()
-        if sel_mon < 0:
-            sel_mon = 0
+        # [WINCAP] 캡처 소스 스냅샷 + 창 소스 유효성 사전 확인.
+        # 워커는 이 스냅샷만 사용하므로 스트리밍 중 목록 새로고침/재선택이 현재 세션을 건드리지 않는다.
+        sel_src = self._current_capture_source()
+        if sel_src.kind == "window":
+            if self._get_window_region(sel_src.window_id) is None:
+                messagebox.showerror(
+                    "오류",
+                    "선택한 창을 찾을 수 없습니다 (닫혔거나 완전히 화면 밖).\n"
+                    "🔄 새로고침 후 다시 선택해주세요.",
+                )
+                return
+            # 폴백 초기값: 시작 직후 첫 조회 실패 대비 마지막 영역 캐시 리셋
+            self._last_window_region = None
+
+        logging.debug("[START] 스트리밍 시작 → %s:%d, 소스=%s(%s)", ip, port,
+                      sel_src.kind, sel_src.label)
 
         # [DEBUG] 이전 워커/캡처 스레드 생존 여부 확인
         for tname, t in (("워커", self.stream_thread), ("캡처", self.capture_thread)):
@@ -418,7 +671,6 @@ class CYDStreamerGUI:
                 else:
                     logging.debug("[START] 이전 %s 스레드 정상 종료 확인.", tname)
 
-        logging.debug("[START] 스트리밍 시작 → %s:%d, 모니터=%d", ip, port, sel_mon)
         self.is_streaming = True
 
         # 초기 스트림 설정 스냅샷 생성 (메인 스레드에서 안전하게)
@@ -433,6 +685,7 @@ class CYDStreamerGUI:
         self.ip_entry.config(state="disabled")
         self.port_entry.config(state="disabled")
         self.mon_combo.config(state="disabled")
+        self.win_refresh_btn.config(state=tk.DISABLED)  # [WINCAP] 스트리밍 중 목록 갱신 방지
 
         # [Phase 4] 파이프라인: 캡처(생산자) → JPEG 큐 → UDP 전송(소비자)
         # 큐가 가득 차면 오래된 프레임을 버리고 최신 프레임을 유지 → 지연 최소화
@@ -445,7 +698,7 @@ class CYDStreamerGUI:
         self._last_sent_ctrl = (-1, -1)
 
         self.stream_thread = threading.Thread(target=self._stream_worker, args=(ip, port), daemon=True)
-        self.capture_thread = threading.Thread(target=self._capture_worker, args=(sel_mon,), daemon=True)
+        self.capture_thread = threading.Thread(target=self._capture_worker, args=(sel_src,), daemon=True)
         self.stream_thread.start()
         self.capture_thread.start()
         logging.debug("[START] 워커(id=%d) + 캡처(id=%d) 스레드 시작됨",
@@ -469,6 +722,8 @@ class CYDStreamerGUI:
         self.ip_entry.config(state="normal")
         self.port_entry.config(state="normal")
         self.mon_combo.config(state="readonly")
+        if HAS_WINDOW_SOURCE:
+            self.win_refresh_btn.config(state=tk.NORMAL)
 
     def on_close(self) -> None:
         """[FIX #9] 창 닫기 이벤트 핸들러.
@@ -647,24 +902,42 @@ class CYDStreamerGUI:
                 )
             logging.debug("[WORKER:%d] 워커 종료.", my_thread_id)
 
-    def _capture_worker(self, monitor_idx: int) -> None:
+    def _capture_worker(self, capture_src: CaptureSource) -> None:
         """캡처 + 변환 + JPEG 인코딩 생산자 스레드.
 
         Tkinter 위젯을 건드리지 않고 _config_lock으로 설정 스냅샷을 읽습니다.
         인코딩된 JPEG를 _frame_queue에 넣고, 큐가 가득 차면 오래된 프레임을 버려 최신을 유지합니다.
+
+        [WINCAP] capture_src가 창(kind="window")이면 매 프레임 창 위치/크기를 재조회해
+        grab한다 — 윈도우 이동·리사이즈 실시간 추적. 조회는 이 스레드 전용이며
+        _last_window_region(폴백)도 이 스레드만 읽고 쓴다.
         """
         my_thread_id = threading.current_thread().ident
-        logging.debug("[CAP:%d] 생산자 시작. 모니터=%d", my_thread_id, monitor_idx)
+        logging.debug("[CAP:%d] 생산자 시작. 소스=%s(%s)", my_thread_id, capture_src.kind, capture_src.label)
         # 재시작 시 self._frame_queue가 교체돼도 이 스레드의 큐를 고정 (오염 방지)
         my_queue = self._frame_queue
 
         try:
             with mss.mss() as sct:
-                if monitor_idx >= len(self.monitors_info):
-                    logging.warning("[CAP:%d] 모니터 인덱스 초과(%d), 0번으로 대체.", my_thread_id, monitor_idx)
-                    monitor_idx = 0
-                monitor = self.monitors_info[monitor_idx]
-                logging.debug("[CAP:%d] 캡처 영역: %dx%d", my_thread_id, monitor["width"], monitor["height"])
+                if capture_src.kind == "monitor":
+                    mon_idx = capture_src.mon_idx
+                    if mon_idx >= len(self.monitors_info):
+                        logging.warning("[CAP:%d] 모니터 인덱스 초과(%d), 0번으로 대체.", my_thread_id, mon_idx)
+                        mon_idx = 0
+                    monitor = self.monitors_info[mon_idx]
+                    logging.debug("[CAP:%d] 캡처 영역: 모니터 %dx%d", my_thread_id,
+                                  monitor["width"], monitor["height"])
+                else:
+                    # [WINCAP] 시작 직후 창이 닫기는 경쟁 대비: 첫 조회 실패 시 생산자 즉시 종료
+                    # (None 시그널로 소비자도 같이 종료된다).
+                    first_region = self._get_window_region(capture_src.window_id)
+                    if first_region is None:
+                        logging.error("[CAP:%d] 시작 직후 창을 찾지 못함 (id=%d, %s). 생산자 종료.",
+                                      my_thread_id, capture_src.window_id, capture_src.label)
+                        return
+                    self._last_window_region = first_region
+                    logging.debug("[CAP:%d] 캡처 영역: 창 '%s' %dx%d", my_thread_id,
+                                  capture_src.label, first_region["width"], first_region["height"])
 
                 while self.is_streaming:
                     loop_start = time.time()
@@ -685,8 +958,23 @@ class CYDStreamerGUI:
                     frame_interval = 1.0 / min(cfg.target_fps, DEVICE_RENDER_FPS_CAP)
 
                     try:
+                        # [WINCAP] grab 영역 결정: 모니터는 고정, 창은 매 프레임 재조회(실시간 추적).
+                        # 창이 닫혔거나 완전히 화면 밖이면 마지막 영역으로 계속 전송(정지 화면 유지),
+                        # 폴백도 없으면 이 프레임만 스킵. 조회 비용은 [TIMING] grab 스테이지에 반영됨.
+                        if capture_src.kind == "monitor":
+                            region = monitor
+                        else:
+                            region = self._get_window_region(capture_src.window_id)
+                            if region is not None:
+                                self._last_window_region = region
+                            else:
+                                region = self._last_window_region
+                                if region is None:
+                                    time.sleep(frame_interval)
+                                    continue
+
                         t0 = time.time()
-                        sct_img = sct.grab(monitor)
+                        sct_img = sct.grab(region)
                         # [PERF B1] BGRA 원본을 RGB로 미리 변환하지 않는다. 기존 frombytes("RGB", …,
                         # "BGRX")는 3MP 전체를 매 프레임 변환+복사(~9MB)했지만, frombuffer RGBA 뷰는
                         # 복사 없이 원본 바이트를 공유하고, RGB 변환을 축소 후 소형(320x240)에서 한 번만
