@@ -125,6 +125,16 @@ ATYPE_FROM_IDX = ["shortcut", "text", "app"]
 REQUEST_HEADER = struct.Struct(">IBBBB")     # MREQ: magic + 4×u8
 CHUNK_MAX = 1200              # MCFG 청크 상한 — 펌웨어 MCFG_CHUNK_MAX와 일치 (UDP 단일 패킷 안전)
 
+# 회전 제어 프로토콜 (스트리밍 프로젝트와 동일 포맷: frame_id=0xFFFFFFFF, >IBBBB)
+MAGIC_CONTROL = 0xFFFFFFFF
+CONTROL_HEADER = struct.Struct(">IBBBB")  # magic, rot_code, show_fps, fec_flag, parity_count
+# 회전 코드 (펌웨어/CLAUDE.md 프로토콜 표와 동기):
+#   0 = portrait(240x320) · 1 = landscape 180°(reversed) · 2 = portrait 180°(reversed) · 3 = landscape(320x240, 기본)
+ROT_PORTRAIT = 0
+ROT_LANDSCAPE_REV = 1
+ROT_PORTRAIT_REV = 2
+ROT_LANDSCAPE = 3
+
 # ------------------------------------------------------------------
 # [PLAN] 호스트 UI 한/영 번역. key → {ko, en}. 위젯/로그/도움말/메시지박스는
 #     self._t(key) / self._tf(key, *args)로 조회 (누락 시 ko). 사용자 라벨(버튼 이름,
@@ -150,6 +160,13 @@ L10N = {
     "label_page_name": {"ko": "페이지 이름:", "en": "Page name:"},
     "btn_add_page": {"ko": "+ 페이지", "en": "+ Page"},
     "btn_del_page": {"ko": "− 페이지", "en": "− Page"},
+    # 회전 설정
+    "label_rotation": {"ko": "화면 회전:", "en": "Rotation:"},
+    "rot_auto": {"ko": "자동 감지", "en": "Auto detect"},
+    "rot_landscape": {"ko": "가로 정방향", "en": "Landscape"},
+    "rot_landscape_rev": {"ko": "가로 180도", "en": "Landscape 180°"},
+    "rot_portrait": {"ko": "세로 (Portrait)", "en": "Portrait"},
+    "rot_portrait_rev": {"ko": "세로 180도", "en": "Portrait 180°"},
     # 하단 버튼
     "btn_apply": {"ko": "💾 설정 적용 (Apply)", "en": "💾 Apply Settings"},
     "btn_export": {"ko": "⬇ 내보내기", "en": "⬇ Export"},
@@ -222,6 +239,15 @@ L10N = {
     "log_event_err": {"ko": "✗ page%d · #%d: %s", "en": "✗ page%d · #%d: %s"},
     "log_device_found": {"ko": "디바이스 발견 (자동 검색): %s — 설정 비교",
                          "en": "Device found (auto-discovery): %s — comparing settings"},
+    # 회전 관련
+    "log_rotation_sent": {"ko": "🔄 화면 회전 전송: code=%d → %s",
+                          "en": "🔄 Rotation sent: code=%d → %s"},
+    "log_rotation_wait": {"ko": "🔄 화면 회전 저장: code=%d (디바이스 연결 시 전송)",
+                          "en": "🔄 Rotation saved: code=%d (will send on device connect)"},
+    "log_rotation_send_fail": {"ko": "⚠️ 회전 전송 실패: %s",
+                               "en": "⚠️ Rotation send failed: %s"},
+    "log_rotation_resent": {"ko": "🔄 회전 재전송 → %s",
+                            "en": "🔄 Rotation resent → %s"},
     # 자동 동기화 보호 (첫 연결 시 디바이스 덮어쓰기 방지)
     "log_autosync_same": {"ko": "디바이스(%s) 설정이 호스트와 동일합니다.",
                           "en": "Device (%s) settings match the host."},
@@ -292,8 +318,8 @@ L10N = {
                            "\"디바이스 발견\"이 뜹니다. IP 입력은 필요 없습니다 (자동 발견, UDP 8890).\n",
                      "en": "1. Power the CYD → it auto-connects to the same Wi-Fi → "
                            "\"device found\" appears in the log below. No IP entry needed (auto-discovery, UDP 8890).\n"},
-    "help_start_2": {"ko": "2. 페이지 탭(최대 8개)에서 4×3 버튼 12개를 설정한 뒤 [설정 적용]을 누르세요.\n",
-                     "en": "2. Configure the 4×3 grid (12 buttons) on a page tab (up to 8), then press [Apply Settings].\n"},
+    "help_start_2": {"ko": "2. 페이지 탭(최대 8개)에서 버튼 12개(가로 4×3 / 세로 3×4)를 설정한 뒤 [설정 적용]을 누르세요. 화면 회전은 상태바에서 변경 가능합니다.\n",
+                     "en": "2. Configure the 12 buttons (4×3 landscape / 3×4 portrait) on a page tab (up to 8), then press [Apply Settings]. Rotation can be changed in the status bar.\n"},
     "help_start_3": {"ko": "3. 장치에서 버튼을 터치하면 호스트가 등록된 동작을 실행합니다.\n",
                      "en": "3. Touch a button on the device and the host runs the registered action.\n"},
     "help_start_4": {"ko": "4. 페이지 탭을 마우스로 끌어 순서를 바꿀 수 있습니다. 순서 변경은 "
@@ -1240,6 +1266,12 @@ class MacroPadGUI:
             self.lang = "ko"
         _set_cur_lang(self.lang)                   # 모듈 전역 → 모듈 함수(run_input_helper 등)도 동일 언어
 
+        # [PLAN 1] 회전 설정 로드 및 그리드 지오메트리 초기화
+        loaded_rot = self.config.get("rotation", ROT_LANDSCAPE)
+        if not isinstance(loaded_rot, int) or loaded_rot not in (ROT_PORTRAIT, ROT_LANDSCAPE_REV, ROT_PORTRAIT_REV, ROT_LANDSCAPE):
+            loaded_rot = ROT_LANDSCAPE
+        self.update_grid_geometry(loaded_rot)
+
         # 스레드 동기화
         self._config_lock = threading.Lock()
         self._resend_queue: "queue.Queue[str]" = queue.Queue()  # Apply→리스너 재전송 요청
@@ -1301,6 +1333,7 @@ class MacroPadGUI:
             "port": UDP_PORT,
             "device_ip": "",
             "lang": "ko",
+            "rotation": ROT_LANDSCAPE,
             "pages": [{"name": "Page %d" % (i + 1), "buttons": list(empty)}
                       for i in range(DEFAULT_PAGES)],
         }
@@ -1335,11 +1368,15 @@ class MacroPadGUI:
                 })
             norm.append({"name": (pg.get("name") or "Page %d" % (i + 1)), "buttons": buttons})
         lang = config.get("lang", "ko")
+        rot = config.get("rotation", ROT_LANDSCAPE)
+        if not isinstance(rot, int) or rot not in (ROT_PORTRAIT, ROT_LANDSCAPE_REV, ROT_PORTRAIT_REV, ROT_LANDSCAPE):
+            rot = ROT_LANDSCAPE
         return {
             "version": 3,
             "port": int(config.get("port", UDP_PORT) or UDP_PORT),
             "device_ip": str(config.get("device_ip", "") or ""),
             "lang": lang if lang in ("ko", "en") else "ko",
+            "rotation": rot,
             "pages": norm,
         }
 
@@ -1427,6 +1464,13 @@ class MacroPadGUI:
                 self._update_hint(w["hint"], w["action"])
                 for entry, key in ((w["label"], "ph_name"), (w["value"], "ph_action")):
                     _set_placeholder_text(entry, _t(key))
+        # 4) 회전 콤보 박스 라벨 갱신
+        if hasattr(self, "rot_combo"):
+            try:
+                self.rot_combo.config(values=[_t("rot_auto"), _t("rot_landscape"), _t("rot_landscape_rev"),
+                                               _t("rot_portrait"), _t("rot_portrait_rev")])
+            except tk.TclError:
+                pass
 
     def _set_listen_status(self, key: str, fg: str, *args) -> None:
         """상태바 갱신 + 재렌더용 (key, fg, args) 저장. 언어 전환 시 _refresh_lang이 복원."""
@@ -1508,9 +1552,27 @@ class MacroPadGUI:
         # 리스너 상태 카드 (IP/포트/시작 버튼 없음 — 리스너는 자동 시작)
         status_card = tk.Frame(self.root, bg=self.card_bg, bd=1, relief=tk.SOLID, padx=12, pady=8)
         status_card.pack(fill=tk.X, padx=16, pady=(0, 8))
-        self.listen_status = tk.Label(status_card, text=_t("status_starting"), bg=self.card_bg,
+        status_row = tk.Frame(status_card, bg=self.card_bg)
+        status_row.pack(fill=tk.X)
+        self.listen_status = tk.Label(status_row, text=_t("status_starting"), bg=self.card_bg,
                                       fg=self.sub_text, font=("Pretendard", 9), anchor="w")
-        self.listen_status.pack(fill=tk.X)
+        self.listen_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # [PLAN 1] 회전 설정 콤보 박스
+        self._rot_label = ttk.Label(status_row, text=_t("label_rotation"))
+        self._rot_label.pack(side=tk.RIGHT, padx=(12, 4))
+        self._i18n_widgets.append((self._rot_label, "label_rotation"))
+        self.rot_combo = ttk.Combobox(status_row,
+            values=[_t("rot_auto"), _t("rot_landscape"), _t("rot_landscape_rev"),
+                    _t("rot_portrait"), _t("rot_portrait_rev")],
+            width=12, state="readonly")
+        self.rot_combo.pack(side=tk.RIGHT)
+        # 저장된 회전 설정을 콤보에 반영 (기본값 가로 정방향 = code 3 = idx 1).
+        # update_grid_geometry()는 위젯 생성 전에 불리므로 여기서 최종 동기화 필요.
+        self.rot_combo.current(
+            {ROT_LANDSCAPE: 1, ROT_LANDSCAPE_REV: 2, ROT_PORTRAIT: 3, ROT_PORTRAIT_REV: 4}
+            .get(self.current_rotation, 1))
+        self.rot_combo.bind("<<ComboboxSelected>>", self.on_rotation_changed)
+        self._i18n_widgets.append((self.rot_combo, "rot_combo"))  # 값은 별도 처리
         self._set_listen_status("status_starting", self.sub_text)   # 언어 전환 재렌더용 상태 기록
 
         # 페이지 관리 행 (이름 편집 + 추가/삭제)
@@ -1833,13 +1895,13 @@ class MacroPadGUI:
 
         page_widgets = []
         for bid in range(BUTTONS_PER_PAGE):
-            r, c = divmod(bid, GRID_COLS)
+            r, c = divmod(bid, self.grid_cols)
             card = self._make_button_card(grid, idx, bid)
             card["frame"].grid(row=r, column=c, padx=4, pady=2, sticky="nsew")
             page_widgets.append(card)
-        for c in range(GRID_COLS):
+        for c in range(self.grid_cols):
             grid.columnconfigure(c, weight=1, uniform="col")
-        for r in range(GRID_ROWS):
+        for r in range(self.grid_rows):
             grid.rowconfigure(r, weight=1, uniform="row")
         self._button_widgets.append(page_widgets)
         self._page_tabs.append(tab)
@@ -2022,6 +2084,7 @@ class MacroPadGUI:
         fresh = self._collect_config()["pages"]     # 위젯 현재 상태 스냅샷 (드래그 전 순서)
         with self._config_lock:
             self.config["pages"] = [fresh[i] for i in order]
+            rot_code = self.current_rotation
         self._button_widgets = [self._button_widgets[i] for i in order]
         self._page_tabs = frames
         self._reindex_tab_labels()
@@ -2030,8 +2093,9 @@ class MacroPadGUI:
         ip = self.config.get("device_ip", "") or ""
         if self._listener_running:
             self._resend_queue.put("resend")
+            self._resend_queue.put(("control", ip, UDP_PORT, rot_code))
         elif _is_valid_ip(ip):
-            self._send_config_from_temp_socket(ip, UDP_PORT)
+            self._send_config_from_temp_socket(ip, UDP_PORT, rot_code)
 
     def _collect_config(self) -> dict:
         with self._config_lock:
@@ -2064,7 +2128,96 @@ class MacroPadGUI:
         return {"version": 3, "port": UDP_PORT,
                 "device_ip": self.config.get("device_ip", "") or "",
                 "lang": self.lang,
+                "rotation": self.current_rotation,
                 "pages": pages}
+
+    # ------------------------------------------------------------------
+    # [PLAN 1] 회전 지원 메서드
+    # ------------------------------------------------------------------
+    def update_grid_geometry(self, rotation_code: int) -> None:
+        """회전 코드에 따라 그리드 컬럼/로우 업데이트.
+        가로(1, 3): 4×3, 세로(0, 2): 3×4"""
+        if rotation_code in (ROT_PORTRAIT, ROT_PORTRAIT_REV):
+            self.grid_cols, self.grid_rows = 3, 4
+        else:
+            self.grid_cols, self.grid_rows = 4, 3
+        self.current_rotation = rotation_code
+        # 콤보 박스 인덱스 업데이트 (시그널 발생 안 함)
+        # 콤보 순서 [자동 감지(0), 가로 정방향(1)=code 3, 가로 180도(2)=code 1,
+        #           세로(3)=code 0, 세로 180도(4)=code 2]
+        rot_index = {ROT_LANDSCAPE: 1, ROT_LANDSCAPE_REV: 2, ROT_PORTRAIT: 3, ROT_PORTRAIT_REV: 4}
+        if hasattr(self, "rot_combo"):
+            try:
+                self.rot_combo.current(rot_index.get(rotation_code, 1))
+            except tk.TclError:
+                pass
+
+    def on_rotation_changed(self, event=None) -> None:
+        """회전 콤보 박스 변경 콜백 — 그리드 재구성 + 디바이스로 제어 패킷 전송"""
+        idx = self.rot_combo.current()
+        # 콤보 순서는 [자동 감지, 가로 정방향, 가로 180도, 세로, 세로 180도]
+        #   → 코드 매핑: 가로 정방향=3, 가로 180도=1, 세로=0, 세로 180도=2
+        # 0=자동 감지 → 스트리밍 프로젝트에서는 모니터 비율로 판단하지만, 매크로패드는 디바이스가 비율을 모르므로 기본 가로(3)로 폴백
+        rot_map = {1: ROT_LANDSCAPE, 2: ROT_LANDSCAPE_REV, 3: ROT_PORTRAIT, 4: ROT_PORTRAIT_REV}
+        rotation_code = rot_map.get(idx, ROT_LANDSCAPE)
+
+        self.update_grid_geometry(rotation_code)
+
+        # 모든 페이지 탭 재구성 (그리드 레이아웃 변경)
+        self._rebuild_all_tabs()
+        self._populate_from_config()
+
+        # 설정 저장 (회전 값 포함)
+        config = self._collect_config()
+        self._save_config(config)
+
+        # 디바이스로 제어 패킷 전송 (연결된 경우)
+        ip = self.config.get("device_ip", "") or ""
+        if self._listener_running and _is_valid_ip(ip):
+            self._send_control_command(ip, UDP_PORT, rotation_code)
+            self._log(_tf("log_rotation_sent", rotation_code, ip))
+        elif _is_valid_ip(ip):
+            self._send_control_command_from_temp_socket(ip, UDP_PORT, rotation_code)
+            self._log(_tf("log_rotation_sent", rotation_code, ip))
+        else:
+            self._log(_tf("log_rotation_wait", rotation_code))
+
+    def send_control_command(self, sock: socket.socket, dest_addr: tuple, rot_code: int,
+                              show_fps: int = 0, fec_flag: int = 1) -> bool:
+        """제어 패킷 전송 (스트리밍 프로젝트와 동일 포맷: frame_id=0xFFFFFFFF, >IBBBB).
+        매크로패드는 rot_code만 사용, 나머지는 예약."""
+        try:
+            pkt = CONTROL_HEADER.pack(MAGIC_CONTROL, rot_code, show_fps, fec_flag, 0)
+            self._safe_sendto(sock, pkt, dest_addr)
+            return True
+        except OSError as e:
+            self._debug_log("control sendto %s: %s" % (dest_addr, e))
+            return False
+
+    def _send_control_command(self, ip: str, port: int, rot_code: int) -> None:
+        """리스너 소켓을 통한 제어 패킷 전송 (리스너 스레드에서 호출)"""
+        self._resend_queue.put(("control", ip, port, rot_code))
+
+    def _send_control_command_from_temp_socket(self, ip: str, port: int, rot_code: int) -> None:
+        """임시 소켓으로 제어 패킷 전송 (메인 스레드에서 호출, 리스너 미실행 시)"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("0.0.0.0", port))
+            except OSError:
+                pass
+            try:
+                self.send_control_command(sock, (ip, port), rot_code)
+            finally:
+                sock.close()
+        except OSError as e:
+            self._log(_tf("log_rotation_send_fail", e), error=True)
+
+    # 리스너 스레드에서 제어 패킷 전송 요청 처리
+    def _handle_control_resend(self, sock: socket.socket, ip: str, port: int, rot_code: int) -> None:
+        self.send_control_command(sock, (ip, port), rot_code)
+        self._event_queue.put(("log", _tf("log_rotation_resent", ip), False))
 
     # ------------------------------------------------------------------
     # 설정 내보내기/가져오기 (D)
@@ -2195,16 +2348,20 @@ class MacroPadGUI:
         with self._config_lock:
             self.config = config
         ip = self.config.get("device_ip", "") or ""
+        # 회전 제어 패킷도 함께 전송
+        rot_code = self.current_rotation
         if self._listener_running:
             self._resend_queue.put("resend")
+            self._resend_queue.put(("control", ip, UDP_PORT, rot_code))
             self._log(_tf("log_apply_resend", len(config["pages"])))
         elif _is_valid_ip(ip):
             self._send_config_from_temp_socket(ip, UDP_PORT)
+            self._send_control_command_from_temp_socket(ip, UDP_PORT, rot_code)
             self._log(_tf("log_apply_sent", ip))
         else:
             self._log(_t("log_apply_wait"))
 
-    def _send_config_from_temp_socket(self, ip: str, port: int) -> None:
+    def _send_config_from_temp_socket(self, ip: str, port: int, rot_code: int = None) -> None:
         """리스너 미실행 시 임시 소켓으로 설정 전송.
 
         소스 포트를 port에 바인드해 디바이스가 호스트 수신 포트를 정확히 학습하게 한다.
@@ -2220,6 +2377,8 @@ class MacroPadGUI:
             try:
                 self._send_all_pages(sock, ip, port)
                 self._send_all_images(sock, ip, port)   # [G] 임시 소켓 경로에도 이미지 포함
+                if rot_code is not None:
+                    self.send_control_command(sock, (ip, port), rot_code)
             finally:
                 sock.close()
         except OSError as e:
@@ -2241,7 +2400,7 @@ class MacroPadGUI:
                 self._safe_sendto(sock, pkt, (ip, port))
 
     def _push_config(self, sock: socket.socket, ip: str, port: int, retries: int = 1,
-                     reason: str = "푸시") -> None:
+                     reason: str = "푸시", rot_code: int = None) -> None:
         """전체 설정+이미지 푸시. retries만큼 250ms 간격 재전송 (UDP 유실 대비).
 
         [H] 3초 재푸시 안전망이 제거됐으므로 Apply/시작/첫 비콘 푸시는 2회 전송으로 보정한다.
@@ -2254,6 +2413,8 @@ class MacroPadGUI:
                 time.sleep(0.25)
             self._send_all_pages(sock, ip, port)
             self._send_all_images(sock, ip, port)
+            if rot_code is not None:
+                self.send_control_command(sock, (ip, port), rot_code)
 
     def _send_all_images(self, sock: socket.socket, ip: str, port: int) -> None:
         """버튼 이미지(MIMG) 전송 (G): 업로드 이미지 / 한글 라벨 / ASCII·빈 라벨(clear).
@@ -2518,12 +2679,17 @@ class MacroPadGUI:
 
                 # Apply 재전송 요청 (메인 스레드에서 큐로 전달) — [H] 2회 재전송 (UDP 유실 보정)
                 try:
-                    self._resend_queue.get_nowait()
-                    with self._config_lock:
-                        ip = self.config.get("device_ip", "") or ""
-                    if _is_valid_ip(ip):
-                        self._pushed_ip = ip
-                        self._push_config(sock, ip, port, retries=1, reason="Apply")
+                    item = self._resend_queue.get_nowait()
+                    if isinstance(item, tuple) and item[0] == "control":
+                        _, ip, dport, rot_code = item
+                        self._handle_control_resend(sock, ip, dport, rot_code)
+                    else:
+                        with self._config_lock:
+                            ip = self.config.get("device_ip", "") or ""
+                            rot_code = self.current_rotation
+                        if _is_valid_ip(ip):
+                            self._pushed_ip = ip
+                            self._push_config(sock, ip, port, retries=1, reason="Apply", rot_code=rot_code)
                 except queue.Empty:
                     pass
 
@@ -2663,6 +2829,7 @@ class MacroPadGUI:
           (b) 새 디바이스 IP의 첫 비콘: **무조건 푸시하지 않고** MREQ로 디바이스 설정을
               읽어 호스트와 비교 후 방향을 묻는다 (동기화 보호 — 빈 호스트가 디바이스를
               지우는 것 방지). 비교·질문은 메인 스레드, 1회는 _pushed_ip 가드 (세션당 1회).
+          (c) 새 디바이스 IP의 첫 비콘: 현재 회전 설정 전송 (컨트롤 패킷)
         """
         device_ip = addr[0]
         is_new = False
@@ -2683,6 +2850,9 @@ class MacroPadGUI:
         if device_ip != self._pushed_ip:
             self._pushed_ip = device_ip
             self._dump_queue.put(("dump_start", device_ip, port, True))
+        # (c) 새 디바이스 IP의 첫 비콘: 회전 제어 패킷 전송 (덤프와 독립적 — 디바이스가 즉시 회전 적용)
+        if is_new:
+            self.send_control_command(sock, (device_ip, UDP_PORT), self.current_rotation)
 
     def _apply_detected_ip(self, ip: str, msg: str) -> None:
         """자동 검색된 디바이스를 상태바에 반영 (메인 스레드)."""

@@ -154,9 +154,9 @@ static LGFX lcd;
 #define BEACON_INTERVAL_MS  3000         // 비콘 재전송 주기 (호스트가 IP 자동 검색)
 #define MAX_PAGES        8               // 최대 페이지 수 (호스트와 일치)
 #define DEFAULT_PAGES    2               // 부팅 시 페이지 수 (numPages 초기값)
-#define GRID_COLS        4
-#define GRID_ROWS        3
-#define BUTTONS_PER_PAGE (GRID_COLS * GRID_ROWS)  // 12
+// GRID_COLS/GRID_ROWS는 회전에 따라 동적 변경됨 (런타임 변수 gridCols/gridRows 사용)
+// 가로(rotation 1/3): 4x3, 세로(rotation 0/2): 3x4
+#define BUTTONS_PER_PAGE 12              // 4x3 = 3x4 = 12 (고정)
 #define LABEL_MAX        24              // 라벨 최대 바이트 (호스트와 동일)
 #define PAGE_NAME_MAX    20              // 페이지 이름 최대 바이트 (호스트와 동일, A)
 #define BTN_COLOR_COUNT  10              // 버튼 팔레트 색 수 (호스트 COLOR_NAMES와 일치)
@@ -170,7 +170,7 @@ static LGFX lcd;
 #define MAGIC_REQUEST     0x4D524551      // "MREQ" 설정 덤프 요청 (호스트→디바이스, H)
 #define ACTION_VAL_MAX    128             // 액션 값(action_value) 최대 바이트 (호스트와 일치, H)
 #define CFG_MAGIC         0x4D504346      // "MPCF" config.bin 매직 (H)
-#define CFG_VERSION       3               // config.bin 버전 (H)
+#define CFG_VERSION       4               // config.bin 버전 (H) — 회전 설정 추가로 버전 업
 #define CONFIG_BIN_PATH   "/config.bin"   // 전체 설정 저장 파일 (H)
 #define BTNS_DIR          "/btns"         // 버튼 이미지 저장 디렉터리 (H)
 #define CONFIG_SAVE_DEBOUNCE_MS 500       // [H] config.bin 저장 debounce — 다중 패킷 푸시를 1회 쓰기로 (웨어 방지)
@@ -178,30 +178,50 @@ static LGFX lcd;
 #define MCFG_CHUNK_MAX      1200          // [H] MCFG 푸시/덤프 청크 상한 (UDP 단일 패킷 안전)
 
 // ==========================================
-// 3. UI 지오메트리 (320x240 가로 정방향, 회전 코드 3)
+// 2.5 회전 제어 프로토콜 (스트리밍 프로젝트와 동일 포맷)
 // ==========================================
-#define STATUS_H        28
-#define STATUS_TOP      212              // 상태바 상단 y
-#define GRID_TOP        6
-#define GRID_LEFT       6
-#define GRID_RIGHT      314              // 그리드 영역 배타적 우측
-#define GRID_BOTTOM     206              // 그리드 영역 배타적 하단
-#define BTN_W           71
-#define BTN_H           61
-#define BTN_GAP_X       8
-#define BTN_GAP_Y       8
+#define MAGIC_CONTROL     0xFFFFFFFF      // 제어 패킷 매직 (frame_id=0xFFFFFFFF)
+// 회전 코드 (스트리밍 펌웨어/CLAUDE.md 프로토콜 표와 동기):
+//   0 = portrait(240x320) · 1 = landscape 180°(reversed) · 2 = portrait 180°(reversed) · 3 = landscape(320x240, 기본)
+#define ROT_PORTRAIT        0
+#define ROT_LANDSCAPE_REV   1
+#define ROT_PORTRAIT_REV    2
+#define ROT_LANDSCAPE       3
+
+// ==========================================
+// 3. UI 지오메트리 (회전에 따라 동적 변경 — updateGridGeometry()에서 초기화)
+// ==========================================
+// 기본값은 가로 정방향(rotation=3, 320x240) 기준
+// [PLAN 1] 회전 지원 — 런타임에 변경되는 UI 지오메트리 변수들 (기본값: 가로 모드 320x240)
+int GRID_LEFT = 6;
+int GRID_RIGHT = 314;
+int GRID_TOP = 6;
+int GRID_BOTTOM = 206;
+int STATUS_TOP = 212;
+int STATUS_H = 28;
+int BTN_W = 71;
+int BTN_H = 61;
+int BTN_GAP_X = 8;
+int BTN_GAP_Y = 8;
+int PREV_X = 4;
+int PREV_Y = 214;
+int PREV_W = 96;              // [PLAN 6] 페이지 전환 버튼 좌우 확대 (누르기 쉽게)
+int PREV_H = 22;
+int NEXT_X = 220;
+int NEXT_Y = 214;
+int NEXT_W = 96;
+int NEXT_H = 22;
+
+// 런타임 그리드 크기 (회전에 따라 4x3 또는 3x4)
+uint8_t gridCols = 4;
+uint8_t gridRows = 3;
+
+// 현재 회전 상태 (기본 3 = 가로 정방향)
+uint8_t currentRotation = ROT_LANDSCAPE;
 // [PLAN 7] 버튼 모서리 라운드 반경. radius 6은 작아서 Chamfer처럼 보이고, 이미지 버튼은
 //     호스트가 JPEG에 구운 라운드(radius 6)가 4:2:0 손실 압축 후 거의 사라져 각지게 보였다.
 //     10이면 압축 후에도/텍스트 버튼 모두 확실한 라운드가 보인다. 호스트 BTN_RADIUS와 일치.
 #define BTN_RADIUS      10
-#define PREV_X          4
-#define PREV_Y          214
-#define PREV_W          96              // [PLAN 6] 페이지 전환 버튼 좌우 확대 (누르기 쉽게)
-#define PREV_H          22
-#define NEXT_X          220
-#define NEXT_Y          214
-#define NEXT_W          96
-#define NEXT_H          22
 
 #define LONG_PRESS_MS   2500             // 상태바 길게 → Wi-Fi 재설정
 #define MAX_TAP_MS      800              // 이보다 길게 누른 탭은 무시
@@ -376,21 +396,27 @@ void setup() {
   Serial.println("\n--- CYD Wireless Macro Pad ---");
 
   lcd.init();
-  lcd.setRotation(3);   // 가로 정방향 (320x240)
-  lcd.setBrightness(BRIGHT_FULL);   // [C] 기본 밝기
+  updateGridGeometry(ROT_LANDSCAPE);  // 그리드 지오메트리 초기화 (기본 가로 모드)
+  lcd.setBrightness(BRIGHT_FULL);     // [C] 기본 밝기
   lastTouchTime = millis();
   lastBrightness = BRIGHT_FULL;
 
+  // 저장된 회전 설정 복원 (NVS에서) — 회전은 cyd_mpad 네임스페이스(아래 prefsPad) 사용
   prefs.begin("cyd_wifi", false);
   stored_ssid = prefs.getString("ssid", "");
   stored_pass = prefs.getString("pass", "");
 
-  // [E][H] 마지막 페이지/전체 설정 복원:
+  // [E][H] 마지막 페이지/전체 설정/회전 복원:
   //  - 전체 설정(라벨/색/액션/페이지 이름/num_pages)은 LittleFS /config.bin 우선 (H)
   //  - config.bin 부재/손상 시 NVS(cyd_mpad)의 페이지 수로 폴백 (E)
   //  - currentPage(마지막 페이지)는 항상 NVS lastPage에서 읽어 config.bin numPages에 클램프
+  //  - 회전 설정(currentRotation)은 NVS rotation에서 읽어 updateGridGeometry()로 적용
   prefsPad.begin("cyd_mpad", false);
   uint8_t savedPage = prefsPad.getUChar("lastPage", 0);
+  uint8_t savedRotation = prefsPad.getUChar("rotation", ROT_LANDSCAPE);
+  if (savedRotation <= ROT_PORTRAIT_REV) {
+    updateGridGeometry(savedRotation);
+  }
 
   // [H] LittleFS 마운트 — udp.listen() 이전에 완료해 AsyncUDP 콜백과 FS/힙 레이스 방지.
   //     이 1MB 파티션은 이번 기능(H)이 처음 쓰는 영역이라, 미사용 잔재(이전 데이터/랜덤 비트)가
@@ -708,7 +734,10 @@ String getTouchInput(const String& prompt, bool isPassword) {
 // Wi-Fi 설정 모드 진입. 부팅 시 터치(forceSetup) 또는 상태바 길게 누름 시 호출된다.
 // 흐름: AP 목록 스캔 → 터치 선택 → 가상 키보드 비밀번호 입력 → NVS 저장 → (호출부에서 ESP.restart)
 void runTouchWifiSetup() {
-  lcd.setRotation(3);  // 설정 UI는 항상 가로 정방향(320x240, 코드 3) 기준으로 그린다
+  // 설정 UI는 항상 가로 정방향(320x240, 코드 3) 기준으로 그린다
+  // 현재 회전 상태 저장 후 가로 모드로 전환
+  uint8_t savedRotation = currentRotation;
+  updateGridGeometry(ROT_LANDSCAPE);
 
   String selectedSsid = selectWifiFromList();
   String new_pass = getTouchInput("Password for: " + selectedSsid, true);
@@ -720,6 +749,75 @@ void runTouchWifiSetup() {
     prefs.putString("ssid", stored_ssid);
     prefs.putString("pass", stored_pass);
     Serial.println("[Setup] Wi-Fi 설정이 NVS 플래시에 저장되었습니다.");
+  }
+
+  // 원래 회전 상태로 복원
+  updateGridGeometry(savedRotation);
+}
+
+// 회전 코드에 맞춰 그리드 지오메트리 및 LCD 회전 설정
+// 호출 시점: 부팅 시(setup), 제어 패킷 수신 시, Wi-Fi 설정 후 복원 시
+void updateGridGeometry(uint8_t rot) {
+  currentRotation = rot;
+  bool isPortrait = (rot == ROT_PORTRAIT || rot == ROT_PORTRAIT_REV);
+
+  // LCD 패널 회전 적용
+  lcd.setRotation(rot);
+
+  // 터치 좌표는 setRotation()만으로 자동 보정된다 — offset_rotation을 여기서 바꾸면 안 됨.
+  //   근거: LovyanGFX Panel_Device::convertRawXY가 유효 회전을
+  //   r = (_internal_rotation + touch.cfg.offset_rotation) & 3 로 계산하므로,
+  //   패널 회전이 이미 터치 변환에 합산된다. 초기 config에서 정해진 값(ST7789: 0 /
+  //   ILI9341: 2)은 "터치 센서 ↔ 패널 rotation 0" 장착 차이만 나타내며 고정값이다.
+  //   여기서 (base + rot)로 다시 더하면 회전이 이중 적용되어 눌린 위치가 90° 틀어진다.
+
+  if (isPortrait) {
+    // 세로 모드: 240x320, 그리드 3x4
+    gridCols = 3;
+    gridRows = 4;
+    // 화면 240x320 기준 레이아웃
+    GRID_LEFT = 4;
+    GRID_RIGHT = 236;
+    GRID_TOP = 4;
+    GRID_BOTTOM = 284;   // 상태바 위까지
+    STATUS_TOP = 288;
+    STATUS_H = 32;
+    // 버튼 크기: 가로 3개 = (236-4 - 2*8)/3 = 216/3 = 72, 세로 4개 = (284-4 - 3*8)/4 = 252/4 = 63
+    BTN_W = 72;
+    BTN_H = 63;
+    BTN_GAP_X = 8;
+    BTN_GAP_Y = 8;
+    // 상태바 버튼 위치
+    PREV_X = 4;
+    PREV_Y = 290;
+    PREV_W = 70;
+    PREV_H = 26;
+    NEXT_X = 166;
+    NEXT_Y = 290;
+    NEXT_W = 70;
+    NEXT_H = 26;
+  } else {
+    // 가로 모드: 320x240, 그리드 4x3 (기본값)
+    gridCols = 4;
+    gridRows = 3;
+    GRID_LEFT = 6;
+    GRID_RIGHT = 314;
+    GRID_TOP = 6;
+    GRID_BOTTOM = 206;
+    STATUS_TOP = 212;
+    STATUS_H = 28;
+    BTN_W = 71;
+    BTN_H = 61;
+    BTN_GAP_X = 8;
+    BTN_GAP_Y = 8;
+    PREV_X = 4;
+    PREV_Y = 214;
+    PREV_W = 96;
+    PREV_H = 22;
+    NEXT_X = 220;
+    NEXT_Y = 214;
+    NEXT_W = 96;
+    NEXT_H = 22;
   }
 }
 
@@ -756,6 +854,25 @@ void onConfigPacket(AsyncUDPPacket packet) {
     dumpReq.port = packet.remotePort();
     dumpReq.pending = true;
     portEXIT_CRITICAL(&dumpReqMux);
+    return;
+  }
+
+  // 제어 패킷 (스트리밍 프로젝트와 동일 포맷: frame_id=0xFFFFFFFF, >IBBBB)
+  // data[4]=rot_code, data[5]=show_fps(예약), data[6]=fec_flag(예약), data[7]=parity_count(예약)
+  if (magic == MAGIC_CONTROL) {
+    if (len >= 8) {
+      uint8_t rot_code = d[4];
+      if (rot_code <= ROT_PORTRAIT_REV) {  // 유효한 회전 코드만 (0~3)
+        if (rot_code != currentRotation) {
+          updateGridGeometry(rot_code);
+          labelsDirty = true;   // 전체 재렌더 트리거
+          labelsDirtyTime = millis();
+          configSaveDirty = true;  // 회전 설정도 플래시에 저장
+          configDirtyTime = millis();
+          Serial.printf("[CTRL] rotation changed to %u\n", rot_code);
+        }
+      }
+    }
     return;
   }
 
@@ -1152,15 +1269,16 @@ uint16_t countImages() {
     for (uint8_t b = 0; b < BUTTONS_PER_PAGE; b++)
       if (imgJpeg[p][b]) n++;
   return n;
-}// [H] 전체 설정(RAM) → LittleFS /config.bin (A.4 포맷). 내용이 실제로 바뀌었을 때만
+}// [H] 전체 설정(RAM) → LittleFS /config.bin (A.4 포맷, v4). 내용이 실제로 바뀌었을 때만
 //     loop()가 호출(디바운스) — 웨어 방지. 최악 ~15KB를 힙 임시 버퍼에 조립 후 1회 쓰기.
+//     v4: 회전 설정(currentRotation) 추가 (header에 저장)
 void saveConfigToFlash() {
   if (!fsMounted) return;
   uint8_t np = numPages;
   if (np < 1) np = 1;
   if (np > MAX_PAGES) np = MAX_PAGES;
 
-  size_t cap = 6;
+  size_t cap = 7;  // +1 for rotation byte
   for (uint8_t p = 0; p < np; p++) {
     cap += 1 + (size_t)strlen(pageNames[p]);
     for (uint8_t b = 0; b < BUTTONS_PER_PAGE; b++)
@@ -1174,6 +1292,7 @@ void saveConfigToFlash() {
   buf[off++] = (uint8_t)(CFG_MAGIC >> 8);  buf[off++] = (uint8_t)CFG_MAGIC;
   buf[off++] = CFG_VERSION;
   buf[off++] = np;
+  buf[off++] = currentRotation;  // 회전 설정 저장 (v4)
   for (uint8_t p = 0; p < np; p++) {
     size_t nlen = strlen(pageNames[p]);
     buf[off++] = (uint8_t)nlen;
@@ -1194,7 +1313,7 @@ void saveConfigToFlash() {
   if (f) {
     f.write(buf, off);
     f.close();
-    Serial.printf("[FS] config.bin 저장: %u페이지 (%uB)\n", np, (unsigned)off);
+    Serial.printf("[FS] config.bin 저장: %u페이지 rot=%u (%uB)\n", np, currentRotation, (unsigned)off);
   } else {
     Serial.println("[FS] config.bin 쓰기 실패");
   }
@@ -1203,6 +1322,7 @@ void saveConfigToFlash() {
 
 // [H] LittleFS /config.bin → RAM 복원. 성공 시 numPages 설정, true 반환.
 //     손상/부재 시 false → 호출자가 NVS 기본값으로 폴백 (디바이스는 그래도 동작).
+//     v3(회전 없음)과 v4(회전 있음) 모두 지원 — ver 확인 후 rotation 읽기
 bool loadConfigFromFlash() {
   if (!fsMounted) return false;
   if (!LittleFS.exists(CONFIG_BIN_PATH)) return false;
@@ -1221,7 +1341,17 @@ bool loadConfigFromFlash() {
   uint8_t ver = buf[4];
   uint8_t np = buf[5];
   off = 6;
-  if (magic != CFG_MAGIC || ver != CFG_VERSION) { free(buf); return false; }
+
+  // v4 이상이면 회전 설정 읽기, v3이면 기본값(가로)
+  uint8_t savedRotation = ROT_LANDSCAPE;
+  if (ver >= 4) {
+    if (off < sz) {
+      savedRotation = buf[off++];
+      if (savedRotation > ROT_PORTRAIT_REV) savedRotation = ROT_LANDSCAPE;
+    }
+  }
+
+  if (magic != CFG_MAGIC || ver < 3 || ver > CFG_VERSION) { free(buf); return false; }
   if (np < 1) np = 1;
   if (np > MAX_PAGES) np = MAX_PAGES;
 
@@ -1260,7 +1390,11 @@ bool loadConfigFromFlash() {
 
   numPages = np;
   if (currentPage >= numPages) currentPage = numPages - 1;   // 호출자가 NVS lastPage로 보정
-  Serial.printf("[FS] config.bin 로드: %u페이지\n", np);
+
+  // 회전 설정 적용 (config.bin에서 읽은 값 또는 기본값)
+  updateGridGeometry(savedRotation);
+
+  Serial.printf("[FS] config.bin 로드: %u페이지 rot=%u\n", np, savedRotation);
   return true;
 }
 
@@ -1435,7 +1569,7 @@ bool hitButton(uint16_t tx, uint16_t ty, int* col, int* row) {
   if (ty < GRID_TOP || ty >= GRID_BOTTOM || tx < GRID_LEFT || tx >= GRID_RIGHT) return false;
   *col = (tx - GRID_LEFT) / (BTN_W + BTN_GAP_X);
   *row = (ty - GRID_TOP) / (BTN_H + BTN_GAP_Y);
-  if (*col < 0 || *col >= GRID_COLS || *row < 0 || *row >= GRID_ROWS) return false;
+  if (*col < 0 || *col >= gridCols || *row < 0 || *row >= gridRows) return false;
   // gap 영역 배제: 실제 버튼 사각형 안쪽인지 확인
   int x = btn_x(*col), y = btn_y(*row);
   if (tx < x || tx >= x + BTN_W || ty < y || ty >= y + BTN_H) return false;
@@ -1550,8 +1684,8 @@ static void drawFittedButtonLabel(int cx, int cy, const char* label, uint16_t co
 }
 
 void drawButton(uint8_t page, uint8_t idx, bool pressed) {
-  int col = idx % GRID_COLS;
-  int row = idx / GRID_COLS;
+  int col = idx % gridCols;
+  int row = idx / gridCols;
   int x = btn_x(col), y = btn_y(row);
 
   // [G] 이미지가 있으면 JPEG 렌더, 없으면 기존 텍스트 렌더 (폴백)
@@ -1673,8 +1807,8 @@ void drawButtonImage(uint8_t page, uint8_t idx, int x, int y, bool pressed) {
 
 // [B] 버튼을 임시 색(피드백용)으로 렌더 — 원상 복귀는 drawButton(page, idx, false)
 void drawButtonFlash(uint8_t page, uint8_t idx, uint16_t fill) {
-  int col = idx % GRID_COLS;
-  int row = idx / GRID_COLS;
+  int col = idx % gridCols;
+  int row = idx / gridCols;
   int x = btn_x(col), y = btn_y(row);
 
   // [G] 이미지 버튼: 이미지는 유지하고 피드백 색 테두리를 3px 오버레이 (성공/실패 신호)
@@ -1722,8 +1856,12 @@ void updateBrightness() {
 }
 
 void drawStatusBar() {
+  // 화면 크기 가져오기 (회전에 따라 달라짐)
+  int scrW = lcd.width();
+  int scrH = lcd.height();
+
   // 상태바 배경 (그리드 배경색과 동일하게 채워 이음새 제거)
-  lcd.fillRect(0, STATUS_TOP, 320, 240 - STATUS_TOP, lcd.color565(15, 23, 42));
+  lcd.fillRect(0, STATUS_TOP, scrW, scrH - STATUS_TOP, lcd.color565(15, 23, 42));
 
   // 이전/다음 페이지 — [롤링] 항상 어느 페이지에서나 동작하므로 항상 활성색(파랑)
   lcd.fillRoundRect(PREV_X, PREV_Y, PREV_W, PREV_H, 4, lcd.color565(37, 99, 235));
@@ -1747,7 +1885,7 @@ void drawStatusBar() {
     snprintf(buf, sizeof(buf), "PAGE %d/%d", currentPage + 1, numPages);
   }
   lcd.setTextColor(lcd.color565(148, 163, 184));
-  lcd.drawString(buf, 160, STATUS_TOP + 14);
+  lcd.drawString(buf, scrW / 2, STATUS_TOP + (STATUS_H / 2));
 }
 
 void drawGrid(uint8_t page) {
@@ -1759,17 +1897,19 @@ void drawGrid(uint8_t page) {
 }
 
 void drawBootScreen(const char* msg) {
+  int cx = lcd.width() / 2;              // 회전 따라 중심 다름 (가로 160 / 세로 120)
   lcd.fillScreen(lcd.color565(15, 23, 42));
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextDatum(MC_DATUM);
   lcd.setTextSize(2);
-  lcd.drawString("Macro Pad", 160, 90);
+  lcd.drawString("Macro Pad", cx, 90);
   lcd.setTextSize(1);
   lcd.setTextColor(lcd.color565(148, 163, 184));
-  lcd.drawString(msg, 160, 120);
+  lcd.drawString(msg, cx, 120);
 }
 
 void drawErrorScreen(const char* msg) {
+  int cx = lcd.width() / 2;
   lcd.fillScreen(lcd.color565(80, 20, 20));
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextDatum(MC_DATUM);
@@ -1780,25 +1920,27 @@ void drawErrorScreen(const char* msg) {
     int l0 = min((int)(nl - msg), 39);
     memcpy(line, msg, l0);
     line[l0] = '\0';
-    lcd.drawString(line, 160, 108);
-    lcd.drawString(nl + 1, 160, 132);
+    lcd.drawString(line, cx, 108);
+    lcd.drawString(nl + 1, cx, 132);
   } else {
-    lcd.drawString(msg, 160, 120);
+    lcd.drawString(msg, cx, 120);
   }
 }
 
 void drawReadyScreen() {
+  int scrW = lcd.width();
+  int scrH = lcd.height();
   lcd.fillScreen(lcd.color565(15, 23, 42));
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextDatum(MC_DATUM);
   lcd.setTextSize(2);
-  lcd.drawString("Macro Pad", 160, 80);
+  lcd.drawString("Macro Pad", scrW / 2, scrH / 2 - 40);
   lcd.setTextSize(1);
   lcd.setTextColor(lcd.color565(148, 163, 184));
   char buf[48];
   snprintf(buf, sizeof(buf), "UDP %d  IP: %s", UDP_PORT, WiFi.localIP().toString().c_str());
-  lcd.drawString(buf, 160, 110);
-  lcd.drawString("Waiting for host config...", 160, 132);
+  lcd.drawString(buf, scrW / 2, scrH / 2);
+  lcd.drawString("Waiting for host config...", scrW / 2, scrH / 2 + 22);
   delay(1200);
 }
 
@@ -1830,7 +1972,7 @@ void handleTouch() {
       if (pressInGrid) {
         int col, row;
         if (hitButton(pressX, pressY, &col, &row)) {
-          drawButton(currentPage, row * GRID_COLS + col, true);  // 눌림 시각 피드백
+          drawButton(currentPage, row * gridCols + col, true);  // 눌림 시각 피드백
         }
       }
     } else if (!pressInGrid && (millis() - touchStart) > LONG_PRESS_MS) {
@@ -1852,7 +1994,7 @@ void handleTouch() {
     if (pressInGrid) {
       int col, row;
       if (hitButton(pressX, pressY, &col, &row)) {
-        int idx = row * GRID_COLS + col;
+        int idx = row * gridCols + col;
         drawButton(currentPage, idx, false);  // 원상 복귀
         sendEvent(currentPage, idx);
       }
@@ -1885,6 +2027,7 @@ void handleTouch() {
 // [E] 마지막 페이지 복원용 상태: 페이지/페이지 수 변경을 5초 디바운스 후 1회만 NVS 저장
 static uint8_t lastShownPage = 0xFF;
 static uint8_t lastSavedPages = 0xFF;
+static uint8_t lastSavedRotation = 0xFF;  // 회전 설정 변경 감지용
 static unsigned long pageChangeTime = 0;
 static bool pageChangePending = false;
 // [G] 페이지 수 감소로 범위 밖이 된 이미지 해제용 추적 (마지막으로 정리한 페이지 수)
@@ -1948,15 +2091,17 @@ void loop() {
   // [C] 백라이트 디밍/조도 자동 밝기 (60s 무터치 시 디밍, 터치 즉시 복귀)
   updateBrightness();
 
-  // [E] 페이지 전환/수 변경 감지 → 5초 안정되면 1회 저장 (연타는 1회로 합침, NVS 웨어 방지)
-  if (lastShownPage != currentPage || lastSavedPages != numPages) {
+  // [E] 페이지 전환/수 변경/회전 변경 감지 → 5초 안정되면 1회 저장 (연타는 1회로 합침, NVS 웨어 방지)
+  if (lastShownPage != currentPage || lastSavedPages != numPages || lastSavedRotation != currentRotation) {
     lastShownPage = currentPage;
     lastSavedPages = numPages;
+    lastSavedRotation = currentRotation;
     pageChangeTime = now;
     pageChangePending = true;
   } else if (pageChangePending && now - pageChangeTime >= 5000) {
     prefsPad.putUChar("lastPage", currentPage);
     prefsPad.putUChar("numPages", numPages);
+    prefsPad.putUChar("rotation", currentRotation);
     pageChangePending = false;
   }
 
