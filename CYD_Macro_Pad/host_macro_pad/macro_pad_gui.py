@@ -91,13 +91,17 @@ IMAGE_HEADER = struct.Struct(">IBBBB")     # magic, page, button, format, rsvd
 
 # [G] 버튼 이름 이미지: 펌웨어 BTN_W/BTN_H와 일치, JPEG는 단일 UDP 패킷(≤1400B)로 전송
 MAGIC_IMAGE = 0x4D494D47      # "MIMG" 호스트→디바이스 버튼 이름 이미지 (G)
-BTN_IMG_W = 71                # 펌웨어 BTN_W와 일치
-BTN_IMG_H = 61                # 펌웨어 BTN_H와 일치
+# 가로 모드 기본값 (펌웨어 BTN_W/BTN_H와 일치) — 세로 모드일 때는 72x63으로 동적 변경
+BTN_IMG_W = 71                # 펌웨어 BTN_W와 일치 (가로 모드)
+BTN_IMG_H = 61                # 펌웨어 BTN_H와 일치 (가로 모드)
+# 세로 모드 버튼 크기 (펌웨어 updateGridGeometry에서 설정: 3x4 그리드 → 72x63)
+BTN_IMG_W_PORTRAIT = 72
+BTN_IMG_H_PORTRAIT = 63
 JPEG_QUALITY = 90             # 기본 품질 — 4:4:4(subsampling=0)와 조합해 크로마 얼룩 제거
 JPEG_MIN_QUALITY = 70         # 품질 하한 — 1400B 예산과 무관하게 이 품질을 보장 (MIMG fmt=2 청킹 전송)
 JPEG_MAX_BYTES = 1400         # fmt=0 단일 패킷 이미지 페이로드 상한 (헤더 8B + 1400B = 1408 < UDP MTU 1472)
 IMG_CHUNK_DATA = 1400         # fmt=2 청크당 데이터 바이트 (8+8+1400 = 1416 < UDP MTU 1472 — 단편화 없음)
-IMG_MAX_BYTES = 4096          # 청킹 이미지 총 상한 (펌웨어 IMG_MAX_BYTES와 일치; 71×61 최악 노이즈 q=70 ≈ 2766B)
+IMG_MAX_BYTES = 4096          # 청킹 이미지 총 상한 (펌웨어 IMG_MAX_BYTES와 일치)
 GRID_BG_HEX = "#0F172A"       # 버튼 주변 그리드 배경색 (이미지 모서리와 동일 → 이음새 제거)
 BTN_BORDER_HEX = "#64748B"    # 비활성 버튼 테두리 (슬레이트 — 펌웨어 색상과 일치)
 # [PLAN 7] 버튼 모서리 라운드 반경. radius 6은 JPEG 4:2:0 손실 압축 후 코너가 거의
@@ -679,7 +683,7 @@ def parse_event_packet(data: bytes):
 
 # ------------------------------------------------------------------
 # [G] 버튼 이름 이미지 렌더링 (Pillow) + MIMG 패킷 구성
-#     호스트가 라벨을 71x61 JPEG로 그려 전송 → 펌웨어 JPEGDEC가 표시.
+#     호스트가 라벨을 w×h JPEG로 그려 전송 (가로: 71x61, 세로: 72x63) → 펌웨어 JPEGDEC가 표시.
 #     F(한글)도 이와 같은 이미지 경로로 해결한다.
 # ------------------------------------------------------------------
 _PIL_READY = False
@@ -817,17 +821,19 @@ def _split_label_runs(label: str):
     return parts
 
 
-def _emoji_glyph(run: str, target_size: int):
+def _emoji_glyph(run: str, target_size: int, btn_w: int = BTN_IMG_W, btn_h: int = BTN_IMG_H):
     """이모지 런을 32px 스트라이크로 렌더해 target_size 높이 RGBA로 축소. 실패 시 None.
 
     Pillow 11은 layout_engine 인자를 받지 않고(RAQM 없음), 크기 16 등 일부 스트라이크
     로드가 실패하므로 항상 32px 스트라이크로 그린 뒤 폰트 크기에 맞게 축소한다.
+    btn_w, btn_h: 버튼 크기 (가로 71x61, 세로 72x63) — 폭 제약에 사용
     """
     f = _load_emoji_font(32)
     if f is None:
         return None
     pad = 4
-    tmp = Image.new("RGBA", (BTN_IMG_W * 3, BTN_IMG_H * 3), (0, 0, 0, 0))
+    # 작업용 캔버스: 32px 폰트 기준 충분히 크게 (최대 32*3=96, 버튼 크기보다 큼)
+    tmp = Image.new("RGBA", (max(btn_w, btn_h) * 3, max(btn_w, btn_h) * 3), (0, 0, 0, 0))
     dt = ImageDraw.Draw(tmp)
     dt.text((pad, pad), run, font=f, embedded_color=True)
     bbox = tmp.getbbox()
@@ -840,41 +846,42 @@ def _emoji_glyph(run: str, target_size: int):
     scale = target_size / gh
     new_w = max(1, round(gw * scale))
     new_h = target_size
-    if new_w > BTN_IMG_W - 2:               # 너무 넓으면 폭 기준으로 다시 축소
-        scale = (BTN_IMG_W - 2) / gw
+    if new_w > btn_w - 2:               # 너무 넓으면 버튼 폭 기준으로 다시 축소
+        scale = (btn_w - 2) / gw
         new_w = round(gw * scale)
         new_h = max(1, round(gh * scale))
     return glyph.resize((new_w, new_h), Image.LANCZOS)
 
 
-def _compose_button_image_emoji(label: str, color_idx: int):
+def _compose_button_image_emoji(label: str, color_idx: int, w: int = BTN_IMG_W, h: int = BTN_IMG_H):
     """이모지 포함 라벨을 버튼 JPEG로 렌더. 맞는 폰트 크기를 못 찾으면 None 반환 → 기본 경로 폴백.
 
     텍스트 런은 라벨 폰트로, 이모지 런은 _emoji_glyph(컬러 32px 스트라이크 축소)로
     그린다. 이모지 폭은 실제 축소 글리프 폭을 사용해 줄바꿈/정렬이 어긋나지 않게 한다.
+    w, h: 목표 이미지 크기 (가로 모드 71x61, 세로 모드 72x63)
     """
     _ensure_pillow()
     color_hex = COLOR_HEX[color_idx]
     text_hex = "#0f172a" if color_idx == 9 else "#ffffff"
 
-    img = Image.new("RGB", (BTN_IMG_W, BTN_IMG_H), GRID_BG_HEX)
+    img = Image.new("RGB", (w, h), GRID_BG_HEX)
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([0, 0, BTN_IMG_W - 1, BTN_IMG_H - 1], radius=BTN_RADIUS, fill=color_hex)
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=BTN_RADIUS, fill=color_hex)
 
-    max_w, max_h = BTN_IMG_W - 10, BTN_IMG_H - 10
+    max_w, max_h = w - 10, h - 10
     tokens = [_split_label_runs(tok) for tok in label.split() if tok]
     if not tokens:
         return None
 
     # [폰트] 순수 이모지 라벨(단일 런)은 버튼을 채우는 큰 이모지로 렌더 (기존 20px → ~49px)
     if len(tokens) == 1 and len(tokens[0]) == 1 and tokens[0][0][1]:
-        g = _emoji_glyph(tokens[0][0][0], max_h - 2)
+        g = _emoji_glyph(tokens[0][0][0], max_h - 2, w, h)
         # 가로로 긴 이모지는 폭 여백(max_w)에도 맞게 다시 축소
         if g is not None and g.width > max_w:
-            g = _emoji_glyph(tokens[0][0][0], max(1, round((max_h - 2) * max_w / g.width)))
+            g = _emoji_glyph(tokens[0][0][0], max(1, round((max_h - 2) * max_w / g.width)), w, h)
         if g is not None:
-            x = (BTN_IMG_W - g.width) // 2
-            y = (BTN_IMG_H - g.height) // 2
+            x = (w - g.width) // 2
+            y = (h - g.height) // 2
             img.paste(g, (int(x), int(y)), g)
             return img
 
@@ -887,9 +894,9 @@ def _compose_button_image_emoji(label: str, color_idx: int):
         for tok in tokens:
             for run, is_emoji in tok:
                 if is_emoji:
-                    g = _emoji_glyph(run, fs)
-                    w = g.width if g is not None else d.textlength(run, font=text_font)
-                    runs.append((True, w, g, run))
+                    g = _emoji_glyph(run, fs, w, h)
+                    w_run = g.width if g is not None else d.textlength(run, font=text_font)
+                    runs.append((True, w_run, g, run))
                 else:
                     runs.append((False, d.textlength(run, font=text_font), None, run))
 
@@ -920,10 +927,10 @@ def _compose_button_image_emoji(label: str, color_idx: int):
         if len(lines) * line_h > max_h:
             continue
         total_h = len(lines) * line_h
-        y0 = (BTN_IMG_H - total_h) / 2
+        y0 = (h - total_h) / 2
         for i, line in enumerate(lines):
             line_w = sum(r[1] for r in line)
-            x = (BTN_IMG_W - line_w) / 2
+            x = (w - line_w) / 2
             y = y0 + i * line_h
             for is_emoji, _w, g, run in line:
                 if is_emoji and g is not None:
@@ -957,15 +964,16 @@ def _wrap_words(draw, words, font, max_w, max_lines):
     return lines if len(lines) <= max_lines else None
 
 
-def _compose_button_image(label: str, color_idx: int):
-    """71x61 버튼 이미지(PIL)를 그린다: 버튼 색 라운드사각 + 중앙 라벨(최대 2줄).
+def _compose_button_image(label: str, color_idx: int, w: int = BTN_IMG_W, h: int = BTN_IMG_H):
+    """버튼 이미지(PIL)를 그린다: 버튼 색 라운드사각 + 중앙 라벨(최대 2줄).
 
     이미지 모서리는 GRID_BG_HEX — 펌웨어가 그대로 push하면 라운드 코너가 주변
     배경과 이어진다. 테두리는 눌림 상태(펌웨어 drawRoundRect)에 따라 그리므로 여기엔 안 넣는다.
+    w, h: 목표 이미지 크기 (가로 모드 71x61, 세로 모드 72x63)
     """
     # [PLAN 8] 이모지 포함 라벨은 텍스트/이모지 런 분리 렌더 (실패 시 아래 기본 경로로 폴백)
     if _EMOJI_RUN_RE.search(label):
-        emo = _compose_button_image_emoji(label, color_idx)
+        emo = _compose_button_image_emoji(label, color_idx, w, h)
         if emo is not None:
             return emo
 
@@ -973,11 +981,11 @@ def _compose_button_image(label: str, color_idx: int):
     color_hex = COLOR_HEX[color_idx]
     text_hex = "#0f172a" if color_idx == 9 else "#ffffff"   # 흰색 배경 → 검정 글자
 
-    img = Image.new("RGB", (BTN_IMG_W, BTN_IMG_H), GRID_BG_HEX)
+    img = Image.new("RGB", (w, h), GRID_BG_HEX)
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([0, 0, BTN_IMG_W - 1, BTN_IMG_H - 1], radius=BTN_RADIUS, fill=color_hex)
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=BTN_RADIUS, fill=color_hex)
 
-    max_w, max_h = BTN_IMG_W - 10, BTN_IMG_H - 10
+    max_w, max_h = w - 10, h - 10
     words = label.split()
     for fs in range(20, 7, -1):
         font = _load_label_font(fs, bold=True)
@@ -988,10 +996,10 @@ def _compose_button_image(label: str, color_idx: int):
         if len(lines) * line_h > max_h:
             continue
         total_h = len(lines) * line_h
-        y0 = (BTN_IMG_H - total_h) / 2
+        y0 = (h - total_h) / 2
         for i, ln in enumerate(lines):
             bbox = d.textbbox((0, 0), ln, font=font)
-            x = (BTN_IMG_W - (bbox[2] - bbox[0])) / 2 - bbox[0]
+            x = (w - (bbox[2] - bbox[0])) / 2 - bbox[0]
             y = y0 + i * line_h - bbox[1]
             d.text((x, y), ln, font=font, fill=text_hex)
         return img
@@ -999,8 +1007,8 @@ def _compose_button_image(label: str, color_idx: int):
     font = _load_label_font(7, bold=True)
     short = label if len(label) <= 7 else label[:6] + "…"
     bbox = d.textbbox((0, 0), short, font=font)
-    d.text(((BTN_IMG_W - (bbox[2] - bbox[0])) / 2 - bbox[0],
-            (BTN_IMG_H - (bbox[3] - bbox[1])) / 2 - bbox[1]), short, font=font, fill=text_hex)
+    d.text(((w - (bbox[2] - bbox[0])) / 2 - bbox[0],
+            (h - (bbox[3] - bbox[1])) / 2 - bbox[1]), short, font=font, fill=text_hex)
     return img
 
 
@@ -1023,52 +1031,55 @@ def _jpeg_fit(img) -> bytes:
     return data   # 최저 품질에도 초과 → 호출부에서 라벨을 줄여 재구성
 
 
-def _render_button_image(label: str, color_idx: int) -> bytes:
+def _render_button_image(label: str, color_idx: int, w: int = BTN_IMG_W, h: int = BTN_IMG_H) -> bytes:
     """라벨/색상 → JPEG 바이트(품질 하한 JPEG_MIN_QUALITY 보장; 초과는 fmt=2 청킹 전송).
-    극단적으로 큰 라벨은 축약 후 재구성."""
-    img = _compose_button_image(label, color_idx)
+    극단적으로 큰 라벨은 축약 후 재구성.
+    w, h: 목표 이미지 크기 (가로 모드 71x61, 세로 모드 72x63)"""
+    img = _compose_button_image(label, color_idx, w, h)
     data = _jpeg_fit(img)
     if len(data) <= JPEG_MAX_BYTES:
         return data
     short = label if len(label) <= 7 else label[:6] + "…"
-    return _jpeg_fit(_compose_button_image(short, color_idx))
+    return _jpeg_fit(_compose_button_image(short, color_idx, w, h))
 
 
-def _image_to_button_jpeg(img) -> bytes:
-    """업로드 이미지를 버튼 크기(71x61)로 중앙 크롭 채움 변환 후 JPEG 인코딩.
+def _image_to_button_jpeg(img, w: int = BTN_IMG_W, h: int = BTN_IMG_H) -> bytes:
+    """업로드 이미지를 버튼 크기(w x h)로 중앙 크롭 채움 변환 후 JPEG 인코딩.
 
     비율은 유지하되 버튼보다 작은 축을 채우도록 확대하고 중앙을 크롭한다.
     (늘어나지도, 빈 여백도 생기지 않는다 — 스트림덱 아이콘 방식)
     [PLAN 7] 모서리는 그리드 배경 위 rounded_rectangle(BTN_RADIUS) 알파 마스크로 합성해
     펌웨어 텍스트 버튼(fillRoundRect BTN_RADIUS)과 같은 둥근 모서리로 표시한다.
+    w, h: 목표 이미지 크기 (가로 모드 71x61, 세로 모드 72x63)
     """
     _ensure_pillow()
-    ratio = max(BTN_IMG_W / img.width, BTN_IMG_H / img.height)
-    w, h = max(1, round(img.width * ratio)), max(1, round(img.height * ratio))
-    img = img.resize((w, h), Image.LANCZOS)
-    left = (w - BTN_IMG_W) // 2
-    top = (h - BTN_IMG_H) // 2
-    img = img.crop((left, top, left + BTN_IMG_W, top + BTN_IMG_H))
+    ratio = max(w / img.width, h / img.height)
+    new_w, new_h = max(1, round(img.width * ratio)), max(1, round(img.height * ratio))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - w) // 2
+    top = (new_h - h) // 2
+    img = img.crop((left, top, left + w, top + h))
     # 라운드 코너 마스크: rounded_rectangle 알파로 잘라 그리드 배경 위에 올린다.
-    canvas = Image.new("RGB", (BTN_IMG_W, BTN_IMG_H), GRID_BG_HEX)
-    mask = Image.new("L", (BTN_IMG_W, BTN_IMG_H), 0)
+    canvas = Image.new("RGB", (w, h), GRID_BG_HEX)
+    mask = Image.new("L", (w, h), 0)
     d = ImageDraw.Draw(mask)
-    d.rounded_rectangle([0, 0, BTN_IMG_W - 1, BTN_IMG_H - 1], radius=BTN_RADIUS, fill=255)
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=BTN_RADIUS, fill=255)
     canvas.paste(img, (0, 0), mask)
     return _jpeg_fit(canvas)
 
 
-def _image_file_to_b64(path) -> str:
-    """이미지 파일 → 버튼 크기 JPEG → base64 문자열 (config에 저장, 내보내기로 이동)."""
+def _image_file_to_b64(path, w: int = BTN_IMG_W, h: int = BTN_IMG_H) -> str:
+    """이미지 파일 → 버튼 크기 JPEG → base64 문자열 (config에 저장, 내보내기로 이동).
+    w, h: 목표 이미지 크기 (가로 모드 71x61, 세로 모드 72x63)"""
     _ensure_pillow()
     with Image.open(path) as im:
-        return base64.b64encode(_image_to_button_jpeg(im.convert("RGB"))).decode("ascii")
+        return base64.b64encode(_image_to_button_jpeg(im.convert("RGB"), w, h)).decode("ascii")
 
 
 def build_image_packet(page: int, button_id: int, jpeg_bytes: bytes, fmt: int = 0) -> bytes:
     """버튼 이미지 패킷 (MIMG): 8B 헤더 + 페이로드. 단일 UDP 패킷으로 전송.
 
-    fmt: 0 = JPEG 바이트(버튼 71x61), 1 = 이미지 제거(clear, 페이로드 없음 —
+    fmt: 0 = JPEG 바이트(버튼 w×h, 회전에 따라 71x61 또는 72x63), 1 = 이미지 제거(clear, 페이로드 없음 —
     디바이스는 해당 버튼을 펌웨어 텍스트/색 사각형으로 폴백).
     """
     return IMAGE_HEADER.pack(MAGIC_IMAGE, page, button_id, fmt, 0) + jpeg_bytes
@@ -1572,7 +1583,6 @@ class MacroPadGUI:
             {ROT_LANDSCAPE: 1, ROT_LANDSCAPE_REV: 2, ROT_PORTRAIT: 3, ROT_PORTRAIT_REV: 4}
             .get(self.current_rotation, 1))
         self.rot_combo.bind("<<ComboboxSelected>>", self.on_rotation_changed)
-        self._i18n_widgets.append((self.rot_combo, "rot_combo"))  # 값은 별도 처리
         self._set_listen_status("status_starting", self.sub_text)   # 언어 전환 재렌더용 상태 기록
 
         # 페이지 관리 행 (이름 편집 + 추가/삭제)
@@ -1807,7 +1817,7 @@ class MacroPadGUI:
     # [G] 버튼 이미지 업로드/제거/미리보기
     # ------------------------------------------------------------------
     def _pick_image(self, page: int, bid: int) -> None:
-        """버튼에 이미지 파일 업로드 → 버튼 크기(71x61) JPEG base64로 저장.
+        """버튼에 이미지 파일 업로드 → 버튼 크기(w×h, 회전에 따라 71x61 또는 72x63) JPEG base64로 저장.
 
         [H] 즉시 푸시하지 않는다 — 디바이스 반영은 [설정 적용]을 눌렀을 때만.
         """
@@ -1817,7 +1827,8 @@ class MacroPadGUI:
         if not path:
             return
         try:
-            b64 = _image_file_to_b64(path)
+            img_w, img_h = self.get_button_image_size()
+            b64 = _image_file_to_b64(path, img_w, img_h)
         except Exception as e:
             self._log(_tf("log_img_convert_fail", e), error=True)
             return
@@ -2152,6 +2163,12 @@ class MacroPadGUI:
             except tk.TclError:
                 pass
 
+    def get_button_image_size(self) -> tuple:
+        """현재 회전에 따른 버튼 이미지 크기 반환 (가로: 71x61, 세로: 72x63)."""
+        if self.current_rotation in (ROT_PORTRAIT, ROT_PORTRAIT_REV):
+            return BTN_IMG_W_PORTRAIT, BTN_IMG_H_PORTRAIT
+        return BTN_IMG_W, BTN_IMG_H
+
     def on_rotation_changed(self, event=None) -> None:
         """회전 콤보 박스 변경 콜백 — 그리드 재구성 + 디바이스로 제어 패킷 전송"""
         idx = self.rot_combo.current()
@@ -2163,9 +2180,16 @@ class MacroPadGUI:
 
         self.update_grid_geometry(rotation_code)
 
+        # [FIX] 탭 재구성 전에 위젯 현재 상태(fresh snapshot)를 수집해야
+        #       미저장 편집이 유실되지 않음. _sync_pages_from_tabs()와 동일한 패턴.
+        fresh_pages = self._collect_config()["pages"]
+
         # 모든 페이지 탭 재구성 (그리드 레이아웃 변경)
+        with self._config_lock:
+            self.config["pages"] = fresh_pages
         self._rebuild_all_tabs()
-        self._populate_from_config()
+        # _rebuild_all_tabs()가 내부에서 _populate_from_config()를 호출하므로
+        # 별도 호출 불필요 — self.config["pages"]가 이미 fresh 상태로 갱신됨.
 
         # 설정 저장 (회전 값 포함)
         config = self._collect_config()
@@ -2249,6 +2273,8 @@ class MacroPadGUI:
             return
         new_config = self._normalize_config(raw)
         new_config["lang"] = self.lang          # 언어는 호스트 표시 설정 — 가져온 파일이 덮지 않게 보존
+        # 회전 설정도 적용: update_grid_geometry로 그리드/콤보 동기화
+        self.update_grid_geometry(new_config["rotation"])
         with self._config_lock:
             self.config = new_config
         self._rebuild_all_tabs()
@@ -2276,6 +2302,10 @@ class MacroPadGUI:
         """[H] 덤프 완료: GUI를 디바이스 설정으로 채운다 (검토 후 수동 Apply)."""
         new_config = self._normalize_config(config)
         new_config["lang"] = self.lang          # 언어는 호스트 표시 설정 — 덤프가 덮지 않게 보존
+        # MREQ 덤프에는 rotation 필드가 없으므로(_normalize_config이 기본값 ROT_LANDSCAPE로 채움),
+        # 호스트의 현재 회전 선호를 유지한다 (lang과 동일하게).
+        new_config["rotation"] = self.current_rotation
+        self.update_grid_geometry(new_config["rotation"])
         n_pages = len(new_config["pages"])
         n_images = sum(1 for pg in new_config["pages"] for b in pg.get("buttons", [])
                        if b.get("image"))
@@ -2421,7 +2451,7 @@ class MacroPadGUI:
 
         설정 푸시(MCFG) 직후 같은 소스로 호출된다. 버튼별 의도 3분기:
           1. 업로드 이미지(base64) → 그대로 MIMG 전송
-          2. 한글(비-ASCII) 라벨 → 텍스트를 71x61 JPEG로 렌더해 MIMG 전송
+          2. 한글(비-ASCII) 라벨 → 텍스트를 w×h JPEG로 렌더해 MIMG 전송 (w/h는 현재 회전에 따름)
           3. ASCII/빈 라벨 → MIMG(fmt=1, clear) 전송 → 디바이스가 펌웨어 텍스트/색 사각형 폴백
         이미지는 ≤JPEG_MAX_BYTES(1400B)면 fmt=0 단일, 초과면 fmt=2 청킹
         (build_image_packets)으로 분할 전송 — 품질 하한 JPEG_MIN_QUALITY(70) 보장.
@@ -2430,6 +2460,7 @@ class MacroPadGUI:
         """
         with self._config_lock:
             pages = self.config.get("pages") or []
+            img_w, img_h = self.get_button_image_size()
         keys = set()
         rendered = 0        # 새로 렌더한 라벨 이미지 수 (캐시 미스 — 설정이 실제로 바뀜)
         for page in range(len(pages)):
@@ -2459,7 +2490,7 @@ class MacroPadGUI:
                         self._safe_sendto(sock, pkt, (ip, port))
                     continue
 
-                # (2) 한글(비-ASCII) 라벨 → 텍스트를 71x61 JPEG로 렌더해 전송
+                # (2) 한글(비-ASCII) 라벨 → 텍스트를 w×h JPEG로 렌더해 전송
                 if label and not label.isascii():
                     if not (0 <= color < COLOR_COUNT):
                         color = 0
@@ -2468,7 +2499,7 @@ class MacroPadGUI:
                     jpeg = self._img_cache.get(key)
                     if jpeg is None:
                         try:
-                            jpeg = _render_button_image(label, color)
+                            jpeg = _render_button_image(label, color, img_w, img_h)
                         except RuntimeError as e:
                             # Pillow 미설치 같은 시스템적 실패는 1회만 경고 (3초 비콘마다 스팸 방지).
                             # 판정은 번역과 무관하게 __cause__(ImportError)로 구분한다.

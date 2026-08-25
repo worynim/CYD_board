@@ -218,6 +218,11 @@ uint8_t gridRows = 3;
 
 // 현재 회전 상태 (기본 3 = 가로 정방향)
 uint8_t currentRotation = ROT_LANDSCAPE;
+// 회전 변경 디퍼 (AsyncUDP 콜백에서 바로 setRotation 금지 — loop()에서 처리)
+// onConfigPacket(제어 패킷)이 세우고 loop()가 소비한다. 전방 선언 불필요하도록
+// onConfigPacket 정의보다 앞에 둔다.
+bool rotationPending = false;
+uint8_t pendingRotation = ROT_LANDSCAPE;
 // [PLAN 7] 버튼 모서리 라운드 반경. radius 6은 작아서 Chamfer처럼 보이고, 이미지 버튼은
 //     호스트가 JPEG에 구운 라운드(radius 6)가 4:2:0 손실 압축 후 거의 사라져 각지게 보였다.
 //     10이면 압축 후에도/텍스트 버튼 모두 확실한 라운드가 보인다. 호스트 BTN_RADIUS와 일치.
@@ -414,7 +419,7 @@ void setup() {
   prefsPad.begin("cyd_mpad", false);
   uint8_t savedPage = prefsPad.getUChar("lastPage", 0);
   uint8_t savedRotation = prefsPad.getUChar("rotation", ROT_LANDSCAPE);
-  if (savedRotation <= ROT_PORTRAIT_REV) {
+  if (savedRotation <= ROT_LANDSCAPE) {
     updateGridGeometry(savedRotation);
   }
 
@@ -862,14 +867,16 @@ void onConfigPacket(AsyncUDPPacket packet) {
   if (magic == MAGIC_CONTROL) {
     if (len >= 8) {
       uint8_t rot_code = d[4];
-      if (rot_code <= ROT_PORTRAIT_REV) {  // 유효한 회전 코드만 (0~3)
+      if (rot_code <= ROT_LANDSCAPE) {  // 유효한 회전 코드만 (0~3)
         if (rot_code != currentRotation) {
-          updateGridGeometry(rot_code);
+          // [FIX] AsyncUDP 콜백에서 setRotation 바로 호출 금지 — loop()에서 처리
+          pendingRotation = rot_code;
+          rotationPending = true;
           labelsDirty = true;   // 전체 재렌더 트리거
           labelsDirtyTime = millis();
           configSaveDirty = true;  // 회전 설정도 플래시에 저장
           configDirtyTime = millis();
-          Serial.printf("[CTRL] rotation changed to %u\n", rot_code);
+          Serial.printf("[CTRL] rotation change queued: %u\n", rot_code);
         }
       }
     }
@@ -1347,7 +1354,7 @@ bool loadConfigFromFlash() {
   if (ver >= 4) {
     if (off < sz) {
       savedRotation = buf[off++];
-      if (savedRotation > ROT_PORTRAIT_REV) savedRotation = ROT_LANDSCAPE;
+      if (savedRotation > ROT_LANDSCAPE) savedRotation = ROT_LANDSCAPE;
     }
   }
 
@@ -2063,6 +2070,13 @@ void loop() {
     Serial.printf("[MREQ] dump -> %s:%u\n", s.c_str(), dumpPort);
     sendConfigDump(dumpIP, dumpPort);
     sendImageDump(dumpIP, dumpPort);
+  }
+
+  // 회전 변경 적용 (AsyncUDP 콜백에서 큐에 넣은 것 — loop()에서 setRotation 안전하게 실행)
+  if (rotationPending) {
+    rotationPending = false;
+    updateGridGeometry(pendingRotation);
+    // 라벨/이미지 재렌더는 아래 labelsDirty/imagesDirty 로직이 처리
   }
 
   // [G] 페이지 수 감소로 범위 밖이 된 페이지의 이미지 해제 + [H] 플래시 파일 정리
